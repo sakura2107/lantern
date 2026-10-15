@@ -23,7 +23,7 @@ blob/string：`u32 byte_length; byte[byte_length]`。普通字符串最大 65,53
 
 ## HELLO 和权限
 
-第一帧必须 op=1：`string pairing_secret,u32 requested_scopes,u32 channel`。
+普通会话第一帧为 op=1：`string pairing_secret,u32 requested_scopes,u32 channel`；一次性邀请兑换允许以下 op=55，完成后关闭连接。
 响应 `u32 granted_scopes`。请求权限必须为配置允许集合的子集；没有自动授予所有权限。
 
 权限位：read=1/write=2/view=4/control=8/audio=16。channel 0=input/control、1=desktop、2=original media、3=bulk、4=system audio。不同 channel 使用不同 TLS socket，文件/媒体共享主机级 Budget。channel不能赋予额外权限；desktop/audio持续流强制独立通道。requested_scopes=0用于仅验证身份与查询能力，没有任何文件/观看/输入/音频权限。
@@ -35,6 +35,7 @@ blob/string：`u32 byte_length; byte[byte_length]`。普通字符串最大 65,53
 | ID | 请求体 | 成功结果 |
 |---|---|---|
 | 1 HELLO | secret,scopes,channel | granted scopes |
+| 55 PAIR | string invite_code,string device_label | string device_id,string device_token,u32 effective_scopes；随后关闭 |
 | 2 LIST | string path,u32 offset,u32 limit,string filter | string generation,u32 count; 每项 string name,u32 directory,u64 size,u64 mtime |
 | 3 STAT | string path | u64 size,string version,string sha256 |
 | 4 READ | string path,string version,u64 offset,u32 length | blob bytes |
@@ -138,3 +139,31 @@ Windows自动同步默认关闭，500ms轮询、代际取消、双端不同内�
 - Windows 下载目录提交凭据 v1 是本机 DPAPI 文件；完成任务日志持久化前保留，离线认领恢复须同时核对主机身份、目录 ID、文件集合和内容摘要。
 - Android 任务日志新增 kind=3、content URI 与 sourceHash；旧 kind 0..2 保留。摘要用于拒绝跨源版本续传。仅具备持久读取授权、已知长度和可寻址能力的来源使用该类型，其余使用原快照方案。
 - Android 已增加前台手动剪贴板 UI，复用 Op53/54；多显示器和快捷键复用既有接口。原生 UTF-8 字符串解析拒绝损坏序列。
+
+## QR pairing v1（Op55，后端接口）
+
+客户端从受信任的电脑屏幕扫描二维码，先使用链接中的完整 SHA-256 固定 TLS 证书，再发送第一帧：
+
+```text
+u16 protocol_version=1, u16 operation=55, str invitation_code, str device_label
+```
+
+设备名为合法 UTF-8，1..64 字节，拒绝 ASCII 控制字符。配对码为 64 位小写十六进制：前 32 位是随机公开邀请 ID，后 32 位是独立随机的 128-bit 秘密。整个码仅在 TLS 建立且证书固定通过后发送。服务端仅持久保存完整码的 SHA-256；公开 ID 用于把错误秘密累计到具体邀请，未知 ID 不会处罚其他邀请。
+
+成功响应：`u16 1,u16 55,u32 0,str device_id,str device_token,u32 effective_scopes`。设备 ID 和新令牌均为独立 256-bit 随机数的 64 位小写十六进制。邀请消耗与设备写入在同一个配置编辑事务中原子提交，权限取邀请权限与当前全局上限的交集；交集为空拒绝。连接结束，客户端保存凭据后重新走原有 HELLO，原 HELLO 字段和行为没有变化。
+
+失败响应为原有响应头加错误字符串，operation=55。`unauthorized=2` 表示无效、过期、已取消或已消费；`busy=8` 表示来源尝试过于频繁或设备容量已满；`unsupported=6` 表示配对协议版本不支持；畸形字段为 `invalid=1`。失败消息不包含提交的码或任何令牌。
+
+每个来源 IP 的滑动 60 秒窗口最多 10 个 PAIR 帧，包括成功、失败和畸形请求。限速表最多 1024 个来源；表满时新来源返回 busy。每个邀请累计 5 个错误秘密后删除；未知邀请 ID 只受 IP 限速。IP 限速属于运行中的 Host 实例，不跨独立进程或主机重启持久化。错误次数和一次性消费通过配置锁跨同一 Windows 会话的主机/管理进程协调。
+
+能力串新增 `pair=qr-v1`，原有认证后 CAPS 查询保持兼容。客户端把带 HELLO 或 PAIR 操作头的 unsupported 响应识别为“主机版本过旧”。仓库历史主机也有在非 HELLO 首帧后直接关闭的实现；无响应断线无法可靠区分旧版本和消费后的网络故障，客户端返回 `outcome_unknown`，不自动重复兑换。
+
+二维码内容严格为：
+
+```text
+lantern://pair?v=1&n=<percent-encoded UTF-8 hostname>&a=<IPv4,IPv4>&p=<port>&f=<SHA256>&c=<code>&x=<Unix expiry seconds>
+```
+
+所有 7 个字段必须且只能出现一次；拒绝未知字段、fragment、非预期 scheme/authority、损坏 percent/UTF-8、空/超长主机名、非规范 IPv4、重复地址、DNS 名称、IPv6、0.0.0.0、组播、非法端口、非十六进制指纹/码和过期链接。最多 8 个地址、总长 2048 字节。指纹允许输入大写并归一为小写，码使用小写；不把 `+` 当空格。客户端和主机都独立校验有效期，时钟错误需要用户校正。
+
+主机配置写入版本升为 3，保留 v1/v2 读取。v2 字段后附加 `u32 invite_count`（<=32），每项为 `str id(32),str label(64),str code_hash(64),u32 scopes,u64 expires_at,u32 failed_attempts`；全部在 DPAPI 中。邀请的明文码不可从存储恢复。过期项在邀请操作时清理，已消费项立即删除。旧版主机/管理程序不能读取 v3，主机与管理程序应一起升级；旧客户端可继续连接新版主机。

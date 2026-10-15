@@ -2,6 +2,8 @@
 
 # 架构、取舍与接口
 
+新增配对后端的模块边界：`pairing.hpp` / `pairing_link.cpp` 提供不依赖 UI 的链接模型及严格解析；`host_admin.cpp` 在配置事务内创建/取消/兑换邀请；`service.cpp` 仅负责 TLS 首帧路由与来源 IP 限速；`pairing_client.cpp` 与 Android `Remote.pair` 完成证书固定和兑换；`qr.cpp` 只生成模块矩阵。Windows `lan.cpp` 枚举网卡，`firewall.cpp` 封装只读策略检查和显式提权命令。UI 负责绘制、扫码、用户确认与凭据存储入口；完整签名与兼容规则见 [PAIRING-BACKEND-HANDOFF.md](PAIRING-BACKEND-HANDOFF.md)。
+
 ## 边界与当前落地
 
 ```mermaid
