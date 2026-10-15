@@ -1,8 +1,11 @@
 #include "lantern/host_admin.hpp"
+#include "lantern/lan.hpp"
+#include "lantern/pairing.hpp"
 #include "ui_kit.hpp"
 #include <commctrl.h>
 #include <commdlg.h>
 #include <fstream>
+#include <set>
 #include <shlobj.h>
 #include <thread>
 #include <wrl/client.h>
@@ -22,6 +25,15 @@ bool stopping = false, closing = false;
 int page = 2;
 std::vector<HostSession> sessions;
 std::wstring listen_address;
+std::string listen_bind; // what the running host was started with
+uint16_t listen_port = 0;
+// Private-profile firewall rule for this executable; queried off the UI thread.
+FirewallState firewall = FirewallState::unknown;
+bool firewall_known = false;
+std::thread firewall_worker;
+std::wstring network_note;
+constexpr UINT firewall_msg = WM_APP + 21;
+constexpr wchar_t phone_glyph = 0xE8EA; // Segoe MDL2/Fluent "CellPhone"
 
 // Presentation strings. Business/status messages stay next to the code that produces them.
 namespace ui_text {
@@ -45,6 +57,7 @@ constexpr const wchar_t* sessions_stopped = L"主机未运行。在“主机设�
 HWND c(int id) {
     return controls.at(id);
 }
+bool loopback_bind(const std::string& bind);
 std::wstring text(HWND h) {
     int n = GetWindowTextLengthW(h);
     std::wstring s(n + 1, 0);
@@ -206,7 +219,8 @@ void layout() {
         top = y + dp(16);
         y = top + pad;
         scene.text({cx, y, cr, y + dp(24)}, ui_text::network, &ui::fonts.heading);
-        scene.text({cx, y + dp(26), cr, y + dp(46)}, ui_text::network_hint, &ui::fonts.note, ui::Tone::Muted);
+        scene.text({cx, y + dp(26), cr, y + dp(46)}, network_note.empty() ? ui_text::network_hint : network_note,
+                   &ui::fonts.note, ui::Tone::Muted);
         ui::Flow n(cx, cr, y + dp(56), dp(10));
         auto labeled = [&](const wchar_t* label, int id, int width) {
             int lw = ui::text_width(ui::fonts.body, label) + dp(10);
@@ -221,6 +235,12 @@ void layout() {
         ui::Flow s(cx, cr, n.bottom() + dp(16), dp(10));
         s.place(c(15), dp(40));
         s.place(c(16), dp(40));
+        s.place(c(62), dp(40));
+        bool firewall_open = firewall_known && firewall == FirewallState::allowed;
+        if (firewall_open || loopback_bind(utf8(text(c(13)))))
+            ShowWindow(c(63), SW_HIDE);
+        else
+            s.place(c(63), dp(40));
         y = s.bottom() + pad;
         scene.card({x0, top, x0 + cw, y});
     }
@@ -247,6 +267,7 @@ void layout() {
             if (apply)
                 ui::field(scene, c(21), fr);
             put(22, a.next(pref(22, bh), bh));
+            put(60, a.next(pref(60, bh), bh));
             py = a.bottom() + dp(14);
             if (apply)
                 scene.hairlines.push_back({ix, py, ir, py + 1});
@@ -288,6 +309,8 @@ void layout() {
     }
     EnableWindow(c(15), admin && !host);
     EnableWindow(c(38), admin && !host);
+    EnableWindow(c(60), admin != nullptr);
+    EnableWindow(c(62), admin != nullptr);
     EnableWindow(c(16), host && !stopping);
     for (int id : {10, 11, 12, 13, 14, 35})
         EnableWindow(c(id), !host);
@@ -463,6 +486,81 @@ void restore_settings() {
         message(L"上次使用的主机配置未能加载：" + wide(e.what()));
     }
 }
+bool loopback_bind(const std::string& bind) {
+    return bind.empty() || bind.starts_with("127.") || bind == "::1" || bind == "localhost";
+}
+/** Addresses a phone can try: the bound one, or (wildcard) physical adapters first. Never 0.0.0.0. */
+std::vector<std::string> reachable_addresses(const std::string& bind) {
+    if (bind != default_host_bind)
+        return valid_pairing_address(bind) && !loopback_bind(bind) ? std::vector<std::string>{bind}
+                                                                   : std::vector<std::string>{};
+    std::vector<std::string> physical, virtual_ones;
+    try {
+        for (auto& a : lan_addresses())
+            (a.virtual_adapter ? virtual_ones : physical).push_back(a.address);
+    } catch (...) {
+    }
+    auto& chosen = physical.empty() ? virtual_ones : physical;
+    if (chosen.size() > 8)
+        chosen.resize(8);
+    return chosen;
+}
+/** One line under “网络与运行”: who can connect, and whether the firewall lets them. */
+void refresh_network_note() {
+    auto bind = utf8(text(c(13)));
+    auto port = text(c(14));
+    if (loopback_bind(bind)) {
+        network_note = L"当前只允许本机连接。把监听地址改为 0.0.0.0，同一局域网里的手机才能连上。";
+    } else {
+        auto addresses = reachable_addresses(bind);
+        if (addresses.empty())
+            network_note = L"没有找到可用的局域网地址，请确认电脑已连接 Wi-Fi 或网线。";
+        else {
+            network_note = L"手机可通过 " + wide(addresses[0]) + L":" + port + L" 连接";
+            if (addresses.size() > 1)
+                network_note += L"（另有 " + std::to_wstring(addresses.size() - 1) + L" 个地址）";
+        }
+        if (!firewall_known)
+            network_note += L" · 正在检查防火墙…";
+        else if (firewall == FirewallState::allowed)
+            network_note += L" · 防火墙已放行（专用网络）";
+        else if (firewall == FirewallState::not_allowed)
+            network_note += L" · 防火墙可能会拦截手机，请点“允许通过防火墙”";
+        else
+            network_note += L" · 无法确认防火墙状态";
+    }
+    if (page == 2)
+        layout();
+}
+fs::path own_executable() {
+    std::wstring path(32768, L'\0');
+    path.resize(GetModuleFileNameW(nullptr, path.data(), DWORD(path.size())));
+    return path;
+}
+uint16_t port_field() {
+    try {
+        auto value = std::stoul(text(c(14)));
+        return value && value <= 65535 ? uint16_t(value) : 47443;
+    } catch (...) {
+        return 47443;
+    }
+}
+/** Queries (and, when asked, requests) the firewall rule off the UI thread. */
+void check_firewall(bool request_allow) {
+    if (firewall_worker.joinable())
+        firewall_worker.join();
+    auto exe = own_executable();
+    auto port = port_field();
+    firewall_known = false;
+    refresh_network_note();
+    firewall_worker = std::thread([exe, port, request_allow] {
+        bool granted = true;
+        if (request_allow)
+            granted = request_firewall_allow(exe, port);
+        auto rule = firewall_state(exe, port);
+        PostMessageW(window, firewall_msg, WPARAM(rule), LPARAM(request_allow ? (granted ? 1 : 2) : 0));
+    });
+}
 void stop() {
     if (!host || stopping)
         return;
@@ -472,6 +570,444 @@ void stop() {
     message(L"正在终止连接与文件任务…");
     layout();
 }
+void command(int id);
+
+// ---------------------------------------------------------------- scan-to-pair dialog
+// One modeless window. The invitation code exists only in this window's memory and in the QR;
+// closing the window cancels the invitation and wipes both.
+namespace pairing {
+constexpr UINT made_msg = WM_APP + 30;
+constexpr int refresh_id = 310, copy_id = 311, done_id = 312, fix_id = 313, scope_base = 300;
+struct Made {
+    std::string id;
+    uint64_t expires = 0;
+    std::wstring host, uri, error;
+    QrMatrix qr;
+    std::vector<std::string> addresses;
+    std::set<std::string> known;
+};
+HWND w;
+ui::Scene scene;
+std::map<int, HWND> controls;
+std::thread worker;
+std::string invite_id;
+uint64_t expires = 0;
+std::wstring host_name, uri, status;
+ui::Tone tone = ui::Tone::Muted;
+QrMatrix qr;
+std::vector<std::string> addresses;
+std::set<std::string> known;
+bool busy = false, done = false;
+int ticks = 0;
+RECT qr_box{}, info_box{}, status_box{};
+
+enum class Ready { no_config, stopped, loopback, ok };
+Ready readiness() {
+    if (!admin)
+        return Ready::no_config;
+    if (!host || stopping)
+        return Ready::stopped;
+    if (loopback_bind(listen_bind) || reachable_addresses(listen_bind).empty())
+        return Ready::loopback;
+    return Ready::ok;
+}
+void wipe() {
+    std::fill(uri.begin(), uri.end(), L'\0');
+    uri.clear();
+    qr = {};
+    invite_id.clear();
+    expires = 0;
+}
+uint32_t chosen_scopes() {
+    uint32_t v = 0;
+    for (int i = 0; i < 5; ++i)
+        if (SendMessageW(controls[scope_base + i], BM_GETCHECK, 0, 0) == BST_CHECKED)
+            v |= 1u << i;
+    return v;
+}
+void join() {
+    if (worker.joinable())
+        worker.join();
+}
+void layout();
+/** Cancels the previous invitation and creates a new one, all on a worker thread. */
+void generate() {
+    if (busy || readiness() != Ready::ok)
+        return;
+    auto scopes = chosen_scopes();
+    if (!scopes) {
+        wipe();
+        status = L"请至少选择一项权限。";
+        tone = ui::Tone::Danger;
+        layout();
+        return;
+    }
+    join();
+    busy = true;
+    done = false;
+    status = L"正在生成二维码…";
+    tone = ui::Tone::Muted;
+    auto old = invite_id;
+    wipe();
+    layout();
+    worker = std::thread([old, st = state, bind = listen_bind, port = listen_port, scopes] {
+        auto made = std::make_unique<Made>();
+        try {
+            HostAdministration a(st);
+            if (!old.empty())
+                try {
+                    a.cancel_invite(old);
+                } catch (...) {
+                }
+            for (auto& d : a.snapshot().devices)
+                made->known.insert(d.id);
+            made->addresses = reachable_addresses(bind);
+            if (made->addresses.empty())
+                throw Error(Code::io, "没有找到可用的局域网地址");
+            auto invite = a.invite("扫码配对", scopes);
+            made->id = invite.id;
+            made->expires = invite.expires_at;
+            made->host = wide(invite.host_name);
+            auto link = pairing_uri(invite, made->addresses, port);
+            made->qr = qr_encode(link);
+            made->uri = wide(link);
+            std::fill(link.begin(), link.end(), '\0');
+            std::fill(invite.code.begin(), invite.code.end(), '\0');
+        } catch (const std::exception& e) {
+            made->error = wide(e.what());
+        }
+        if (PostMessageW(w, made_msg, 0, LPARAM(made.get())))
+            made.release();
+    });
+}
+void close() {
+    if (!w)
+        return;
+    join();
+    if (!invite_id.empty() && !done)
+        try {
+            HostAdministration(state).cancel_invite(invite_id);
+        } catch (...) {
+        }
+    wipe();
+    auto h = w;
+    w = nullptr;
+    DestroyWindow(h);
+}
+/** Called every two seconds: has the phone used the invitation yet? */
+void watch() {
+    if (invite_id.empty() || done || busy)
+        return;
+    try {
+        HostAdministration a(state);
+        auto pending = a.invites();
+        if (std::any_of(pending.begin(), pending.end(), [](auto& p) { return p.id == invite_id; }))
+            return;
+        if (pairing_unix_time() >= expires)
+            return; // expired, not used; the countdown says so
+        std::wstring label = L"新设备";
+        for (auto& d : a.snapshot().devices)
+            if (!known.count(d.id))
+                label = wide(d.label);
+        done = true;
+        status = L"已添加“" + label + L"”。手机上会自动连接，以后打开就能直接用。";
+        tone = ui::Tone::Positive;
+        wipe();
+        refresh_devices();
+        layout();
+    } catch (...) {
+    }
+}
+void copy_link() {
+    if (uri.empty() || !OpenClipboard(w))
+        return;
+    EmptyClipboard();
+    size_t bytes = (uri.size() + 1) * sizeof(wchar_t);
+    if (auto mem = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+        memcpy(GlobalLock(mem), uri.c_str(), bytes);
+        GlobalUnlock(mem);
+        if (!SetClipboardData(CF_UNICODETEXT, mem))
+            GlobalFree(mem);
+    }
+    CloseClipboard();
+    status = L"链接已复制。可粘贴到 Windows 客户端，和二维码一样只能用一次。";
+    tone = ui::Tone::Muted;
+    InvalidateRect(w, &status_box, FALSE);
+}
+void layout() {
+    if (!w)
+        return;
+    using ui::dp;
+    RECT rc{};
+    GetClientRect(w, &rc);
+    int W = rc.right, H = rc.bottom, x = dp(28), R = W - dp(28);
+    scene.clear();
+    int y = dp(20);
+    scene.text({x, y, R, y + dp(32)}, L"用手机扫码添加设备", &ui::fonts.title);
+    y += dp(36);
+    scene.text({x, y, R, y + dp(20)}, L"在手机 Lantern 的“设备”页点“扫码配对”，对准下面的二维码。", &ui::fonts.note,
+               ui::Tone::Muted);
+    y += dp(32);
+    int q = dp(272);
+    qr_box = {(W - q) / 2, y, (W + q) / 2, y + q};
+    y += q + dp(10);
+    info_box = {x, y, R, y + dp(44)};
+    y += dp(54);
+    scene.text({x, y, R, y + dp(22)}, L"这台设备可以", &ui::fonts.strong);
+    ui::Flow f(x, R, y + dp(28), dp(8));
+    for (int i = 0; i < 5; ++i)
+        f.place(controls[scope_base + i], dp(34));
+    y = f.bottom() + dp(14);
+    status_box = {x, y, R, y + dp(40)};
+    int bh = dp(36), by = H - dp(24) - bh;
+    ui::Flow b(x, R, by, dp(8));
+    b.place(controls[refresh_id], bh);
+    b.place(controls[copy_id], bh);
+    int dw = ui::preferred_width(controls[done_id], bh);
+    MoveWindow(controls[done_id], R - dw, by, dw, bh, TRUE);
+    auto ready = readiness();
+    ShowWindow(controls[fix_id], ready == Ready::stopped || ready == Ready::loopback ? SW_SHOW : SW_HIDE);
+    int fw = ui::preferred_width(controls[fix_id], bh);
+    MoveWindow(controls[fix_id], (W - fw) / 2, qr_box.bottom - dp(60), fw, bh, TRUE);
+    EnableWindow(controls[refresh_id], ready == Ready::ok && !busy);
+    EnableWindow(controls[copy_id], !uri.empty());
+    InvalidateRect(w, nullptr, FALSE);
+}
+void paint(HDC dc) {
+    using ui::dp;
+    auto ready = readiness();
+    bool live = !qr.modules.empty() && !done;
+    uint64_t now = pairing_unix_time();
+    bool expired = live && now >= expires;
+    ui::round_rect(dc, qr_box, dp(16), live ? RGB(255, 255, 255) : ui::pal.inset, ui::pal.line);
+    if (live) {
+        // Quiet zone of four modules, integer module size, no smoothing.
+        int total = qr.size + 8, inner = qr_box.right - qr_box.left - dp(16);
+        int m = std::max(1, inner / total), side = m * total;
+        int ox = qr_box.left + (qr_box.right - qr_box.left - side) / 2 + 4 * m;
+        int oy = qr_box.top + (qr_box.bottom - qr_box.top - side) / 2 + 4 * m;
+        HBRUSH ink = ui::brush(expired ? RGB(200, 204, 210) : RGB(0, 0, 0));
+        for (int r = 0; r < qr.size; ++r)
+            for (int c0 = 0; c0 < qr.size;) {
+                if (!qr.modules[size_t(r) * qr.size + c0]) {
+                    ++c0;
+                    continue;
+                }
+                int c1 = c0;
+                while (c1 < qr.size && qr.modules[size_t(r) * qr.size + c1])
+                    ++c1;
+                RECT cell{ox + c0 * m, oy + r * m, ox + c1 * m, oy + (r + 1) * m};
+                FillRect(dc, &cell, ink);
+                c0 = c1;
+            }
+        if (expired) {
+            RECT badge{qr_box.left + dp(70), qr_box.top + dp(116), qr_box.right - dp(70), qr_box.top + dp(156)};
+            ui::round_rect(dc, badge, dp(10), ui::pal.surface, ui::pal.line);
+            ui::draw_text(dc, L"已过期", badge, ui::fonts.strong, ui::pal.ink, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+    } else {
+        std::wstring big, sub;
+        if (done) {
+            big = L"配对完成";
+            sub = L"可以关闭这个窗口了";
+        } else if (ready == Ready::no_config) {
+            big = L"还没有主机配置";
+            sub = L"请先在“主机设置”里加载或新建";
+        } else if (ready == Ready::stopped) {
+            big = L"主机还没有启动";
+            sub = L"手机需要连到正在运行的主机";
+        } else if (ready == Ready::loopback) {
+            big = L"主机只允许本机连接";
+            sub = L"改为局域网监听后，手机才能连上";
+        } else {
+            big = busy ? L"正在生成…" : L"";
+        }
+        RECT t{qr_box.left + dp(16), qr_box.top + dp(70), qr_box.right - dp(16), qr_box.top + dp(104)};
+        ui::draw_text(dc, big, t, ui::fonts.heading, done ? ui::pal.positive : ui::pal.ink,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        OffsetRect(&t, 0, dp(34));
+        ui::draw_text(dc, sub, t, ui::fonts.note, ui::pal.muted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    if (live) {
+        std::wstring line1;
+        if (expired)
+            line1 = L"二维码已过期，点“刷新二维码”生成新的";
+        else {
+            auto left = expires - now;
+            wchar_t clock[16];
+            swprintf_s(clock, L"%02llu:%02llu", left / 60, left % 60);
+            line1 = std::wstring(clock) + L" 后失效 · 只能使用一次";
+        }
+        std::wstring line2 = host_name;
+        if (!addresses.empty())
+            line2 += L" · " + wide(addresses[0]) + L":" + std::to_wstring(listen_port);
+        RECT a = info_box;
+        a.bottom = a.top + ui::dp(22);
+        ui::draw_text(dc, line1, a, ui::fonts.body, expired ? ui::pal.danger : ui::pal.ink,
+                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        OffsetRect(&a, 0, ui::dp(22));
+        ui::draw_text(dc, line2, a, ui::fonts.note, ui::pal.muted, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+    ui::draw_text(dc, status, status_box, ui::fonts.body, ui::tone(tone), DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+}
+LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    try {
+        switch (msg) {
+        case WM_CREATE: {
+            w = h;
+            const wchar_t* labels[] = {L"文件读取", L"文件写入", L"观看桌面", L"键鼠控制", L"系统音频"};
+            // Least privilege by default: everything the host allows except writing files.
+            uint32_t initial = snapshot.ceiling & ~uint32_t(files_write);
+            if (!initial)
+                initial = snapshot.ceiling;
+            for (int i = 0; i < 5; ++i) {
+                controls[scope_base + i] = ui::button(h, scope_base + i, ui::Kind::Chip, labels[i]);
+                SendMessageW(controls[scope_base + i], BM_SETCHECK, (initial >> i) & 1 ? BST_CHECKED : BST_UNCHECKED, 0);
+                EnableWindow(controls[scope_base + i], (snapshot.ceiling >> i) & 1);
+            }
+            controls[refresh_id] = ui::button(h, refresh_id, ui::Kind::Secondary, L"刷新二维码", ui::glyph::refresh);
+            controls[copy_id] = ui::button(h, copy_id, ui::Kind::Ghost, L"复制链接", ui::glyph::copy);
+            controls[done_id] = ui::button(h, done_id, ui::Kind::Primary, L"完成");
+            controls[fix_id] = ui::button(h, fix_id, ui::Kind::Primary, L"改为局域网并启动主机", ui::glyph::play);
+            for (auto [id, c] : controls)
+                ShowWindow(c, SW_SHOW);
+            ui::frame(h);
+            SetTimer(h, 1, 1000, nullptr);
+            layout();
+            generate();
+            return 0;
+        }
+        case WM_TIMER:
+            if (++ticks % 2 == 0)
+                watch();
+            if (!busy && !done && invite_id.empty() && readiness() == Ready::ok && status.empty())
+                generate(); // the host just became reachable
+            InvalidateRect(h, &info_box, FALSE);
+            if (!qr.modules.empty() && pairing_unix_time() >= expires)
+                InvalidateRect(h, &qr_box, FALSE);
+            return 0;
+        case made_msg: {
+            std::unique_ptr<Made> made(reinterpret_cast<Made*>(lp));
+            busy = false;
+            if (!made->error.empty()) {
+                status = L"未能生成二维码：" + made->error;
+                tone = ui::Tone::Danger;
+            } else {
+                invite_id = made->id;
+                expires = made->expires;
+                host_name = made->host;
+                uri = std::move(made->uri);
+                qr = std::move(made->qr);
+                addresses = made->addresses;
+                known = made->known;
+                status = L"等待手机扫码…";
+                tone = ui::Tone::Muted;
+            }
+            layout();
+            return 0;
+        }
+        case WM_COMMAND: {
+            int id = LOWORD(wp);
+            if (HIWORD(wp) != BN_CLICKED)
+                return 0;
+            if (lp)
+                ui::clicked(HWND(lp));
+            if (id >= scope_base && id < scope_base + 5) {
+                generate();
+            } else if (id == refresh_id) {
+                generate();
+            } else if (id == copy_id) {
+                copy_link();
+            } else if (id == fix_id) {
+                if (loopback_bind(utf8(text(c(13)))))
+                    SetWindowTextW(c(13), L"0.0.0.0");
+                if (host) {
+                    status = L"请先在“主机设置”里停止主机，再改为局域网监听。";
+                    tone = ui::Tone::Danger;
+                    layout();
+                } else {
+                    status.clear();
+                    SendMessageW(window, WM_COMMAND, 15, 0);
+                    layout();
+                }
+            } else if (id == done_id || id == IDCANCEL) {
+                close();
+            }
+            return 0;
+        }
+        case WM_DRAWITEM:
+            ui::draw((DRAWITEMSTRUCT*)lp);
+            return TRUE;
+        case WM_PAINT:
+            ui::paint(h, scene, paint);
+            return 0;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_CLOSE:
+            close();
+            return 0;
+        case WM_DESTROY:
+            KillTimer(h, 1);
+            controls.clear();
+            return 0;
+        }
+    } catch (const std::exception& e) {
+        status = wide(e.what());
+        tone = ui::Tone::Danger;
+        InvalidateRect(h, nullptr, FALSE);
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+void open() {
+    if (w) {
+        SetForegroundWindow(w);
+        return;
+    }
+    if (!admin)
+        throw Error(Code::invalid, "请先在“主机设置”中加载或新建主机配置");
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{sizeof(wc)};
+        wc.lpfnWndProc = proc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"LanternPairing";
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        ui::class_icons(wc);
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+    status.clear();
+    done = false;
+    busy = false;
+    ticks = 0;
+    RECT client{0, 0, ui::dp(468), ui::dp(660)};
+    AdjustWindowRectExForDpi(&client, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME, ui::dpi);
+    RECT owner{};
+    GetWindowRect(window, &owner);
+    int ww = client.right - client.left, wh = client.bottom - client.top;
+    int x = owner.left + (owner.right - owner.left - ww) / 2, y = owner.top + (owner.bottom - owner.top - wh) / 2;
+    CreateWindowExW(WS_EX_DLGMODALFRAME, L"LanternPairing", L"扫码添加设备", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                    x, std::max(0, y), ww, wh, window, nullptr, GetModuleHandleW(nullptr), nullptr);
+    ui::window_icons(w);
+    ShowWindow(w, SW_SHOW);
+}
+/** The main window started or stopped the host: re-evaluate what the dialog can show. */
+void host_changed() {
+    if (!w)
+        return;
+    if (readiness() != Ready::ok && !done) {
+        if (!invite_id.empty())
+            try {
+                HostAdministration(state).cancel_invite(invite_id);
+            } catch (...) {
+            }
+        wipe();
+        status.clear();
+    }
+    layout();
+}
+} // namespace pairing
+
 struct SetupRoot {
     fs::path root;
     std::wstring title, ok; // empty = the resource's own “新建主机配置 / 下一步”
@@ -580,7 +1116,9 @@ void command(int id) {
             throw;
         }
         SetWindowTextW(c(10), target.c_str());
+        SetWindowTextW(c(13), wide(default_host_bind).c_str()); // a new host is meant for the LAN
         load();
+        refresh_network_note();
         message(L"新身份已创建，旧共享凭据默认关闭。添加设备后再明确启动主机。");
     } else if (id == 38) {
         if (host)
@@ -633,6 +1171,12 @@ void command(int id) {
             SetWindowTextW(c(10), fs::path(name).parent_path().c_str());
     } else if (id == 12)
         load();
+    else if (id == 60 || id == 62)
+        pairing::open();
+    else if (id == 63) {
+        message(L"正在请求管理员权限，为“专用网络”添加防火墙规则…");
+        check_firewall(true);
+    }
     else if (id >= 50 && id <= 52) {
         page = id - 50;
         layout();
@@ -647,6 +1191,8 @@ void command(int id) {
             throw Error(Code::invalid, "端口必须为1..65535");
         host = std::make_unique<Host>(state, utf8(text(c(13))), uint16_t(port));
         listen_address = text(c(13)) + L":" + text(c(14));
+        listen_bind = utf8(text(c(13)));
+        listen_port = uint16_t(port);
         auto capacity = utf8(text(c(36)));
         size_t capacity_used = 0;
         auto mbps = std::stoul(capacity, &capacity_used);
@@ -660,8 +1206,12 @@ void command(int id) {
             PostMessageW(window, WM_APP + 1, 0, 0);
         });
         save_settings();
-        message(L"主机已启动；127.0.0.1仅本机，局域网使用LAN地址或0.0.0.0。" +
-                wide(host->discovery_status()));
+        message(loopback_bind(listen_bind)
+                    ? L"主机已启动，但只允许本机连接；要让手机连接，请停止后把监听地址改为 0.0.0.0。"
+                    : L"主机已启动。点“扫码添加设备”，用手机扫一下就能连上。" + wide(host->discovery_status()));
+        refresh_network_note();
+        check_firewall(false);
+        pairing::host_changed();
         layout();
     } else if (id == 16)
         stop();
@@ -756,12 +1306,15 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             for (int i = 0; i < 5; ++i)
                 button(100 + i, 2, Kind::Chip, labels[i]);
             button(17, 2, Kind::Secondary, L"保存权限上限", g::save);
-            child(13, 2, L"EDIT", L"127.0.0.1", ES_AUTOHSCROLL | WS_TABSTOP);
+            // New setups listen on the LAN; a remembered address (even loopback) replaces this in restore.
+            child(13, 2, L"EDIT", wide(default_host_bind).c_str(), ES_AUTOHSCROLL | WS_TABSTOP);
             child(14, 2, L"EDIT", L"47443", ES_NUMBER | WS_TABSTOP);
             child(36, 2, L"EDIT", L"320", ES_NUMBER | WS_TABSTOP);
             button(37, 2, Kind::Secondary, L"应用带宽上限");
             button(15, 2, Kind::Primary, L"启动主机", g::play);
             button(16, 2, Kind::Danger, L"停止主机", g::stop);
+            button(62, 2, Kind::Secondary, L"扫码添加设备", phone_glyph);
+            button(63, 2, Kind::Secondary, L"允许通过防火墙", g::shield);
             // Devices and permissions.
             child(19, 0, L"STATIC", L"旧共享凭据状态将在加载后显示。", SS_NOTIFY | SS_CENTERIMAGE | SS_ENDELLIPSIS);
             button(34, 0, Kind::Danger, L"禁用旧共享凭据", g::shield);
@@ -771,7 +1324,8 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             column(list, 1, L"生效权限", 260);
             column(list, 2, L"设备 ID", 500);
             child(21, 0, L"EDIT", L"新设备", ES_AUTOHSCROLL | WS_TABSTOP);
-            button(22, 0, Kind::Primary, L"新增设备", g::add);
+            button(22, 0, Kind::Secondary, L"新增设备", g::add);
+            button(60, 0, Kind::Primary, L"扫码添加", phone_glyph);
             for (int i = 0; i < 5; ++i)
                 button(200 + i, 0, Kind::Chip, labels[i]);
             button(23, 0, Kind::Secondary, L"保存设备权限", g::save);
@@ -808,8 +1362,21 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         }
         case WM_APP + 2:
             restore_settings();
+            refresh_network_note();
+            check_firewall(false);
             layout();
             refresh_rail();
+            return 0;
+        case firewall_msg:
+            firewall = FirewallState(w);
+            firewall_known = true;
+            if (l == 2)
+                message(L"没有添加防火墙规则（未获得管理员授权或操作失败）。也可以在 Windows 安全中心手动允许 lantern-host.exe。");
+            else if (l == 1)
+                message(firewall == FirewallState::allowed ? L"已允许 Lantern 在“专用网络”中接受连接；公用网络仍然拦截。"
+                                                           : L"防火墙规则已提交，但状态仍无法确认。");
+            refresh_network_note();
+            layout();
             return 0;
         case WM_SIZE:
             if (!controls.empty())
@@ -853,6 +1420,10 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             auto notice = HIWORD(w);
             if (l && (notice == EN_SETFOCUS || notice == EN_KILLFOCUS)) {
                 ui::invalidate_field(window, scene, (HWND)l);
+                return 0;
+            }
+            if (notice == EN_CHANGE && (LOWORD(w) == 13 || LOWORD(w) == 14)) {
+                refresh_network_note();
                 return 0;
             }
             if (notice == BN_CLICKED || (l && notice == BN_DOUBLECLICKED && ui::item((HWND)l))) {
@@ -899,6 +1470,8 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             host.reset();
             stopping = false;
             refresh_sessions();
+            pairing::host_changed();
+            refresh_network_note();
             if (closing)
                 DestroyWindow(h);
             else {
@@ -913,6 +1486,7 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             closing = true;
             KillTimer(h, 1);
             hide_secret();
+            pairing::close();
             save_settings();
             if (host) {
                 stop();
@@ -921,6 +1495,8 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             DestroyWindow(h);
             return 0;
         case WM_DESTROY:
+            if (firewall_worker.joinable())
+                firewall_worker.join();
             PostQuitMessage(0);
             return 0;
         case WM_CTLCOLORSTATIC:
@@ -964,7 +1540,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     ShowWindow(h, show);
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0)
-        if (!IsDialogMessageW(h, &msg)) {
+        if (!(pairing::w && IsDialogMessageW(pairing::w, &msg)) && !IsDialogMessageW(h, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

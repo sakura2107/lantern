@@ -44,3 +44,10 @@ Windows剪贴板/WIC预览/多文件选择器增量只调用Windows系统API，�
 - 位置：`third_party/qrcodegen/qrcodegen.cpp`、`qrcodegen.hpp`。保留原始头部 MIT 声明，并提供 `third_party/qrcodegen/LICENSE`，安装时复制为 `licenses/QRCODEGEN-MIT.txt`。
 - 原始文件 SHA-256：cpp `1f3b3fcdac6954c32cf583ccd02ec9b5901f756a38c461acedc70be4a77d3757`；hpp `b779c3b156cf7a57ce789d6fee4fc991ccc2913774d26c909d22bb8f26b2a793`。
 - 只静态链接编码器；`qr_encode` 固定 M 纠错、自动选择 1..40 版本，不自动提升纠错等级。没有相机/扫码实现和动态运行库。
+
+## ZXing core 3.5.3（Android 扫码解码）
+
+- 来源：Maven Central `com.google.zxing:core:3.5.3`（https://repo1.maven.org/maven2/com/google/zxing/core/3.5.3/ ）。项目主页 https://github.com/zxing/zxing 。
+- 位置：`android/libs/zxing-core-3.5.3.jar`，未作修改。SHA-1 `ca1349214a356cd7958651b2d5a0e1f3811a9c4b`（与 Maven Central 发布的校验值一致），SHA-256 `8d8064c1636fdaef7189dd9055c7d59950a8940a12f2293956446ec3c109fd82`。
+- 许可：Apache License 2.0，全文见 `licenses/ZXING-APACHE-2.0.txt`；APK 内为 `assets/licenses/ZXing-Apache-2.0.txt`，可在应用“开源许可”页查看。
+- 用途：只在 Android 端 `ScanActivity` 中用 `QRCodeReader` 解码相机画面里的配对二维码。Windows 端不使用。

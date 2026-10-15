@@ -16,6 +16,8 @@ Android 原生 Java 界面共享 C++ 协议核心，通过 JNI 接入。最低 A
   -Apk 'C:\Work\Lantern-0.1-Android-debug.apk'
 ```
 
+扫码配对依赖 `libs/zxing-core-3.5.3.jar`（Apache-2.0，见 [THIRD_PARTY.md](../THIRD_PARTY.md)）。两个构建脚本会自动把 `libs/*.jar` 加入编译和 dex，无需额外配置。
+
 脚本编译全部 Java 和两个 ABI（arm64-v8a、x86_64），使用 16 KiB 原生页对齐，组装 APK、调试签名，再验证签名和对齐。输出目录需已存在。每次使用新的 Java 类输出目录，避免已删除类残留。调试密钥保存在 ScratchDir，勿把它放入源码或共享目录。
 
 本次交付为 **debug APK**，包含仅用于验证的 instrumentation 和受 `MANAGE_DOCUMENTS` 权限保护的测试文档提供者，不是正式签名发行版。Gradle 工程也保留：使用支持 AGP 8.9.2 的 Gradle 及 JDK 17，在本目录执行 `gradle :app:assembleDebug`；需先配置 `ANDROID_HOME` 或未提交的 `local.properties`。仓库不捆绑 Gradle wrapper；本批实测构建走上面的独立脚本。

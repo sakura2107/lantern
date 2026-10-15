@@ -200,6 +200,7 @@ public final class MainActivity extends Activity {
         if(transfers.credentials!=null){credentials=transfers.credentials;ui.setConnection(AppShell.SAVED,display(credentials));}
         if(getIntent().getBooleanExtra("open_transfers",false))ui.select(AppShell.TRANSFERS);
         ui.device.notificationsAllowed(notificationsAllowed());
+        if(state==null)handleViewIntent(getIntent());
         refreshDesktopUi();
         Runnable frameTask = new Runnable() {
             public void run() {
@@ -364,6 +365,89 @@ public final class MainActivity extends Activity {
                 }
             });
     }
+    // ---------------------------------------------------------------- scan-to-pair
+    static final int REQUEST_SCAN = 103, REQUEST_CAMERA = 202;
+    /** Opens the in-app scanner (asks for the camera first). */
+    void scanPairing() {
+        if (checkSelfPermission(android.Manifest.permission.CAMERA) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[] {android.Manifest.permission.CAMERA}, REQUEST_CAMERA);
+            return;
+        }
+        startActivityForResult(new Intent(this, ScanActivity.class), REQUEST_SCAN);
+    }
+    /** Pairing link from the clipboard (copied from the computer's pairing window or sent by chat). */
+    void pastePairingLink() {
+        android.content.ClipboardManager clipboard = (android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE);
+        android.content.ClipData clip = clipboard.getPrimaryClip();
+        CharSequence text = clip == null || clip.getItemCount() == 0 ? null : clip.getItemAt(0).getText();
+        if (text == null || !text.toString().trim().startsWith(ScanActivity.PREFIX)) {
+            status(S.CLIPBOARD_NOT_LINK);
+            return;
+        }
+        pairingLink(text.toString().trim());
+    }
+    /** lantern://pair links opened from a camera app, a browser or chat. */
+    void handleViewIntent(Intent intent) {
+        if (intent == null || !Intent.ACTION_VIEW.equals(intent.getAction()) || intent.getData() == null ||
+            !"lantern".equals(intent.getData().getScheme()))
+            return;
+        String raw = intent.getData().toString();
+        intent.setData(null); // a recreated activity must not pair again
+        if (desktopLayout != null)
+            desktopLayout.setFullscreen(false);
+        ui.select(AppShell.DEVICE);
+        pairingLink(raw);
+    }
+    /** Validates the link offline, then asks the user to confirm which computer this is. */
+    void pairingLink(String raw) {
+        PairingLink link = raw == null ? null : PairingLink.parse(raw);
+        if (link == null) {
+            Sheet.info(this, S.LINK_INVALID_TITLE, S.LINK_INVALID_DETAIL);
+            return;
+        }
+        StringBuilder groups = new StringBuilder();
+        for (int i = 0; i < 16; i += 4)
+            groups.append(link.pin, i, i + 4).append(' ');
+        String address = link.addresses.get(0) + ":" + link.port;
+        Sheet.confirm(this, S.PAIR_CONFIRM_TITLE,
+                      String.format(Locale.ROOT, S.PAIR_CONFIRM, link.hostName, address, groups.toString().trim()),
+                      S.PAIR_CONFIRM_ACTION, false, () -> pairWith(link));
+    }
+    static String deviceLabel() {
+        String maker = android.os.Build.MANUFACTURER == null ? "" : android.os.Build.MANUFACTURER.trim();
+        String model = android.os.Build.MODEL == null ? "" : android.os.Build.MODEL.trim();
+        if (!maker.isEmpty() && !model.toLowerCase(Locale.ROOT).startsWith(maker.toLowerCase(Locale.ROOT)))
+            model = Character.toUpperCase(maker.charAt(0)) + maker.substring(1) + " " + model;
+        return PairingLink.validLabel(model) ? model : "Android 手机";
+    }
+    /** Enrols over pinned TLS, then reuses the normal connect path (which saves and connects). */
+    void pairWith(PairingLink link) {
+        String label = deviceLabel();
+        ui.setConnection(AppShell.CONNECTING, link.hostName);
+        status(String.format(Locale.ROOT, S.PAIRING_NOW, link.hostName));
+        job(() -> {
+            Remote.Credentials c;
+            try {
+                c = Remote.pair(link, label);
+            } catch (Remote.PairingException e) {
+                String why = S.PAIR_ERRORS[e.reason.ordinal()];
+                runOnUiThread(() -> {
+                    ui.setConnection(AppShell.FAILED, link.hostName);
+                    ui.deviceState.setText(why);
+                    Sheet.info(this, S.PAIR_FAILED_TITLE, why);
+                });
+                return;
+            }
+            runOnUiThread(() -> {
+                host.setText((c.host.indexOf(':') >= 0 ? "[" + c.host + "]" : c.host) + ":" + c.port);
+                pin.setText(c.pin);
+                secret.setText(c.token);
+                ui.device.summarize();
+                status(S.PAIRED_OK);
+                pairDevice();
+            });
+        });
+    }
     /**
      * Ends every channel to the computer and keeps the saved pairing (address, fingerprint, key):
      * picture, sound, control, file browsing and transfers stop; “连接电脑” resumes.
@@ -430,8 +514,8 @@ public final class MainActivity extends Activity {
     void parentFolder(){String current=path.getText().toString();int slash=current.lastIndexOf('/');ui.files.navigate(slash<0?"":current.substring(0,slash));}
     boolean notificationsAllowed(){return Build.VERSION.SDK_INT<33||checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)==android.content.pm.PackageManager.PERMISSION_GRANTED;}
     void enableTransferNotifications(){if(!notificationsAllowed())requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS},201);else status("传输通知已允许");}
-    @Override public void onRequestPermissionsResult(int request,String[] permissions,int[] results){super.onRequestPermissionsResult(request,permissions,results);if(request==201){boolean granted=results.length>0&&results[0]==android.content.pm.PackageManager.PERMISSION_GRANTED;ui.device.notificationsAllowed(granted);status(granted?"传输通知已开启":"未允许通知；可在传输页查看并暂停后台任务");}}
-    @Override protected void onNewIntent(Intent intent){super.onNewIntent(intent);setIntent(intent);if(intent.getBooleanExtra("open_transfers",false)){desktopLayout.setFullscreen(false);ui.select(AppShell.TRANSFERS);}}
+    @Override public void onRequestPermissionsResult(int request,String[] permissions,int[] results){super.onRequestPermissionsResult(request,permissions,results);if(request==REQUEST_CAMERA){if(results.length>0&&results[0]==android.content.pm.PackageManager.PERMISSION_GRANTED)startActivityForResult(new Intent(this,ScanActivity.class),REQUEST_SCAN);else Sheet.info(this,S.SCAN_PAIR,S.CAMERA_DENIED);return;}if(request==201){boolean granted=results.length>0&&results[0]==android.content.pm.PackageManager.PERMISSION_GRANTED;ui.device.notificationsAllowed(granted);status(granted?"传输通知已开启":"未允许通知；可在传输页查看并暂停后台任务");}}
+    @Override protected void onNewIntent(Intent intent){super.onNewIntent(intent);setIntent(intent);if(intent.getBooleanExtra("open_transfers",false)){desktopLayout.setFullscreen(false);ui.select(AppShell.TRANSFERS);}handleViewIntent(intent);}
     void networkDiagnostics(){
         Remote.Credentials c=credentials;if(c==null){status("请先连接电脑，再测量实际网络");return;}
         status(S.DIAG_RUNNING);cancelled.set(false);
@@ -877,6 +961,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if(request==REQUEST_SCAN){if(result==RESULT_OK&&data!=null)pairingLink(data.getStringExtra(ScanActivity.EXTRA_LINK));return;}
         if(request==102&&result==RESULT_OK&&data!=null&&data.getData()!=null){
             Uri tree=data.getData();try{getContentResolver().takePersistableUriPermission(tree,Intent.FLAG_GRANT_READ_URI_PERMISSION);
                 String doc=android.provider.DocumentsContract.getTreeDocumentId(tree);Uri rootUri=android.provider.DocumentsContract.buildDocumentUriUsingTree(tree,doc);String name;

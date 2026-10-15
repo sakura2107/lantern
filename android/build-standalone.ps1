@@ -16,10 +16,11 @@ $Java=Join-Path $Jdk 'bin\java.exe'
 $Jar=Join-Path $Jdk 'bin\jar.exe'
 $AndroidJar=Join-Path $Platform 'android.jar'
 $Sources=Get-ChildItem "$PSScriptRoot\app\src\main\java","$PSScriptRoot\app\src\debug\java" -Filter '*.java' -Recurse | ForEach-Object FullName
-& (Join-Path $Jdk 'bin\javac.exe') --release 17 -encoding UTF-8 -classpath $AndroidJar -d $LanternJavaClasses $Sources
+$Libs=@(Get-ChildItem "$PSScriptRoot\libs\*.jar" | ForEach-Object FullName)  # ZXing core (QR scanning)
+& (Join-Path $Jdk 'bin\javac.exe') --release 17 -encoding UTF-8 -classpath ((@($AndroidJar)+$Libs) -join ';') -d $LanternJavaClasses $Sources
 Check-Exit 'Java compile'
 $Classes=Get-ChildItem $LanternJavaClasses -Filter '*.class' -Recurse | ForEach-Object FullName
-& $Java -cp "$BuildTools\lib\d8.jar" com.android.tools.r8.D8 --release --min-api 26 --lib $AndroidJar --output "$ScratchDir\dex" $Classes
+& $Java -cp "$BuildTools\lib\d8.jar" com.android.tools.r8.D8 --release --min-api 26 --lib $AndroidJar --output "$ScratchDir\dex" $Classes $Libs
 Check-Exit 'Dex conversion'
 $Clang=Join-Path $Ndk 'toolchains\llvm\prebuilt\windows-x86_64\bin\clang++.exe'
 $Core=(Resolve-Path "$PSScriptRoot\..").Path

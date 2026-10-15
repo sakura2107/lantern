@@ -14,7 +14,7 @@ final class Glyph extends Drawable {
                      COMMAND = 38, TRASH = 39, EDIT = 40, COPY = 41, MOVE = 42, INFO = 43, OPEN = 44,
                      FOLDER_PLUS = 45, SELECT = 46, PULSE = 47, BELL = 48, LICENSE = 49, TOOLS = 50,
                      CHEVRON_DOWN = 51, TOP = 52, STOP = 53, HOME = 54, PASTE = 55, CLOCK = 56,
-                     WARNING = 57, SELECT_ALL = 58, LOCK = 59, CHEVRON_LEFT = 60, MOUSE_RIGHT = 61;
+                     WARNING = 57, SELECT_ALL = 58, LOCK = 59, CHEVRON_LEFT = 60, MOUSE_RIGHT = 61, SCAN = 62;
 
     final int kind;
     final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG), fill = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -89,6 +89,9 @@ final class Glyph extends Drawable {
         case CHEVRON_LEFT: poly(c, false, 14.5f, 6, 8.5f, 12, 14.5f, 18); break;
         case CHEVRON_DOWN: poly(c, false, 6, 9.5f, 12, 15.5f, 18, 9.5f); break;
         case BACK: poly(c, false, 11, 5, 4, 12, 11, 19); line(c, 4.5f, 12, 20, 12); break;
+        case SCAN: poly(c, false, 3.5f, 8, 3.5f, 3.5f, 8, 3.5f); poly(c, false, 16, 3.5f, 20.5f, 3.5f, 20.5f, 8);
+            poly(c, false, 20.5f, 16, 20.5f, 20.5f, 16, 20.5f); poly(c, false, 8, 20.5f, 3.5f, 20.5f, 3.5f, 16);
+            line(c, 6.5f, 12, 17.5f, 12); break;
         case SEARCH: c.drawCircle(10.5f, 10.5f, 6, stroke); line(c, 15, 15, 20, 20); break;
         case SORT: line(c, 4, 7, 14, 7); line(c, 4, 12, 11, 12); line(c, 4, 17, 8, 17);
             line(c, 18, 5, 18, 19); poly(c, false, 15, 16, 18, 19, 21, 16); break;

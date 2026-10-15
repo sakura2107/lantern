@@ -1,4 +1,6 @@
 #include "lantern/discovery.hpp"
+#include "lantern/pairing.hpp"
+#include "lantern/pairing_client.hpp"
 #include "lantern/windows_client.hpp"
 #include "lantern/windows_clipboard.hpp"
 #include "lantern/windows_media.hpp"
@@ -77,6 +79,7 @@ struct Update {
     bool discovery_result = false;
     std::vector<DiscoveredDevice> discovered;
     int connection = -1;
+    std::optional<ClientCredentials> paired; // fills the device fields after link pairing
 };
 std::deque<Update> updates;
 bool update_posted = false;
@@ -370,7 +373,7 @@ void layout() {
             y += dp(52);
         }
         ui::Flow f(cx + lw, cr, y + dp(4), dp(10));
-        for (int id : {10, 73, 22})
+        for (int id : {10, 73, 121, 22})
             f.place(ctl(id), dp(40));
         y = f.bottom() + pad;
         scene.card({x0, y0, x0 + cw, y});
@@ -1159,6 +1162,86 @@ void command(int id) {
             u.status = L"设备已验证并保存（DPAPI）。" + wide(caps);
             publish(std::move(u));
         });
+    } else if (id == 121) {
+        // Pair with the one-time link copied from the host manager's scan-to-pair window.
+        std::wstring prefill;
+        if (OpenClipboard(window)) {
+            if (auto data = GetClipboardData(CF_UNICODETEXT))
+                if (auto p = static_cast<const wchar_t*>(GlobalLock(data))) {
+                    std::wstring clip(p);
+                    GlobalUnlock(data);
+                    if (clip.starts_with(L"lantern://pair?"))
+                        prefill = clip;
+                }
+            CloseClipboard();
+        }
+        auto entered = ui::prompt(window, L"用配对链接连接", L"粘贴电脑上“扫码添加设备”窗口里复制的链接：", prefill, L"下一步");
+        if (!entered)
+            return;
+        auto link = parse_pairing_uri(utf8(*entered));
+        if (!link)
+            throw Error(Code::invalid, "链接无效或已过期，请在电脑上刷新二维码后重新复制");
+        std::wstring groups;
+        for (size_t i = 0; i < 16 && i + 4 <= link->pin.size(); i += 4)
+            groups += wide(link->pin.substr(i, 4)) + L" ";
+        auto question = L"将与这台电脑配对：\n\n名称：" + wide(link->host_name) + L"\n地址：" +
+                        wide(format_endpoint({link->addresses.front(), link->port})) + L"\n指纹开头：" + groups +
+                        L"…\n\n请确认它和电脑主机管理里显示的一致。";
+        if (MessageBoxW(window, question.c_str(), L"确认电脑", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
+            return;
+        wchar_t name[256]{};
+        DWORD size = 256;
+        std::string label = "Windows 客户端";
+        if (GetComputerNameExW(ComputerNamePhysicalDnsHostname, name, &size) && size)
+            if (auto candidate = utf8(name) + " (Windows)"; valid_pairing_label(candidate))
+                label = candidate;
+        connection_state = 4;
+        status(L"正在与 " + wide(link->host_name) + L" 配对…");
+        enqueue([l = *link, label] {
+            try {
+                auto r = pair_with_link(l, label);
+                ClientCredentials c;
+                c.host = r.host;
+                c.port = r.port;
+                c.pin = r.pin;
+                c.token = r.token;
+                auto client = c.connect(0, 0);
+                auto b = client->call(Op::capabilities);
+                Reader rd{b};
+                auto caps = rd.str();
+                rd.end();
+                save_credentials(state_dir / L"device.dpapi", c);
+                {
+                    std::lock_guard lock(credentials_mutex);
+                    credentials = c;
+                    av_timeline = std::make_shared<AvTimeline>();
+                }
+                Update u;
+                u.connection = 2;
+                u.paired = c;
+                u.status = L"已配对并保存（DPAPI）。" + wide(caps);
+                publish(std::move(u));
+            } catch (const PairingError& e) {
+                const wchar_t* why[] = {
+                    L"链接无效或已过期，请在电脑上刷新二维码（也请检查两台电脑的时间）。",
+                    L"电脑端版本过旧，请更新主机后重新生成二维码。",
+                    L"配对码无效、已使用或已过期，请在电脑上刷新二维码。",
+                    L"所有地址都连不上：请确认在同一局域网、主机已启动，并已允许通过防火墙。",
+                    L"电脑身份与链接不一致，已停止配对。请重新核对电脑上的二维码。",
+                    L"尝试过于频繁，请一分钟后再试。",
+                    L"配对响应无效，没有保存任何凭据。请检查两端版本。",
+                    L"连接中断，无法确认是否已配对。请在电脑的设备列表里检查，撤销多余条目后重新生成二维码。"};
+                Update failed;
+                failed.connection = 3;
+                failed.status = why[size_t(e.reason)];
+                publish(std::move(failed));
+            } catch (...) {
+                Update failed;
+                failed.connection = 3;
+                publish(std::move(failed));
+                throw;
+            }
+        });
     } else if (id == 72) {
         wchar_t exe[32768]{};
         GetModuleFileNameW(nullptr, exe, 32768);
@@ -1751,6 +1834,7 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(ctl(3), EM_SETCUEBANNER, TRUE, (LPARAM)L"主机管理为此设备生成的密钥");
             button(10, 0, Kind::Primary, L"验证并保存", g::check, ui::Surface::Card);
             button(73, 0, Kind::Secondary, L"发现局域网电脑", g::search, ui::Surface::Card);
+            button(121, 0, Kind::Secondary, L"用配对链接连接", g::link, ui::Surface::Card);
             button(22, 0, Kind::Secondary, L"网络诊断", g::diagnose, ui::Surface::Card);
             child(114, 0, L"STATIC", ui_text::privacy, SS_NOPREFIX);
             // Desktop: four independent switches, then picture tools, then keyboard and clipboard.
@@ -2003,6 +2087,11 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     SetWindowTextW(statusbox, u.status.c_str());
                 if (u.connection >= 0)
                     connection_state = u.connection;
+                if (u.paired) {
+                    SetWindowTextW(ctl(1), wide(format_endpoint({u.paired->host, u.paired->port})).c_str());
+                    SetWindowTextW(ctl(2), wide(u.paired->pin).c_str());
+                    SetWindowTextW(ctl(3), wide(u.paired->token).c_str());
+                }
                 if (u.epoch == UINT_MAX && !u.listing) {
                     SetWindowTextW(ctl(62), wide(u.path).c_str());
                     relayout = true;

@@ -20,15 +20,17 @@ New-Item -ItemType Directory -Force "$Work\classes","$Work\dex" | Out-Null
 Copy-Item -Recurse "$PSScriptRoot\app\src\main\java" "$Work\main"
 Copy-Item -Recurse "$PSScriptRoot\app\src\debug\java" "$Work\debug"
 Copy-Item -Recurse "$PSScriptRoot\app\src\main\res" "$Work\res"
+Copy-Item -Recurse "$PSScriptRoot\app\src\main\assets" "$Work\assets"
+$Libs=@(Get-ChildItem "$PSScriptRoot\libs\*.jar" | ForEach-Object { Copy-Item $_.FullName "$Work\$($_.Name)"; "$Work\$($_.Name)" })
 Copy-Item "$PSScriptRoot\tools\Repack.java" "$Work\Repack.java"
 Copy-Item $BaseApk "$Work\base.apk"
 Get-ChildItem "$Work\main","$Work\debug" -Recurse -Filter *.java | ForEach-Object FullName | Set-Content -Encoding ASCII "$Work\sources.txt"
 # Tool notes on stderr are not failures in Windows PowerShell; exit codes are checked instead.
 $ErrorActionPreference='Continue'
-& "$Jdk\bin\javac.exe" --release 17 -encoding UTF-8 -nowarn -classpath $AndroidJar -d "$Work\classes" "@$Work\sources.txt"
+& "$Jdk\bin\javac.exe" --release 17 -encoding UTF-8 -nowarn -classpath ((@($AndroidJar)+$Libs) -join ';') -d "$Work\classes" "@$Work\sources.txt"
 Check-Exit 'Java compile'
 & "$Jdk\bin\jar.exe" cf "$Work\classes.jar" -C "$Work\classes" .
-& $Java -cp "$BuildTools\lib\d8.jar" com.android.tools.r8.D8 --release --min-api 26 --lib $AndroidJar --output "$Work\dex" "$Work\classes.jar"
+& $Java -cp "$BuildTools\lib\d8.jar" com.android.tools.r8.D8 --release --min-api 26 --lib $AndroidJar --output "$Work\dex" "$Work\classes.jar" $Libs
 Check-Exit 'Dex conversion'
 # Same debug manifest as build-standalone.ps1.
 $Manifest=Get-Content "$PSScriptRoot\app\src\main\AndroidManifest.xml" -Raw
@@ -39,7 +41,7 @@ $Manifest=$Manifest.Replace('</manifest>', '<instrumentation android:name="org.l
 Set-Content "$Work\AndroidManifest.xml" $Manifest -Encoding utf8
 & "$BuildTools\aapt2.exe" compile --dir "$Work\res" -o "$Work\res.zip"
 Check-Exit 'Launcher icon resources'
-& "$BuildTools\aapt2.exe" link -I $AndroidJar --manifest "$Work\AndroidManifest.xml" -R "$Work\res.zip" --min-sdk-version 26 --target-sdk-version 35 --version-code 1 --version-name 0.1.0 -o "$Work\resources.apk"
+& "$BuildTools\aapt2.exe" link -I $AndroidJar --manifest "$Work\AndroidManifest.xml" -R "$Work\res.zip" -A "$Work\assets" --min-sdk-version 26 --target-sdk-version 35 --version-code 1 --version-name 0.1.0 -o "$Work\resources.apk"
 Check-Exit 'Android resources'
 & $Java "$Work\Repack.java" "$Work\base.apk" "$Work\dex\classes.dex" "$Work\resources.apk" "$Work\unsigned.apk"
 Check-Exit 'Repack'

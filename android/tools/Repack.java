@@ -5,7 +5,7 @@ import java.util.zip.*;
 
 /**
  * Rebuilds a debug APK without Gradle: keeps the base APK's native libraries and assets, swaps in a fresh
- * classes.dex and takes the manifest, resources.arsc and res/ (launcher icons) from an aapt2-linked APK.
+ * classes.dex and takes the manifest, resources.arsc, res/ (launcher icons) and assets/ from an aapt2-linked APK.
  * Usage: java Repack.java base.apk classes.dex resources.apk out.apk  (then zipalign -P 16 4 and apksigner).
  * Old signatures are dropped. Each entry keeps its source compression, so .so files and resources.arsc stay stored.
  */
@@ -18,8 +18,9 @@ public class Repack {
                 if (resource(e.getName())) fresh.put(e.getName(), e);
             if (!fresh.containsKey("AndroidManifest.xml") || !fresh.containsKey("resources.arsc"))
                 throw new IOException("resources APK lacks AndroidManifest.xml or resources.arsc");
+            // aapt2 on Windows can store nested asset paths with '\'; APK entry names must use '/'.
             for (ZipEntry e : fresh.values())
-                put(out, e.getName(), res.getInputStream(e).readAllBytes(), e.getMethod());
+                put(out, e.getName().replace('\\', '/'), res.getInputStream(e).readAllBytes(), e.getMethod());
             int kept = 0;
             for (ZipEntry e : Collections.list(base.entries())) {
                 String n = e.getName();
@@ -33,7 +34,7 @@ public class Repack {
     }
 
     static boolean resource(String n) {
-        return n.equals("AndroidManifest.xml") || n.equals("resources.arsc") || n.startsWith("res/");
+        return n.equals("AndroidManifest.xml") || n.equals("resources.arsc") || n.startsWith("res/") || n.startsWith("assets/");
     }
 
     static void put(ZipOutputStream out, String n, byte[] data, int method) throws IOException {

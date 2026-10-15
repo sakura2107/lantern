@@ -34,7 +34,7 @@ final class S {
         ENDED_BY_HOST_NOTICE = "电脑已结束此设备的连接，已断开",
         ENDED_BY_HOST_DETAIL = "电脑在主机管理中结束了此设备的连接。配对仍然有效，需要时点“连接电脑”重新连接。";
     static final String HERO_UNPAIRED = "还没有连接电脑";
-    static final String HERO_UNPAIRED_DETAIL = "填写电脑地址、主机指纹和设备密钥，完成一次配对后即可浏览文件、远程桌面和收听系统声音。";
+    static final String HERO_UNPAIRED_DETAIL = "在电脑的 Lantern 主机管理里点“扫码添加设备”，再点这里的“扫码配对”扫一下就能连上。也可以在下方手动填写。";
     static final String HERO_SAVED = "已保存一台电脑", HERO_SAVED_AT = "%s";
     static final String HERO_SAVED_DETAIL = "连接以验证电脑身份。后台传输任务会按原授权继续。";
     static final String HERO_CONNECTING = "正在连接", HERO_CONNECTING_TO = "正在连接 %s";
@@ -217,4 +217,27 @@ final class S {
     static final String CLEAR_CONFIRM = "清理";
     static final String LIMIT_TITLE = "传输限速", LIMIT_DETAIL = "当前生效 %s。画面或声音开启时会自动进一步限制，保证实时流畅。";
     static final String LIMIT_MAX = "不额外限制";
+
+    // Scan-to-pair
+    static final String SCAN_PAIR = "扫码配对", PASTE_PAIR_LINK = "粘贴链接", CANCEL_SCAN = "取消";
+    static final String SCAN_TITLE = "对准电脑上的二维码", SCAN_SUBTITLE = "在电脑 Lantern 主机管理里点“扫码添加设备”";
+    static final String SCAN_NOT_LANTERN = "这不是 Lantern 的配对二维码";
+    static final String CAMERA_DENIED = "没有相机权限。可以改用“粘贴链接”，或在系统设置里允许相机。";
+    static final String CAMERA_FAILED = "无法打开相机，可以改用“粘贴链接”", CAMERA_NONE = "这台手机没有可用的相机";
+    static final String CLIPBOARD_NOT_LINK = "剪贴板里没有 Lantern 配对链接";
+    static final String LINK_INVALID_TITLE = "二维码无法使用";
+    static final String LINK_INVALID_DETAIL = "二维码无效或已过期。请在电脑上点“刷新二维码”后重新扫描。如果手机时间不准，也会出现这个提示。";
+    static final String PAIR_CONFIRM_TITLE = "与这台电脑配对？";
+    static final String PAIR_CONFIRM = "名称：%s\n地址：%s\n指纹：%s …\n\n请确认和电脑上显示的一致。配对后，这台手机会出现在电脑的设备列表里。";
+    static final String PAIR_CONFIRM_ACTION = "配对并连接", PAIRING_NOW = "正在与 %s 配对…", PAIRED_OK = "配对成功，正在连接…";
+    static final String PAIR_FAILED_TITLE = "配对没有完成";
+    static final String[] PAIR_ERRORS = {
+        "二维码无效或已过期，请在电脑上刷新二维码；如果手机时间不准，也请校正。",
+        "电脑端 Lantern 版本过旧，请更新后重新生成二维码。",
+        "配对码无效、已被使用或已过期，请在电脑上刷新二维码。",
+        "连不上电脑：请确认手机和电脑在同一个局域网、主机已启动，并已允许通过防火墙。",
+        "电脑身份和二维码不一致，已停止配对。请重新核对电脑上的二维码。",
+        "尝试太频繁了，请一分钟后再试。",
+        "电脑的回应无效，没有保存任何凭据。请检查两端的版本。",
+        "连接中断，无法确认是否已配对。请在电脑的设备列表里检查，删掉多余的条目后重新生成二维码。"};
 }

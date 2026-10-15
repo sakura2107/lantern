@@ -17,7 +17,7 @@ final class DevicePage {
     final ScrollView view;
     final Lamp lamp;
     final TextView headline, detail, fingerprintSummary, pinHint, formSummary;
-    final Button pair, browse, disconnect;
+    final Button scan, pair, browse, disconnect;
     final EditText host, pin, secret;
     final LinearLayout form, formHeader;
     final ImageView formChevron;
@@ -60,9 +60,16 @@ final class DevicePage {
         detail.setPadding(0, Theme.dp(14), 0, Theme.dp(16));
         hero.addView(detail);
         LinearLayout actions = Ui.row(a);
+        // First pairing: scanning the computer's QR is the main path; manual entry stays below.
+        scan = Ui.button(a, S.SCAN_PAIR, Ui.PRIMARY, a::scanPairing);
+        Ui.withIcon(scan, Glyph.SCAN);
+        Ui.id(scan, "device.scan");
+        actions.addView(scan, new LinearLayout.LayoutParams(0, Theme.dp(48), 1));
         pair = Ui.button(a, S.CONNECT, Ui.PRIMARY, a::pairDevice);
         Ui.id(pair, "device.connect");
-        actions.addView(pair, new LinearLayout.LayoutParams(0, Theme.dp(48), 1));
+        LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(0, Theme.dp(48), 1);
+        cp.setMarginStart(Theme.dp(10));
+        actions.addView(pair, cp);
         browse = Ui.button(a, S.BROWSE_FILES, Ui.SECONDARY, () -> shell.select(AppShell.FILES));
         Ui.id(browse, "device.browse");
         LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(0, Theme.dp(48), 1);
@@ -101,6 +108,20 @@ final class DevicePage {
         form.setBackground(Ui.outline(Theme.SURFACE, Theme.LINE, 20));
         form.setPadding(Theme.dp(16), Theme.dp(4), Theme.dp(16), Theme.dp(16));
         content.addView(form, Ui.lp(-1, -2));
+
+        LinearLayout quick = Ui.row(a);
+        quick.setPadding(0, Theme.dp(12), 0, Theme.dp(2));
+        Button formScan = Ui.button(a, S.SCAN_PAIR, Ui.SECONDARY, a::scanPairing);
+        Ui.withIcon(formScan, Glyph.SCAN);
+        Ui.id(formScan, "device.form.scan");
+        quick.addView(formScan, new LinearLayout.LayoutParams(0, Theme.dp(44), 1));
+        Button pasteLink = Ui.button(a, S.PASTE_PAIR_LINK, Ui.SECONDARY, a::pastePairingLink);
+        Ui.withIcon(pasteLink, Glyph.CLIPBOARD);
+        Ui.id(pasteLink, "device.form.paste");
+        LinearLayout.LayoutParams qp = new LinearLayout.LayoutParams(0, Theme.dp(44), 1);
+        qp.setMarginStart(Theme.dp(8));
+        quick.addView(pasteLink, qp);
+        form.addView(quick, Ui.lp(-1, -2));
 
         form.addView(Ui.label(a, S.FIELD_HOST));
         LinearLayout hostRow = Ui.row(a);
@@ -273,6 +294,9 @@ final class DevicePage {
         // Connected or (re)connecting: offer disconnect (it also cancels a pending connect).
         boolean live = state == AppShell.CONNECTED || (state == AppShell.CONNECTING && a.credentials != null);
         pair.setVisibility(state == AppShell.CONNECTED ? View.GONE : View.VISIBLE);
+        // Scanning leads only while nothing usable is saved; afterwards “连接电脑” is the main action.
+        boolean offerScan = state != AppShell.CONNECTED && state != AppShell.CONNECTING && state != AppShell.SAVED;
+        scan.setVisibility(offerScan ? View.VISIBLE : View.GONE);
         disconnect.setVisibility(live ? View.VISIBLE : View.GONE);
         switch (state) {
         case AppShell.CONNECTED:
@@ -325,6 +349,8 @@ final class DevicePage {
             browse.setVisibility(View.GONE);
             setFormOpen(true);
         }
+        if (offerScan)
+            Ui.style(pair, Ui.SECONDARY);
     }
 
     void notificationsAllowed(boolean allowed) {
