@@ -24,16 +24,15 @@ Lantern 适合这样的场景：人在沙发上，想用手机看书房电脑里
 
 > 目前是 0.1 实验版。主要功能都能用、也在真机上测过，但还不是一个完成的产品，详见[现状与限制](#现状与限制)。
 
-<table>
-  <tr>
-    <td width="62%"><img src="docs/screenshots/windows-client.png" alt="Windows 客户端"></td>
-    <td><img src="docs/screenshots/android-desktop.png" alt="Android 远程桌面"></td>
-  </tr>
-  <tr>
-    <td><img src="docs/screenshots/windows-host.png" alt="主机管理"></td>
-    <td><img src="docs/screenshots/android-transfers.png" alt="Android 传输"></td>
-  </tr>
-</table>
+<p align="center">
+  <img src="docs/screenshots/windows-client.png" width="520" alt="Windows 客户端：浏览电脑文件">
+  &nbsp;
+  <img src="docs/screenshots/android-desktop.png" width="160" alt="Android：远程桌面">
+  <img src="docs/screenshots/android-transfers.png" width="160" alt="Android：传输">
+</p>
+<p align="center">
+  <img src="docs/screenshots/windows-host.png" width="520" alt="主机管理：设备与权限">
+</p>
 
 ## 功能
 
