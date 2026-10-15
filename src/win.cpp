@@ -164,13 +164,33 @@ void save_config(const fs::path& p, const Config& c) {
            std::find(ids.begin(),ids.end(),d.id)!=ids.end()||std::find(tokens.begin(),tokens.end(),d.token)!=tokens.end())throw Error(Code::invalid,"Invalid or duplicated device trust");
         (void)wide(d.label);ids.push_back(d.id);tokens.push_back(d.token);
     }
+    if (c.invites.size() > 32)
+        throw Error(Code::invalid, "Invitation count bound");
+    std::vector<std::string> invite_ids;
+    for (auto& i : c.invites) {
+        if (i.id.size() != 32 || !valid_sha(i.id + i.id) || !valid_sha(i.code_hash) ||
+            !valid_pairing_label(i.label) || !i.scopes || (i.scopes & ~31u) || !i.expires_at ||
+            i.expires_at > 4102444800ULL || i.failed_attempts >= 5 ||
+            std::find(invite_ids.begin(), invite_ids.end(), i.id) != invite_ids.end())
+            throw Error(Code::invalid, "Invalid invitation configuration");
+        invite_ids.push_back(i.id);
+    }
     Writer w;
-    w.u16(2);
+    w.u16(3);
     w.str(utf8(fs::absolute(c.root).wstring()));
     w.str(c.token);
     w.u32(c.scopes);
     w.u32(c.legacy_enabled?1:0);w.u64(c.legacy_epoch);w.u32(uint32_t(c.devices.size()));
     for(auto& d:c.devices){w.str(d.id);w.str(d.label);w.str(d.token);w.u32(d.scopes);w.u64(d.epoch);}
+    w.u32(uint32_t(c.invites.size()));
+    for (auto& i : c.invites) {
+        w.str(i.id);
+        w.str(i.label);
+        w.str(i.code_hash);
+        w.u32(i.scopes);
+        w.u64(i.expires_at);
+        w.u32(i.failed_attempts);
+    }
     auto b = protect(w.b);
     auto temp = p;
     temp += L".new-" + wide(random_token().substr(0, 12));
@@ -191,18 +211,38 @@ Config load_config(const fs::path& p) {
     auto b = unprotect(cipher);
     Reader r{b};
     auto version=r.u16();
-    if (version != 1&&version!=2)
+    if (version != 1 && version != 2 && version != 3)
         throw Error(Code::unsupported, "Configuration version");
     Config c;
     c.root = wide(r.str());
     c.token = r.str(128);
     c.scopes = r.u32();
-    if(version==2){
+    if (version >= 2) {
         auto enabled=r.u32();c.legacy_epoch=r.u64();auto count=r.u32();if(enabled>1||count>64)throw Error(Code::invalid,"Trust configuration bound");c.legacy_enabled=enabled!=0;
         for(uint32_t i=0;i<count;i++){TrustedDevice d;d.id=r.str(64);d.label=r.str(128);d.token=r.str(64);d.scopes=r.u32();d.epoch=r.u64();
             if(!valid_sha(d.id)||!valid_sha(d.token)||(d.scopes&~31u)||d.label.empty()||std::any_of(d.label.begin(),d.label.end(),[](unsigned char ch){return ch<32||ch==127;})||
                d.token==c.token||std::any_of(c.devices.begin(),c.devices.end(),[&](auto& old){return old.id==d.id||old.token==d.token;}))throw Error(Code::invalid,"Device configuration corrupt");
             (void)wide(d.label);c.devices.push_back(std::move(d));
+        }
+    }
+    if (version >= 3) {
+        auto count = r.u32();
+        if (count > 32)
+            throw Error(Code::invalid, "Invitation count bound");
+        for (uint32_t at = 0; at < count; ++at) {
+            InviteRecord i;
+            i.id = r.str(32);
+            i.label = r.str(64);
+            i.code_hash = r.str(64);
+            i.scopes = r.u32();
+            i.expires_at = r.u64();
+            i.failed_attempts = r.u32();
+            if (i.id.size() != 32 || !valid_sha(i.id + i.id) || !valid_sha(i.code_hash) ||
+                !valid_pairing_label(i.label) || !i.scopes || (i.scopes & ~31u) || !i.expires_at ||
+                i.expires_at > 4102444800ULL || i.failed_attempts >= 5 ||
+                std::any_of(c.invites.begin(), c.invites.end(), [&](auto& old) { return old.id == i.id; }))
+                throw Error(Code::invalid, "Invitation configuration corrupt");
+            c.invites.push_back(std::move(i));
         }
     }
     r.end();

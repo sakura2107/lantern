@@ -45,6 +45,97 @@ static bool disconnected(Client& c) {
         return true;
     }
 }
+static void invitation_checks(const fs::path& root, const fs::path& share) {
+    auto state = root / L"invite-state";
+    HostAdministration::initialize(state, share, 31);
+    HostAdministration admin(state);
+    auto previous = load_config(state / L"config.dpapi");
+    Writer v2;
+    v2.u16(2);
+    v2.str(utf8(previous.root.wstring()));
+    v2.str(previous.token);
+    v2.u32(previous.scopes);
+    v2.u32(previous.legacy_enabled ? 1 : 0);
+    v2.u64(previous.legacy_epoch);
+    v2.u32(0);
+    write_file(state / L"config.dpapi", protect(v2.b));
+    auto invite = admin.invite("生成邀请", 3);
+    auto migrated = load_config(state / L"config.dpapi");
+    check(migrated.token == previous.token && migrated.root == previous.root &&
+              migrated.scopes == previous.scopes && migrated.legacy_enabled == previous.legacy_enabled,
+          "v2 invitation migration preserves legacy configuration");
+    check(invite.code.size() == 64 && invite.id == invite.code.substr(0, 32) &&
+              invite.expires_at > pairing_unix_time(),
+          "invitation generated with default TTL");
+    auto pending = admin.invites();
+    check(pending.size() == 1 && pending[0].scopes == 3 && pending[0].label == "生成邀请",
+          "pending metadata contains no code");
+    auto clear = unprotect(read_file(state / L"config.dpapi"));
+    auto contains = [&](const std::string& s) {
+        return std::search(clear.begin(), clear.end(), s.begin(), s.end()) != clear.end();
+    };
+    check(!contains(invite.code) && !contains(invite.code.substr(32)),
+          "invitation plaintext absent even after DPAPI decryption");
+    auto cfg = load_config(state / L"config.dpapi");
+    check(contains(cfg.invites[0].code_hash), "config stores SHA256 digest only");
+    auto device = admin.redeem_invite(invite.code, "Android fixture");
+    check(device.scopes == 3 && valid_sha(device.id) && valid_sha(device.token) && admin.invites().empty(),
+          "invitation consumed with distinct device credential");
+    expect(Code::unauthorized, [&] { admin.redeem_invite(invite.code, "Again"); }, "invitation single use");
+    auto expired = admin.invite("Expires", 1);
+    edit_config(state / L"config.dpapi",
+                [&](Config& c) { c.invites.back().expires_at = pairing_unix_time() - 1; });
+    expect(
+        Code::unauthorized, [&] { admin.redeem_invite(expired.code, "Expired"); },
+        "expired invitation rejected");
+    check(admin.invites().empty(), "expired invitation cleaned on access");
+    auto wrong = admin.invite("Wrong attempts", 1);
+    auto guessed = wrong.code;
+    guessed.back() = guessed.back() == '0' ? '1' : '0';
+    for (unsigned i = 0; i < 5; ++i)
+        expect(
+            Code::unauthorized, [&] { admin.redeem_invite(guessed, "Wrong"); },
+            "incorrect invitation attempt rejected");
+    expect(
+        Code::unauthorized, [&] { admin.redeem_invite(wrong.code, "Now correct"); },
+        "five wrong secrets invalidate selected invitation");
+    check(admin.invites().empty(), "invalidated invitation cleaned");
+    auto canceled = admin.invite("Canceled", 1);
+    admin.cancel_invite(canceled.id);
+    admin.cancel_invite(canceled.id);
+    expect(
+        Code::unauthorized, [&] { admin.redeem_invite(canceled.code, "Canceled"); },
+        "cancel invitation is effective and idempotent");
+    auto reduced = admin.invite("Reduced", 3);
+    admin.ceiling(1);
+    check(admin.redeem_invite(reduced.code, "Least privilege").scopes == 1,
+          "redeem applies current ceiling intersection");
+    expect(
+        Code::unauthorized, [&] { admin.invite("Over ceiling", 2); },
+        "invitation cannot exceed host ceiling");
+    expect(
+        Code::invalid, [&] { admin.invite("Bad TTL", 1, std::chrono::seconds(0)); },
+        "nonpositive invitation TTL rejected");
+    auto race = admin.invite("Concurrent", 1);
+    std::atomic_uint succeeded = 0;
+    std::thread first([&] {
+        try {
+            admin.redeem_invite(race.code, "First");
+            ++succeeded;
+        } catch (const Error&) {
+        }
+    });
+    std::thread second([&] {
+        try {
+            HostAdministration(state).redeem_invite(race.code, "Second");
+            ++succeeded;
+        } catch (const Error&) {
+        }
+    });
+    first.join();
+    second.join();
+    check(succeeded == 1, "atomic invitation redemption accepts exactly one concurrent client");
+}
 int wmain(int argc, wchar_t** argv) {
     try {
         if (argc < 2)
@@ -75,6 +166,7 @@ int wmain(int argc, wchar_t** argv) {
         fs::create_directories(state);
         fs::create_directories(share);
         write_file(share / L"readme.txt", Bytes{'o', 'k'});
+        invitation_checks(root, share);
         auto fresh = root / L"wizard";
         HostAdministration::initialize(fresh, share, 1);
         HostAdministration wizard(fresh);

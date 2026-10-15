@@ -69,7 +69,8 @@ enum class Op : uint16_t {
     shortcut = 51,
     right_click = 52,
     clipboard_read = 53,
-    clipboard_write = 54
+    clipboard_write = 54,
+    pair = 55
 };
 struct Writer {
     Bytes b;

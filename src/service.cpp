@@ -1,5 +1,6 @@
 #include "lantern/clipboard.hpp"
 #include "lantern/discovery.hpp"
+#include "lantern/host_admin.hpp"
 #include "lantern/link_scheduler.hpp"
 #include "lantern/win.hpp"
 
@@ -32,6 +33,11 @@ struct Host::Impl {
         bool ended = false; // closed by an administrator (end session / end device)
     };
     std::map<SOCKET, Peer> authenticated;
+    std::mutex pairing_mutex;
+    struct PairWindow {
+        std::deque<std::chrono::steady_clock::time_point> attempts;
+    };
+    std::map<std::string, PairWindow> pairing_windows;
     /** session=end-v1: after an administrator ends a device's sessions, that device's *automatic*
      *  reconnects are refused until it connects deliberately (clears the hold) or the hold expires.
      *  Trust is unchanged; clients that never send the flag behave exactly as before. */
@@ -209,7 +215,7 @@ struct Host::Impl {
                   "pcm16-v1,codec-negotiation-v2;privacy-screen="
                   "unsupported;virtual-"
                   "display=unsupported;hardware-codec=optional-nvenc-h264;desktop-stream=h264-v1,h264-clock-"
-                  "v2;av-clock=host-qpc-v1;session=end-v1");
+                  "v2;av-clock=host-qpc-v1;session=end-v1;pair=qr-v1");
             break;
         case Op::list: {
             require(files_read);
@@ -416,7 +422,66 @@ struct Host::Impl {
             session = random_token();
             auto first = tls->receive();
             Reader auth{first};
-            if (auth.u16() != protocol_version || auth.u16() != uint16_t(Op::hello))
+            auto first_version = auth.u16();
+            auto first_op = auth.u16();
+            if (first_op == uint16_t(Op::pair)) {
+                Writer response;
+                response.u16(protocol_version);
+                response.u16(uint16_t(Op::pair));
+                try {
+                    // Count all PAIR frames, including invalid versions/fields, before parsing secrets.
+                    sockaddr_storage peer{};
+                    int length = sizeof(peer);
+                    char ip[NI_MAXHOST]{};
+                    if (getpeername(socket, reinterpret_cast<sockaddr*>(&peer), &length) ||
+                        getnameinfo(reinterpret_cast<sockaddr*>(&peer), length, ip, sizeof(ip), nullptr, 0,
+                                    NI_NUMERICHOST))
+                        throw Error(Code::busy, "无法校验配对来源，请重试");
+                    {
+                        std::lock_guard lock(pairing_mutex);
+                        auto now = std::chrono::steady_clock::now();
+                        for (auto& [key, window] : pairing_windows) {
+                            (void)key;
+                            while (!window.attempts.empty() &&
+                                   now - window.attempts.front() >= std::chrono::minutes(1))
+                                window.attempts.pop_front();
+                        }
+                        std::erase_if(pairing_windows,
+                                      [&](auto& item) { return item.second.attempts.empty(); });
+                        if (!pairing_windows.contains(ip) && pairing_windows.size() >= 1024)
+                            throw Error(Code::busy, "配对尝试过于频繁，请稍后重试");
+                        auto [at, inserted] = pairing_windows.try_emplace(ip);
+                        (void)inserted;
+                        if (at->second.attempts.size() >= 10)
+                            throw Error(Code::busy, "配对尝试过于频繁，请一分钟后重试");
+                        at->second.attempts.push_back(now);
+                    }
+                    if (first_version != protocol_version)
+                        throw Error(Code::unsupported, "不支持的配对协议版本，请更新客户端");
+                    auto code = auth.str(128), label = auth.str(64);
+                    auth.end();
+                    auto device = HostAdministration(state).redeem_invite(code, label);
+                    response.u32(0);
+                    response.str(device.id);
+                    response.str(device.token);
+                    response.u32(device.scopes);
+                } catch (const Error& error) {
+                    response.b.resize(4);
+                    response.u32(uint32_t(error.code));
+                    response.str(error.code == Code::unauthorized  ? "配对码无效或已过期，请在电脑刷新二维码"
+                                 : error.code == Code::busy        ? "配对尝试过于频繁或设备已满，请稍后重试"
+                                 : error.code == Code::unsupported ? "不支持的配对协议版本"
+                                                                   : "配对请求无效或无法保存，请重试");
+                } catch (...) {
+                    response.b.resize(4);
+                    response.u32(uint32_t(Code::io));
+                    response.str("配对无法完成，请重试");
+                }
+                tls->send(response.b);
+                // Use the normal cleanup path; do not leave this socket in active.
+                throw Error(Code::cancelled, "Pair connection complete");
+            }
+            if (first_version != protocol_version || first_op != uint16_t(Op::hello))
                 throw Error(Code::unsupported, "Protocol version or HELLO required");
             auto token = auth.str(128);
             auto requested = auth.u32(), channel = auth.u32();

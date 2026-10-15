@@ -1,9 +1,10 @@
 #pragma once
 #include "core.hpp"
+#include "pairing.hpp"
 #include <filesystem>
 #include <functional>
-#include <memory>
 #include <map>
+#include <memory>
 #include <optional>
 #include <windows.h>
 #include <winsock2.h>
@@ -208,6 +209,9 @@ public:
 };
 std::unique_ptr<AudioEncoder> open_opus_encoder(uint32_t sample_rate);
 struct TrustedDevice { std::string id,label,token; uint32_t scopes=files_read;uint64_t epoch=0; };
+struct InviteRecord : PendingInvite {
+    std::string code_hash;
+};
 struct Config {
     fs::path root;
     std::string token;
@@ -215,6 +219,7 @@ struct Config {
     bool legacy_enabled=true;
     uint64_t legacy_epoch=0;
     std::vector<TrustedDevice> devices;
+    std::vector<InviteRecord> invites;
 };
 void save_config(const fs::path&, const Config&);
 Config load_config(const fs::path&);

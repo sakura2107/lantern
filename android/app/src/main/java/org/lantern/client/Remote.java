@@ -11,6 +11,138 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import javax.net.ssl.*;
 
 final class Remote implements AutoCloseable {
+    enum PairFailure {
+        INVALID_LINK,
+        HOST_TOO_OLD,
+        INVALID_INVITE,
+        UNREACHABLE,
+        PIN_MISMATCH,
+        BUSY,
+        PROTOCOL_ERROR,
+        OUTCOME_UNKNOWN
+    }
+    static final class PairingException extends IOException {
+        final PairFailure reason;
+        PairingException(PairFailure r, String message) {
+            super(message);
+            reason = r;
+        }
+    }
+    private static final class PairPinException extends java.security.cert.CertificateException {}
+    /** Blocking worker-thread API. Does not alter the existing HELLO/credential constructors. */
+    static Credentials pair(PairingLink link, String deviceLabel) throws PairingException {
+        if (link == null || link.expiresAt <= System.currentTimeMillis() / 1000 ||
+            !PairingLink.validLabel(deviceLabel))
+            throw new PairingException(PairFailure.INVALID_LINK,
+                                       "配对链接无效或已过期，或设备名称超过64字节");
+        boolean pinFailed = false;
+        for (String host : link.addresses) {
+            java.net.Socket raw = new java.net.Socket();
+            SSLSocket tls = null;
+            boolean sent = false;
+            try {
+                raw.connect(new java.net.InetSocketAddress(host, link.port), 10000);
+                raw.setTcpNoDelay(true);
+                raw.setSoTimeout(15000);
+                X509TrustManager verifier = new X509TrustManager() {
+                    public X509Certificate[] getAcceptedIssuers() {
+                        return new X509Certificate[0];
+                    }
+                    public void checkClientTrusted(X509Certificate[] c, String a)
+                        throws java.security.cert.CertificateException {
+                        throw new PairPinException();
+                    }
+                    public void checkServerTrusted(X509Certificate[] chain, String auth)
+                        throws java.security.cert.CertificateException {
+                        try {
+                            if (chain.length == 0)
+                                throw new PairPinException();
+                            chain[0].checkValidity();
+                            String actual =
+                                hex(MessageDigest.getInstance("SHA-256").digest(chain[0].getEncoded()));
+                            if (!MessageDigest.isEqual(actual.getBytes(StandardCharsets.US_ASCII),
+                                                       link.pin.getBytes(StandardCharsets.US_ASCII)))
+                                throw new PairPinException();
+                        } catch (Exception ignored) {
+                            throw new PairPinException();
+                        }
+                    }
+                };
+                TrustManager[] trust = {verifier};
+                SSLContext context = SSLContext.getInstance("TLSv1.2");
+                context.init(null, trust, new SecureRandom());
+                tls = (SSLSocket)context.getSocketFactory().createSocket(raw, host, link.port, true);
+                tls.setSoTimeout(15000);
+                tls.setEnabledProtocols(new String[] {"TLSv1.2"});
+                tls.startHandshake();
+                DataOutputStream out = new DataOutputStream(tls.getOutputStream());
+                byte[] packet = body(o -> {
+                    o.writeShort(1);
+                    o.writeShort(55);
+                    str(o, link.code);
+                    str(o, deviceLabel);
+                });
+                sent = true;
+                out.writeInt(packet.length);
+                out.write(packet);
+                out.flush();
+                DataInputStream input = new DataInputStream(tls.getInputStream());
+                int count = input.readInt();
+                if (count < 8 || count > 2048)
+                    throw new PairingException(PairFailure.PROTOCOL_ERROR, "主机配对响应无效");
+                byte[] bytes = new byte[count];
+                input.readFully(bytes);
+                DataInputStream reply = reader(bytes);
+                int version = reply.readUnsignedShort(), op = reply.readUnsignedShort(),
+                    error = reply.readInt();
+                if (error == 6 && (op == 55 || op == 1))
+                    throw new PairingException(PairFailure.HOST_TOO_OLD, "主机版本过旧，请更新电脑端");
+                if (version != 1 || op != 55)
+                    throw new PairingException(PairFailure.PROTOCOL_ERROR, "主机配对响应无效");
+                if (error != 0) {
+                    str(reply);
+                    if (reply.available() != 0)
+                        throw new IOException();
+                    if (error == 2)
+                        throw new PairingException(PairFailure.INVALID_INVITE,
+                                                   "配对码无效或已过期，请在电脑刷新二维码");
+                    if (error == 8)
+                        throw new PairingException(PairFailure.BUSY,
+                                                   "配对尝试过于频繁或设备已满，请稍后重试");
+                    throw new PairingException(PairFailure.PROTOCOL_ERROR, "主机拒绝配对请求");
+                }
+                String id = str(reply), token = str(reply);
+                int scopes = reply.readInt();
+                if (!id.matches("[0-9a-f]{64}") || !token.matches("[0-9a-f]{64}") || scopes < 1 ||
+                    scopes > 31 || reply.available() != 0)
+                    throw new PairingException(PairFailure.PROTOCOL_ERROR, "主机配对响应无效");
+                return new Credentials(host, link.port, link.pin, token);
+            } catch (PairingException error) {
+                throw error;
+            } catch (Exception error) {
+                for (Throwable cause = error; cause != null; cause = cause.getCause())
+                    if (cause instanceof PairPinException)
+                        pinFailed = true;
+                if (sent)
+                    throw new PairingException(
+                        PairFailure.OUTCOME_UNKNOWN,
+                        "配对响应中断，结果无法确认；请检查电脑设备列表并重新生成邀请");
+            } finally {
+                try {
+                    raw.close();
+                } catch (IOException ignored) {
+                }
+                if (tls != null)
+                    try {
+                        tls.close();
+                    } catch (IOException ignored) {
+                    }
+            }
+        }
+        throw new PairingException(pinFailed ? PairFailure.PIN_MISMATCH : PairFailure.UNREACHABLE,
+                                   pinFailed ? "主机证书指纹不匹配，请重新核对二维码"
+                                             : "所有地址均无法连接，请检查同一局域网和防火墙");
+    }
     static final class TransportError extends IOException {
         TransportError(IOException cause){super("连接中断："+cause.getClass().getSimpleName(),cause);}
     }

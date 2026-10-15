@@ -4,7 +4,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 enable_testing()
-add_library(lantern_core STATIC src/core.cpp)
+add_library(qrcodegen STATIC third_party/qrcodegen/qrcodegen.cpp)
+target_include_directories(qrcodegen PUBLIC third_party/qrcodegen)
+add_library(lantern_core STATIC src/core.cpp src/pairing_link.cpp src/qr.cpp)
+target_link_libraries(lantern_core PRIVATE qrcodegen)
 target_include_directories(lantern_core PUBLIC include)
 if(MSVC)
   add_compile_options(/W4 /permissive- /utf-8 /EHsc)
@@ -17,6 +20,9 @@ add_executable(link_scheduler_tests tests/link_scheduler.cpp)
 target_link_libraries(link_scheduler_tests PRIVATE lantern_core)
 add_test(NAME link_scheduler COMMAND link_scheduler_tests)
 add_test(NAME core COMMAND core_tests $<TARGET_FILE:example_provider>)
+add_executable(pairing_link_tests tests/pairing_link.cpp)
+target_link_libraries(pairing_link_tests PRIVATE lantern_core)
+add_test(NAME pairing_link COMMAND pairing_link_tests)
 if(WIN32)
   option(LANTERN_WITH_OPUS "Build the optional Opus system-audio encoder" ON)
   if(LANTERN_WITH_OPUS)
@@ -25,7 +31,7 @@ if(WIN32)
     set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
     add_subdirectory(third_party/opus-1.5.2 EXCLUDE_FROM_ALL)
   endif()
-  add_library(lantern_win STATIC src/win.cpp src/tls.cpp src/files.cpp src/file_queries.cpp src/tree_ops.cpp src/file_jobs.cpp src/preview.cpp src/desktop.cpp src/input.cpp src/audio.cpp src/audio_encoder.cpp src/video.cpp src/service.cpp src/client.cpp src/clipboard.cpp src/host_admin.cpp src/discovery.cpp)
+  add_library(lantern_win STATIC src/win.cpp src/tls.cpp src/files.cpp src/file_queries.cpp src/tree_ops.cpp src/file_jobs.cpp src/preview.cpp src/desktop.cpp src/input.cpp src/audio.cpp src/audio_encoder.cpp src/video.cpp src/service.cpp src/client.cpp src/clipboard.cpp src/host_admin.cpp src/discovery.cpp src/pairing_client.cpp)
   if(LANTERN_WITH_OPUS)
     target_link_libraries(lantern_win PRIVATE opus)
     target_compile_definitions(lantern_win PRIVATE LANTERN_WITH_OPUS=1)
@@ -103,6 +109,7 @@ if(WIN32)
       COMMAND "${LANTERN_JNI_TEST_JDK}/bin/javac.exe" --release 17 -encoding UTF-8 -d "${CMAKE_CURRENT_BINARY_DIR}/java-classes"
         "${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/java/org/lantern/client/Native.java"
         "${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/java/org/lantern/client/Remote.java"
+        "${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/java/org/lantern/client/PairingLink.java"
         "${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/java/org/lantern/client/FileItem.java"
         "${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/java/org/lantern/client/TransferPacer.java"
         "${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/java/org/lantern/client/RetryPolicy.java"
@@ -115,7 +122,9 @@ if(WIN32)
         "${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/java/org/lantern/client/Endpoint.java"
         "${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/java/org/lantern/client/MediaTimeline.java"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/TimelineTest.java"
-        "${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/java/org/lantern/client/Discovery.java")
+        "${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/java/org/lantern/client/Discovery.java"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/PairingLinkTest.java")
+    add_test(NAME pairing_link_java COMMAND "${LANTERN_JNI_TEST_JDK}/bin/java.exe" -cp "${CMAKE_CURRENT_BINARY_DIR}/java-classes" org.lantern.client.PairingLinkTest)
     add_test(NAME timeline_endpoint COMMAND "${LANTERN_JNI_TEST_JDK}/bin/java.exe" -cp "${CMAKE_CURRENT_BINARY_DIR}/java-classes" org.lantern.client.TimelineTest)
     add_test(NAME retry_policy COMMAND "${LANTERN_JNI_TEST_JDK}/bin/java.exe" -cp "${CMAKE_CURRENT_BINARY_DIR}/java-classes" org.lantern.client.RetryPolicyTest)
     add_test(NAME transfer_pacer COMMAND "${LANTERN_JNI_TEST_JDK}/bin/java.exe" -cp "${CMAKE_CURRENT_BINARY_DIR}/java-classes" org.lantern.client.PacerTest)
@@ -125,5 +134,6 @@ if(WIN32)
 endif()
 install(DIRECTORY docs DESTINATION .)
 install(DIRECTORY licenses DESTINATION .)
+install(FILES third_party/qrcodegen/LICENSE DESTINATION licenses RENAME QRCODEGEN-MIT.txt)
 set(CPACK_GENERATOR ZIP)
 include(CPack)

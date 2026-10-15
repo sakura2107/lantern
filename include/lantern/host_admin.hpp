@@ -34,5 +34,11 @@ class HostAdministration {
     void root(const fs::path& shared_root);
     void disable_legacy();
     DevicePairing pairing(const std::string& id) const;
+    PairingInvite invite(const std::string& label, uint32_t scopes,
+                         std::chrono::seconds ttl = std::chrono::minutes(10));
+    std::vector<PendingInvite> invites() const;
+    void cancel_invite(const std::string& invite_id);
+    // Protocol backend: atomically consumes the invitation and saves its device.
+    TrustedDevice redeem_invite(const std::string& code, const std::string& device_label);
 };
 } // namespace lantern

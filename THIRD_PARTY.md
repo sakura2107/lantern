@@ -37,3 +37,10 @@
 源码保存在 third_party/opus-1.5.2；许可证见该目录COPYING以及 licenses/OPUS.txt。BSD类许可证及相关专利声明按原文保留。Windows主机编码与客户端解码静态链接，不携带额外运行时DLL；CMake LANTERN_WITH_OPUS=OFF可去除。Android通过系统MediaCodec解码Opus，桌面视频通过系统MediaCodec解码；文件影音交给外部手机应用，APK没有打包FFmpeg/libopus。生成验证视频用的FFmpeg工具仅保存在工作区，不随产品分发。
 
 Windows剪贴板/WIC预览/多文件选择器增量只调用Windows系统API，没有增加第三方库或捆绑播放器；许可证清单保持适用。
+
+## Nayuki QR Code generator 1.8.0（C++ 编码）
+
+- 来源：[官方仓库 v1.8.0](https://github.com/nayuki/QR-Code-generator/tree/v1.8.0/cpp)，tag 解引用的 commit 为 `720f62bddb7226106071d4728c292cb1df519ceb`。
+- 位置：`third_party/qrcodegen/qrcodegen.cpp`、`qrcodegen.hpp`。保留原始头部 MIT 声明，并提供 `third_party/qrcodegen/LICENSE`，安装时复制为 `licenses/QRCODEGEN-MIT.txt`。
+- 原始文件 SHA-256：cpp `1f3b3fcdac6954c32cf583ccd02ec9b5901f756a38c461acedc70be4a77d3757`；hpp `b779c3b156cf7a57ce789d6fee4fc991ccc2913774d26c909d22bb8f26b2a793`。
+- 只静态链接编码器；`qr_encode` 固定 M 纠错、自动选择 1..40 版本，不自动提升纠错等级。没有相机/扫码实现和动态运行库。

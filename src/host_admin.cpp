@@ -122,4 +122,100 @@ DevicePairing HostAdministration::pairing(const std::string& id) const {
     Identity identity(state_ / L"identity.dpapi", false);
     return {{d.id, d.label, d.scopes, d.scopes & c.scopes}, identity.fingerprint(), d.token};
 }
+namespace {
+void prune_invites(Config& c) {
+    auto now = pairing_unix_time();
+    std::erase_if(c.invites, [&](auto& i) { return i.expires_at <= now || i.failed_attempts >= 5; });
+}
+bool constant_equal(const std::string& a, const std::string& b) {
+    if (a.size() != b.size())
+        return false;
+    volatile unsigned difference = 0;
+    for (size_t i = 0; i < a.size(); ++i)
+        difference = difference | unsigned(uint8_t(a[i]) ^ uint8_t(b[i]));
+    return difference == 0;
+}
+} // namespace
+PairingInvite HostAdministration::invite(const std::string& label, uint32_t scopes,
+                                         std::chrono::seconds ttl) {
+    if (!valid_pairing_label(label) || !scopes || ttl.count() < 1 || ttl.count() > 86400)
+        throw Error(Code::invalid, "邀请名称须为1..64字节，有效期须为1秒到24小时");
+    PairingInvite result;
+    result.id = random_token().substr(0, 32);
+    result.code = result.id + random_token().substr(0, 32);
+    result.label = label;
+    result.scopes = scopes;
+    result.expires_at = pairing_unix_time() + uint64_t(ttl.count());
+    wchar_t host[256]{};
+    DWORD count = 256;
+    result.host_name = GetComputerNameW(host, &count) ? utf8(std::wstring(host, count)) : "Lantern";
+    if (!valid_pairing_label(result.host_name))
+        result.host_name = "Lantern";
+    Identity identity(state_ / L"identity.dpapi", false);
+    result.pin = identity.fingerprint();
+    InviteRecord record;
+    static_cast<PendingInvite&>(record) = result;
+    record.code_hash = sha256({reinterpret_cast<const uint8_t*>(result.code.data()), result.code.size()});
+    edit_config(state_ / L"config.dpapi", [&](Config& c) {
+        prune_invites(c);
+        subset(c, scopes);
+        if (c.invites.size() >= 32)
+            throw Error(Code::busy, "待配对邀请已达上限");
+        c.invites.push_back(record);
+    });
+    return result;
+}
+std::vector<PendingInvite> HostAdministration::invites() const {
+    std::vector<PendingInvite> result;
+    edit_config(state_ / L"config.dpapi", [&](Config& c) {
+        prune_invites(c);
+        for (auto& i : c.invites)
+            result.push_back(i);
+    });
+    return result;
+}
+void HostAdministration::cancel_invite(const std::string& id) {
+    if (id.size() != 32 || !valid_sha(id + id))
+        throw Error(Code::invalid, "邀请ID无效");
+    edit_config(state_ / L"config.dpapi", [&](Config& c) {
+        prune_invites(c);
+        std::erase_if(c.invites, [&](auto& i) { return i.id == id; });
+    });
+}
+TrustedDevice HostAdministration::redeem_invite(const std::string& code, const std::string& label) {
+    if (!valid_pairing_label(label))
+        throw Error(Code::invalid, "设备名称须为1..64字节");
+    TrustedDevice result;
+    Code failure = Code::unauthorized;
+    auto digest = sha256({reinterpret_cast<const uint8_t*>(code.data()), code.size()});
+    edit_config(state_ / L"config.dpapi", [&](Config& c) {
+        prune_invites(c);
+        auto found = std::find_if(c.invites.begin(), c.invites.end(),
+                                  [&](auto& i) { return code.size() == 64 && i.id == code.substr(0, 32); });
+        if (found == c.invites.end())
+            return;
+        if (!constant_equal(found->code_hash, digest)) {
+            ++found->failed_attempts;
+            prune_invites(c);
+            return;
+        }
+        auto effective = found->scopes & c.scopes;
+        if (!effective) {
+            c.invites.erase(found);
+            return;
+        }
+        if (c.devices.size() >= 64) {
+            failure = Code::busy;
+            return;
+        }
+        result = {random_token(), label, random_token(), effective};
+        c.devices.push_back(result);
+        c.invites.erase(found);
+        failure = Code::ok;
+    });
+    if (failure != Code::ok)
+        throw Error(failure,
+                    failure == Code::busy ? "设备数量已达上限" : "配对码无效或已过期，请在电脑刷新二维码");
+    return result;
+}
 } // namespace lantern
