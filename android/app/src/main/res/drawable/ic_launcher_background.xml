@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adaptive icon background: the ink gradient of assets/lantern-icon.svg across the visible 72dp of the 108dp layer. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp" android:height="108dp" android:viewportWidth="1024" android:viewportHeight="1024">
+    <path android:pathData="M0,0h1024v1024h-1024z">
+        <aapt:attr name="android:fillColor">
+            <gradient android:type="linear" android:startX="512" android:startY="170" android:endX="512" android:endY="854">
+                <item android:offset="0" android:color="#FF26323F" />
+                <item android:offset="1" android:color="#FF0B1016" />
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>

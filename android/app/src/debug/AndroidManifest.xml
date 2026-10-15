@@ -1,0 +1,4 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+ <instrumentation android:name="org.lantern.client.DeviceTestRunner" android:targetPackage="org.lantern.client" android:label="Lantern device validation" />
+ <application><provider android:name=".TestDocuments" android:authorities="org.lantern.client.testdocs" android:exported="true" android:permission="android.permission.MANAGE_DOCUMENTS" android:grantUriPermissions="true" /></application>
+</manifest>

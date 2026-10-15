@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.22)
+project(lantern_android LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+get_filename_component(ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.." ABSOLUTE)
+add_library(lantern_jni SHARED bridge.cpp "${ROOT}/src/core.cpp")
+target_include_directories(lantern_jni PRIVATE "${ROOT}/include")
+target_link_options(lantern_jni PRIVATE "-Wl,-z,max-page-size=16384")

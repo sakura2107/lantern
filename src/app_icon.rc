@@ -1,0 +1,2 @@
+#include "app_icon.h"
+LANTERN_APP_ICON ICON "../assets/lantern.ico"

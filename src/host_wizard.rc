@@ -1,0 +1,14 @@
+#pragma code_page(65001)
+#include <windows.h>
+101 DIALOGEX 0, 0, 420, 132
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "新建主机配置"
+FONT 9, "Microsoft YaHei UI"
+BEGIN
+    LTEXT "选择要授权的电脑目录；也可粘贴绝对路径。", -1, 14, 12, 390, 22
+    EDITTEXT 700, 14, 40, 316, 16, ES_AUTOHSCROLL | WS_TABSTOP
+    PUSHBUTTON "浏览…", 701, 338, 39, 66, 19
+    LTEXT "设备身份保存在独立目录。确认后仍需添加设备并手动启动主机。", -1, 14, 68, 390, 22
+    DEFPUSHBUTTON "下一步", IDOK, 256, 103, 70, 20
+    PUSHBUTTON "取消", IDCANCEL, 334, 103, 70, 20
+END

@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#26323F"/><stop offset="1" stop-color="#0B1016"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="512" cy="600" r="400" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F3A223" stop-opacity="0.50"/>
+      <stop offset="0.4" stop-color="#F3A223" stop-opacity="0.14"/>
+      <stop offset="1" stop-color="#F3A223" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F3A223" stop-opacity="0.10"/>
+      <stop offset="0.65" stop-color="#F3A223" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#F3A223" stop-opacity="0.18"/>
+    </linearGradient>
+    <radialGradient id="flame" cx="512" cy="640" r="150" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFF4D6"/><stop offset="0.3" stop-color="#FFCF6A"/>
+      <stop offset="0.75" stop-color="#F3A223"/><stop offset="1" stop-color="#E0861A"/>
+    </radialGradient>
+    <linearGradient id="metal" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F6F8FA"/><stop offset="1" stop-color="#C3CDD8"/>
+    </linearGradient>
+    <clipPath id="sq"><rect x="40" y="40" width="944" height="944" rx="232"/></clipPath>
+  </defs>
+    <rect x="40" y="40" width="944" height="944" rx="232" fill="url(#bg)"/>
+    <rect x="41.5" y="41.5" width="941" height="941" rx="230.5" fill="none" stroke="#ffffff" stroke-opacity="0.07" stroke-width="3"/>
+  <g clip-path="url(#sq)">
+  <g transform="translate(512 528) scale(1) translate(-512 -528)">
+  <circle cx="512" cy="600" r="400" fill="url(#glow)"/>
+  <path d="M430 318 A 82 82 0 0 1 594 318" fill="none" stroke="url(#metal)" stroke-width="34" stroke-linecap="round"/>
+  <path d="M446 318 L578 318 L656 388 L368 388 Z" fill="url(#metal)" stroke="url(#metal)" stroke-width="22" stroke-linejoin="round"/>
+  <rect x="380" y="404" width="264" height="344" rx="64" fill="url(#glass)" stroke="url(#metal)" stroke-width="30"/>
+  <path d="M512 486 C 556 548, 592 590, 592 640 A 80 80 0 0 1 432 640 C 432 590, 468 548, 512 486 Z" fill="url(#flame)"/>
+  <path d="M512 570 C 532 600, 546 620, 546 646 A 34 34 0 0 1 478 646 C 478 620, 492 600, 512 570 Z" fill="#FFF7E4" fill-opacity="0.9"/>
+  <rect x="344" y="752" width="336" height="58" rx="26" fill="url(#metal)"/>
+  </g></g>
+</svg>

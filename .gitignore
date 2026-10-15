@@ -1,0 +1,16 @@
+/build/
+/package/
+/.vs/
+android/.gradle/
+android/local.properties
+android/app/build/
+*.dpapi
+*.part
+*.lantern-part
+*.lantern-resume
+*.keystore
+
+# Local validation reports and test captures (they contain machine-specific paths)
+/*.json
+/docs/validation/
+/docs/ui/windows-setup.png
