@@ -1,7 +1,10 @@
+#include "lantern/host_admin.hpp"
+#include "lantern/lan.hpp"
+#include "lantern/pairing_client.hpp"
 #include "lantern/win.hpp"
 #include <iostream>
-#include <thread>
 #include <sddl.h>
+#include <thread>
 #include <winioctl.h>
 using namespace lantern;
 static int checks = 0;
@@ -83,7 +86,8 @@ static bool junction(const fs::path& link, const fs::path& target) {
                            nullptr) != 0;
 }
 static bool run_java(const fs::path& jdk, const fs::path& classes, const fs::path& library,
-                     const std::string& pin, const std::string& token, const fs::path& directory) {
+                     const std::string& pin, const std::string& token, const fs::path& directory,
+                     const std::string& pairing_link) {
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
     HANDLE read_pipe, write_pipe;
     if (!CreatePipe(&read_pipe, &write_pipe, &sa, 0))
@@ -105,7 +109,7 @@ static bool run_java(const fs::path& jdk, const fs::path& classes, const fs::pat
         win_error("Launch JVM interoperability");
     Handle proc(process.hProcess), thread(process.hThread);
     in = Handle();
-    auto data = pin + "\n" + token + "\n" + utf8(directory.wstring()) + "\n";
+    auto data = pin + "\n" + token + "\n" + utf8(directory.wstring()) + "\n" + pairing_link + "\n";
     DWORD n = 0;
     if (!WriteFile(out, data.data(), DWORD(data.size()), &n, nullptr))
         win_error("JVM credentials pipe");
@@ -118,6 +122,58 @@ static bool run_java(const fs::path& jdk, const fs::path& classes, const fs::pat
     DWORD code = 1;
     GetExitCodeProcess(proc, &code);
     return code == 0;
+}
+static void old_pairing_response(const fs::path& state, const std::string& pin) {
+    Identity identity(state / L"identity.dpapi", false);
+    SOCKET listener = listen_socket("127.0.0.1", 0);
+    sockaddr_in address{};
+    int address_length = sizeof(address);
+    if (getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_length)) {
+        closesocket(listener);
+        throw std::runtime_error("legacy fixture address");
+    }
+    std::exception_ptr failure;
+    std::thread server([&] {
+        try {
+            fd_set readable;
+            FD_ZERO(&readable);
+            FD_SET(listener, &readable);
+            timeval timeout{5, 0};
+            if (select(0, &readable, nullptr, nullptr, &timeout) <= 0)
+                throw std::runtime_error("legacy fixture timeout");
+            Tls tls(accept(listener, nullptr, nullptr), &identity);
+            auto request = tls.receive();
+            Reader r{request};
+            if (r.u16() != 1 || r.u16() != uint16_t(Op::pair))
+                throw std::runtime_error("legacy fixture operation");
+            Writer response;
+            response.u16(1);
+            response.u16(uint16_t(Op::hello));
+            response.u32(uint32_t(Code::unsupported));
+            response.str("Protocol version or HELLO required");
+            tls.send(response.b);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+    });
+    bool old = false;
+    try {
+        PairingLink link;
+        link.host_name = "Legacy fixture";
+        link.addresses = {"127.0.0.1"};
+        link.port = ntohs(address.sin_port);
+        link.pin = pin;
+        link.code = std::string(64, 'a');
+        link.expires_at = pairing_unix_time() + 600;
+        pair_with_link(link, "Legacy phone");
+    } catch (const PairingError& error) {
+        old = error.reason == PairError::host_too_old;
+    }
+    server.join();
+    closesocket(listener);
+    if (failure)
+        std::rethrow_exception(failure);
+    check(old, "legacy HELLO unsupported response maps to host-too-old over real TLS");
 }
 int wmain(int argc, wchar_t** argv) {
     auto testroot = fs::temp_directory_path() / wide("Lantern-test-" + random_token().substr(0, 12));
@@ -138,6 +194,7 @@ int wmain(int argc, wchar_t** argv) {
         }
         auto token = random_token();
         save_config(state / L"config.dpapi", {root, token, 15});
+        old_pairing_response(state, pin);
         unopenable_children(testroot);
         FileService local(root);
         error(Code::unauthorized, [&] { local.stat("../outside"); }, "traversal");
@@ -189,6 +246,90 @@ int wmain(int argc, wchar_t** argv) {
                     t.join();
             }
         } stop{host, thread};
+        {
+            HostAdministration admin(state);
+            auto invite = admin.invite("TLS invite", files_read);
+            auto uri = pairing_uri(invite, {"127.0.0.2", "127.0.0.1"}, 47449);
+            auto invite_link = parse_pairing_uri(uri);
+            check(bool(invite_link), "TLS invitation link parsed");
+            auto paired = pair_with_link(*invite_link, "TLS phone");
+            check(paired.host == "127.0.0.1" && paired.scopes == files_read && valid_sha(paired.token),
+                  "real pinned TLS PAIR with address failover");
+            {
+                Tls tls(connect_socket("127.0.0.1", 47449), nullptr, pin);
+                Writer request;
+                request.u16(2);
+                request.u16(uint16_t(Op::pair));
+                request.str("unused");
+                request.str("Version");
+                tls.send(request.b);
+                auto bytes = tls.receive();
+                Reader response{bytes};
+                check(response.u16() == 1 && response.u16() == uint16_t(Op::pair) &&
+                          response.u32() == uint32_t(Code::unsupported),
+                      "PAIR unsupported version gets structured response");
+            }
+            Client accepted(paired.host, paired.port, paired.pin, paired.token, files_read);
+            check(!accepted.list("").empty(), "paired token accepted by unchanged HELLO");
+            error(
+                Code::unauthorized, [&] { pair_with_link(*invite_link, "Replay"); },
+                "TLS invitation replay rejected");
+            auto bad_invite = admin.invite("Bad TLS invite", 1);
+            auto wrong = *parse_pairing_uri(pairing_uri(bad_invite, {"127.0.0.1"}, 47449));
+            wrong.code.back() = wrong.code.back() == '0' ? '1' : '0';
+            error(
+                Code::unauthorized, [&] { pair_with_link(wrong, "Bad"); },
+                "wrong invitation denied over TLS");
+            auto pin_link = wrong;
+            pin_link.pin = std::string(64, '0');
+            try {
+                pair_with_link(pin_link, "Pin");
+                check(false, "pair pin mismatch missing");
+            } catch (const PairingError& e) {
+                check(e.reason == PairError::pin_mismatch,
+                      "pair pin mismatch distinguished before sending code");
+            }
+            auto address_link = wrong;
+            address_link.port = 1;
+            try {
+                pair_with_link(address_link, "Offline");
+                check(false, "pair unreachable missing");
+            } catch (const PairingError& e) {
+                check(e.reason == PairError::unreachable, "all pair addresses unreachable distinguished");
+            }
+            auto before = load_config(state / L"config.dpapi").devices.size();
+            // Ten PAIR frames per rolling minute; successful and unsuccessful attempts both count.
+            bool busy = false;
+            for (unsigned i = 0; i < 12; ++i) {
+                try {
+                    pair_with_link(wrong, "Limited");
+                } catch (const PairingError& e) {
+                    if (e.reason == PairError::busy) {
+                        busy = true;
+                        break;
+                    }
+                }
+            }
+            check(busy && load_config(state / L"config.dpapi").devices.size() == before,
+                  "IP pairing rate limit returns busy without creating devices");
+            Client legacy("127.0.0.1", 47449, pin, token, 0);
+            auto caps_bytes = legacy.call(Op::capabilities);
+            Reader caps_reader{caps_bytes};
+            check(caps_reader.str().find("pair=qr-v1") != std::string::npos,
+                  "old HELLO unaffected by pair throttling and advertises QR capability");
+            auto firewall = firewall_state(fs::path(argv[0]), 47449);
+            check(firewall == FirewallState::allowed || firewall == FirewallState::not_allowed ||
+                      firewall == FirewallState::unknown,
+                  "nonadmin firewall query returns a tri-state without mutation");
+            check(firewall_state(fs::path(argv[0]), 0) == FirewallState::unknown,
+                  "invalid firewall query cannot report allowed");
+            check(!request_firewall_allow(testroot / L"missing.exe", 47449),
+                  "invalid firewall request does not launch elevation");
+            for (auto& a : lan_addresses())
+                check(valid_pairing_address(a.address) && !a.address.starts_with("127.") &&
+                          !a.address.starts_with("169.254."),
+                      "LAN enumeration excludes unusable addresses");
+        }
         {
             error(
                 Code::unauthorized, [&] { Client c("127.0.0.1", 47449, std::string(64, '0'), token); },
@@ -391,12 +532,30 @@ int wmain(int argc, wchar_t** argv) {
                     Code::unauthorized, [&] { audio_client.call(Op::audio_stream, audio_version); },
                     "audio permission revocation on live control socket");
             }
-            if (argc == 4)
-                check(run_java(argv[1], argv[2], argv[3], pin, token, client),
-                      "Java/JNI cross-client interoperability");
+            if (argc == 4) {
+                Host pairing_host(state, "127.0.0.1", 47448);
+                std::thread pairing_thread([&] { pairing_host.run(); });
+                Stop pairing_stop{pairing_host, pairing_thread};
+                auto invitation = HostAdministration(state).invite("Java phone", 1);
+                auto pairing_link = pairing_uri(invitation, {"127.0.0.2", "127.0.0.1"}, 47448);
+                check(run_java(argv[1], argv[2], argv[3], pin, token, client, pairing_link),
+                      "Java/JNI cross-client interoperability and QR pairing");
+            }
             auto new_token = random_token();
             save_config(state / L"config.dpapi", {root, new_token, 15});
-            error(Code::unauthorized, [&] { c.list(""); }, "revoke active trust");
+            // Revocation may be observed by the request handler or by the asynchronous socket auditor.
+            bool revoked = false;
+            try {
+                c.list("");
+            } catch (const TransportError&) {
+                revoked = true;
+            } catch (const Error& e) {
+                revoked = e.code == Code::unauthorized;
+            }
+            check(revoked, "revoke active trust rejects request or closes the old connection");
+            error(
+                Code::unauthorized, [&] { Client old("127.0.0.1", 47449, pin, token); },
+                "revoked token cannot establish a fresh HELLO");
             Client freshly_paired("127.0.0.1", 47449, pin, new_token);
             check(!freshly_paired.list("").empty(), "new pairing accepted without restart");
         }

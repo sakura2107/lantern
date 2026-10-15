@@ -14,6 +14,31 @@ public final class InteropTest {
         BufferedReader stdin =
             new BufferedReader(new InputStreamReader(System.in, java.nio.charset.StandardCharsets.UTF_8));
         String pin = stdin.readLine(), token = stdin.readLine(), directory = stdin.readLine();
+        String pairingUri = stdin.readLine();
+        PairingLink pairingLink = PairingLink.parse(pairingUri);
+        check(pairingLink != null, "Java pairing URI parsed");
+        var paired = Remote.pair(pairingLink, "Java phone fixture");
+        check(paired.host.equals("127.0.0.1") && paired.token.matches("[0-9a-f]{64}"),
+              "Java pinned TLS pairing with address failover");
+        try (Remote remote = new Remote(paired, 1, 3)) {
+            check(!remote.list("", 0).isEmpty(), "Java QR credential accepted by HELLO");
+        }
+        boolean reused = false;
+        try {
+            Remote.pair(pairingLink, "Replay");
+        } catch (Remote.PairingException error) {
+            reused = error.reason == Remote.PairFailure.INVALID_INVITE;
+        }
+        check(reused, "Java typed invitation replay error");
+        String wrongPin = pairingUri.replace("f=" + pairingLink.pin, "f="
+                                                                         + "0".repeat(64));
+        boolean mismatch = false;
+        try {
+            Remote.pair(PairingLink.parse(wrongPin), "Pin");
+        } catch (Remote.PairingException error) {
+            mismatch = error.reason == Remote.PairFailure.PIN_MISMATCH;
+        }
+        check(mismatch, "Java pin mismatch distinguished without sending invitation");
         var credentials = new Remote.Credentials("127.0.0.1", 47449, pin, token);
         boolean pinDenied = false;
         try (Remote ignored =

@@ -1,3 +1,6 @@
+#include "lantern/host_admin.hpp"
+#include "lantern/lan.hpp"
+#include "lantern/pairing_client.hpp"
 #include "lantern/win.hpp"
 #include <iostream>
 #include <shellapi.h>
@@ -19,7 +22,10 @@ static void usage() {
                  "device-list STATE; device-grant STATE ID SCOPES; device-remove STATE ID\n"
                  "device-end STATE ID (end current connections; trust remains, clients may reconnect)\n"
                  "device-secret STATE ID LOCAL-DPAPI-FILE; legacy-off STATE\n"
-                 "host STATE [BIND=127.0.0.1] [PORT=47443]\n"
+                 "host STATE [BIND=0.0.0.0] [PORT=47443]\n"
+                 "invite STATE LABEL SCOPES [MINUTES=10] (prints a one-time pairing URI)\n"
+                 "pair LINK DEVICE-LABEL SECRET-FILE (DPAPI credential; never prints the token)\n"
+                 "firewall-allow EXE PORT (administrator; Private profile only)\n"
                  "revoke STATE           (rotates credential; interrupts existing trust)\n"
                  "secret STATE LOCAL-DPAPI-FILE  (protect pairing credential for this user)\n"
                  "client HOST PORT PIN SECRET-FILE caps|list|stat|get|put|mkdir|move|copy|delete|frame|media "
@@ -41,6 +47,62 @@ int wmain(int argc, wchar_t** argv) {
             if (a.size() < n)
                 throw Error(Code::invalid, "Missing argument; run without arguments for help");
         };
+        auto bounded_number = [&](const std::string& value, uint64_t low, uint64_t high) {
+            if (value.empty() ||
+                std::any_of(value.begin(), value.end(), [](char c) { return c < '0' || c > '9'; }))
+                throw Error(Code::invalid, "数字参数格式无效");
+            uint64_t n = 0;
+            try {
+                n = std::stoull(value);
+            } catch (...) {
+                throw Error(Code::invalid, "数字参数超出范围");
+            }
+            if (n < low || n > high)
+                throw Error(Code::invalid, "数字参数超出范围");
+            return n;
+        };
+        if (a[0] == "invite") {
+            need(4);
+            if (a.size() > 5)
+                throw Error(Code::invalid, "邀请命令参数过多");
+            auto scopes = uint32_t(bounded_number(a[3], 1, 31));
+            auto minutes = a.size() == 5 ? bounded_number(a[4], 1, 1440) : 10;
+            std::vector<std::string> addresses;
+            for (auto& address : lan_addresses()) {
+                if (addresses.size() == 8)
+                    break;
+                if (std::find(addresses.begin(), addresses.end(), address.address) == addresses.end())
+                    addresses.push_back(address.address);
+            }
+            if (addresses.empty())
+                throw Error(Code::not_found, "没有已连接的局域网 IPv4 地址");
+            auto invite =
+                HostAdministration(wide(a[1])).invite(a[2], scopes, std::chrono::seconds(minutes * 60));
+            std::cout << pairing_uri(invite, addresses, 47443) << "\n";
+            return 0;
+        }
+        if (a[0] == "pair") {
+            need(4);
+            if (a.size() != 4)
+                throw Error(Code::invalid, "配对命令参数无效");
+            auto link = parse_pairing_uri(a[1]);
+            if (!link)
+                throw Error(Code::invalid, "配对链接无效或已过期");
+            auto result = pair_with_link(*link, a[2]);
+            write_file(wide(a[3]),
+                       protect({reinterpret_cast<const uint8_t*>(result.token.data()), result.token.size()}));
+            std::cout << "配对成功，凭据已用 DPAPI 保存。主机 " << result.host << ":" << result.port
+                      << "；设备 " << result.device_id << "；生效权限 " << result.scopes << "\n";
+            return 0;
+        }
+        if (a[0] == "firewall-allow") {
+            need(3);
+            if (a.size() != 3)
+                throw Error(Code::invalid, "防火墙命令参数无效");
+            firewall_allow(wide(a[1]), uint16_t(bounded_number(a[2], 1, 65535)));
+            std::cout << "已更新 Lantern 专用网络 TCP 和局域网发现 UDP 规则。\n";
+            return 0;
+        }
         if (a[0] == "init") {
             need(4);
             fs::path state = wide(a[1]);
@@ -132,7 +194,7 @@ int wmain(int argc, wchar_t** argv) {
                     throw Error(Code::invalid, "Input diagnostics PID required");
                 set_input_validation_pid(pid);
             }
-            Host h(wide(a[1]), a.size() > 2 ? a[2] : "127.0.0.1",
+            Host h(wide(a[1]), a.size() > 2 ? a[2] : default_host_bind,
                    a.size() > 3 ? uint16_t(std::stoul(a[3])) : 47443);
             running = &h;
             SetConsoleCtrlHandler(console_signal, TRUE);

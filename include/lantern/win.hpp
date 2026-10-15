@@ -235,7 +235,7 @@ class Host {
     std::unique_ptr<Impl> p_;
 
   public:
-    Host(const fs::path& state, const std::string& bind, uint16_t port);
+    Host(const fs::path& state, const std::string& bind = "0.0.0.0", uint16_t port = 47443);
     ~Host();
     void run();
     void stop();

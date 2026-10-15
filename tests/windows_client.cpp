@@ -221,7 +221,19 @@ int wmain(int argc, wchar_t** argv) {
                 until([&] { return queue.snapshot()[2].state == TaskState::failed; }, "conflict detected");
                 check(read_file(share / L"note.txt") == Bytes({'t', 'e', 's', 't'}),
                       "same name conflict preserves original");
-                queue.rename_destination(conflict, "renamed-upload.bin", dest);
+                // Terminal state is published before the worker releases its active connection.
+                until(
+                    [&] {
+                        try {
+                            queue.rename_destination(conflict, "renamed-upload.bin", dest);
+                            return true;
+                        } catch (const Error& e) {
+                            if (e.code == Code::busy)
+                                return false;
+                            throw;
+                        }
+                    },
+                    "conflict worker cleanup");
                 queue.resume(conflict);
                 until([&] { return queue.snapshot()[2].state == TaskState::completed; },
                       "renamed upload complete");
