@@ -8,6 +8,15 @@ Client::Client(const std::string& a, uint16_t port, const std::string& pin, cons
                uint32_t scopes, uint32_t channel, uint32_t hello_flags)
     : scopes_(scopes) {
     tls_ = std::make_unique<Tls>(connect_socket(a, port), nullptr, pin);
+    hello(token, channel, hello_flags);
+}
+Client::Client(std::unique_ptr<Tls> tls, const std::string& token, uint32_t scopes, uint32_t channel,
+               uint32_t flags)
+    : tls_(std::move(tls)), scopes_(scopes) {
+    hello(token, channel, flags);
+}
+void Client::hello(const std::string& token, uint32_t channel, uint32_t hello_flags) {
+    auto scopes = scopes_;
     Writer w;
     w.str(token);
     w.u32(scopes);
@@ -19,6 +28,7 @@ Client::Client(const std::string& a, uint16_t port, const std::string& pin, cons
     if (r.u32() != scopes)
         throw Error(Code::unauthorized, "Granted scope differs");
     r.end();
+    tls_->clear_deadline();
 }
 Bytes Client::call(Op op, Writer payload) {
     send(op, std::move(payload));

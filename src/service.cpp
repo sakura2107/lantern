@@ -1,10 +1,10 @@
 #include "lantern/clipboard.hpp"
 #include "lantern/discovery.hpp"
 #include "lantern/host_admin.hpp"
+#include "lantern/lan.hpp"
 #include "lantern/link_scheduler.hpp"
 #include "lantern/win.hpp"
 
-#include <condition_variable>
 #include <deque>
 #include <thread>
 #include <ws2tcpip.h>
@@ -21,9 +21,24 @@ struct Host::Impl {
     LinkScheduler link{40 * 1024 * 1024};
     std::atomic_uint64_t next_flow = 1;
     std::mutex m;
-    std::condition_variable cv;
-    std::deque<SOCKET> pending;
     std::vector<SOCKET> active;
+    struct Handshake {
+        std::string address;
+        std::chrono::steady_clock::time_point deadline;
+        bool guarded = false, timed_out = false;
+    };
+    std::map<SOCKET, Handshake> handshakes;
+    AuthenticationGuard auth_guard;
+    uint32_t public_sessions = 0;
+    std::atomic_bool internet_enabled = false;
+    UpnpLease upnp;
+    std::string actual_bind;
+    uint16_t actual_port = 0;
+    struct ConnectionThread {
+        std::thread thread;
+        std::shared_ptr<std::atomic_bool> done;
+    };
+    std::vector<ConnectionThread> connections;
     struct Peer {
         std::string token, session;
         uint32_t requested;
@@ -58,8 +73,41 @@ struct Host::Impl {
     Impl(const fs::path& s, const std::string& bind, uint16_t port)
         : state(s), identity(s / L"identity.dpapi", false), config(load_config(s / L"config.dpapi")),
           files(config.root), file_jobs(files) {
-        listener = listen_socket(bind, port);
-        discovery = std::make_unique<DiscoveryResponder>(bind, port, identity.fingerprint());
+        actual_bind = bind;
+        try {
+            listener = listen_socket(bind, port);
+        } catch (...) {
+            if (bind != "::")
+                throw;
+            actual_bind = "0.0.0.0";
+            listener = listen_socket(actual_bind, port);
+        }
+        sockaddr_storage bound{};
+        int size = sizeof(bound);
+        getsockname(listener.load(), reinterpret_cast<sockaddr*>(&bound), &size);
+        actual_port = ntohs(bound.ss_family == AF_INET6 ? reinterpret_cast<sockaddr_in6*>(&bound)->sin6_port
+                                                        : reinterpret_cast<sockaddr_in*>(&bound)->sin_port);
+        internet_enabled = config.internet_access;
+        connections.reserve(128);
+        discovery = std::make_unique<DiscoveryResponder>(actual_bind, actual_port, identity.fingerprint());
+    }
+    std::vector<ConnectionEndpoint> recommended(const Config& c) {
+        auto addresses = host_addresses();
+        std::erase_if(addresses, [&](auto& a) {
+            if (actual_bind == "::")
+                return false;
+            if (actual_bind == "0.0.0.0")
+                return numeric_address(a.address)->v6;
+            return normalize_address(a.address) != normalize_address(actual_bind);
+        });
+        auto list = host_endpoints(c, actual_port, addresses);
+        auto mapping = upnp.status();
+        if (c.internet_access && mapping.ipv4.status == UpnpStatus::success) {
+            auto e = connection_endpoint(mapping.ipv4.external_address, mapping.ipv4.external_port);
+            e.expires_at = mapping.ipv4.expires_at;
+            list.push_back(e);
+        }
+        return merge_endpoints({}, list, pairing_unix_time());
     }
     Bytes dispatch(Op op, Reader& r, uint32_t granted, Lane lane, InputSession& input,
                    std::unique_ptr<DirectorySearch>& search, const std::string& owner,
@@ -70,6 +118,13 @@ struct Host::Impl {
         };
         Writer w;
         switch (op) {
+        case Op::endpoints: {
+            r.end();
+            auto current = load_config(state / L"config.dpapi");
+            w.u32(1);
+            write_endpoints(w, recommended(current));
+            break;
+        }
         case Op::ping: {
             auto nonce = r.u64();
             r.end();
@@ -215,7 +270,7 @@ struct Host::Impl {
                   "pcm16-v1,codec-negotiation-v2;privacy-screen="
                   "unsupported;virtual-"
                   "display=unsupported;hardware-codec=optional-nvenc-h264;desktop-stream=h264-v1,h264-clock-"
-                  "v2;av-clock=host-qpc-v1;session=end-v1;pair=qr-v1");
+                  "v2;av-clock=host-qpc-v1;session=end-v1;pair=qr-v1;endpoints=v1");
             break;
         case Op::list: {
             require(files_read);
@@ -417,13 +472,46 @@ struct Host::Impl {
         auto flow = next_flow.fetch_add(1);
         auto cancelled = std::make_shared<std::atomic_bool>(false);
         Lane send_lane = Lane::input;
+        std::string source;
+        bool guarded = false;
+        bool reserved = false;
+        bool authentication_timeout = false;
+        {
+            std::lock_guard lock(m);
+            auto& h = handshakes.at(socket);
+            source = h.address;
+            guarded = h.guarded;
+        }
         try {
-            tls = std::make_unique<Tls>(socket, &identity);
+            auto deadline = guarded ? std::chrono::steady_clock::now() + std::chrono::seconds(10)
+                                    : std::chrono::steady_clock::time_point::max();
+            tls = std::make_unique<Tls>(
+                socket, &identity, "", deadline, [this, socket, source, guarded](bool timed_out) {
+                    std::lock_guard lock(m);
+                    auto h = handshakes.find(socket);
+                    if (h != handshakes.end() && guarded) {
+                        if (!h->second.timed_out &&
+                            (timed_out || std::chrono::steady_clock::now() >= h->second.deadline))
+                            auth_guard.timeout(source);
+                        auth_guard.release(source);
+                    }
+                    handshakes.erase(socket);
+                    std::erase(active, socket);
+                });
             session = random_token();
-            auto first = tls->receive();
+            auto first = tls->receive(512);
             Reader auth{first};
             auto first_version = auth.u16();
             auto first_op = auth.u16();
+            if (first_op == uint16_t(Op::endpoints)) {
+                Writer denied;
+                denied.u16(protocol_version);
+                denied.u16(first_op);
+                denied.u32(uint32_t(Code::unauthorized));
+                denied.str("请先完成 HELLO 认证");
+                tls->send(denied.b);
+                throw Error(Code::unauthorized, "HELLO required");
+            }
             if (first_op == uint16_t(Op::pair)) {
                 Writer response;
                 response.u16(protocol_version);
@@ -448,9 +536,10 @@ struct Host::Impl {
                         }
                         std::erase_if(pairing_windows,
                                       [&](auto& item) { return item.second.attempts.empty(); });
-                        if (!pairing_windows.contains(ip) && pairing_windows.size() >= 1024)
+                        auto key = source_key(ip);
+                        if (!pairing_windows.contains(key) && pairing_windows.size() >= 1024)
                             throw Error(Code::busy, "配对尝试过于频繁，请稍后重试");
-                        auto [at, inserted] = pairing_windows.try_emplace(ip);
+                        auto [at, inserted] = pairing_windows.try_emplace(key);
                         (void)inserted;
                         if (at->second.attempts.size() >= 10)
                             throw Error(Code::busy, "配对尝试过于频繁，请一分钟后重试");
@@ -460,7 +549,8 @@ struct Host::Impl {
                         throw Error(Code::unsupported, "不支持的配对协议版本，请更新客户端");
                     auto code = auth.str(128), label = auth.str(64);
                     auth.end();
-                    auto device = HostAdministration(state).redeem_invite(code, label);
+                    auto device =
+                        HostAdministration(state).redeem_invite(code, label, local_pairing_source(source));
                     response.u32(0);
                     response.str(device.id);
                     response.str(device.token);
@@ -498,11 +588,23 @@ struct Host::Impl {
                 tls->send(denied.b);
                 throw Error(code, message);
             };
+            bool auth_throttled = false;
+            if (guarded) {
+                std::lock_guard lock(m);
+                auth_throttled = !auth_guard.allowed(source, GetTickCount64());
+            }
+            if (auth_throttled)
+                reject(Code::busy, "认证尝试过于频繁，请稍后重试");
             if (auth_config.root != config.root)
                 reject(Code::conflict, "Root changed; restart host");
             auto allowed = authorized_scopes(auth_config, token);
-            if (!allowed || (requested & ~*allowed))
+            if (!allowed || (requested & ~*allowed)) {
+                if (guarded) {
+                    std::lock_guard lock(m);
+                    auth_guard.failed(source, GetTickCount64());
+                }
                 reject(Code::unauthorized, "Pairing credential or requested permission denied");
+            }
             if (channel > 4)
                 reject(Code::unsupported, "Channel unavailable");
             bool refused = false;
@@ -523,12 +625,24 @@ struct Host::Impl {
                         : channel == 3 ? Lane::bulk
                         : channel == 1 ? Lane::desktop
                                        : Lane::input;
+            bool sessions_full = false;
+            {
+                std::lock_guard lock(m);
+                sessions_full = guarded && public_sessions >= 16;
+                if (guarded && !sessions_full) {
+                    ++public_sessions;
+                    reserved = true;
+                }
+            }
+            if (sessions_full)
+                reject(Code::busy, "已认证会话已满，请稍后重试");
             Writer hello;
             hello.u16(protocol_version);
             hello.u16(uint16_t(Op::hello));
             hello.u32(0);
             hello.u32(requested);
             tls->send(hello.b);
+            tls->clear_deadline();
             auto session_epoch = authorization_epoch(auth_config, token).value();
             HostSession info;
             info.id = session;
@@ -548,11 +662,16 @@ struct Host::Impl {
             if (getpeername(socket, reinterpret_cast<sockaddr*>(&address), &address_size) == 0 &&
                 !getnameinfo(reinterpret_cast<sockaddr*>(&address), address_size, ip, sizeof(ip), nullptr, 0,
                              NI_NUMERICHOST))
-                info.address = ip;
+                info.address = normalize_address(ip);
             {
                 std::lock_guard lock(m);
                 authenticated[socket] = {token,         session,         requested,
                                          session_epoch, std::move(info), cancelled};
+                if (guarded) {
+                    auth_guard.success(source);
+                    auth_guard.release(source);
+                }
+                handshakes.erase(socket);
             }
             tls->set_send_gate([&, flow](size_t bytes) {
                 link.acquire(flow, send_lane, bytes, [&] { return stopped || cancelled->load(); });
@@ -618,6 +737,8 @@ struct Host::Impl {
                 }
                 tls->send(response.b);
             }
+        } catch (const TransportError& error) {
+            authentication_timeout = error.native_code == WSAETIMEDOUT;
         } catch (...) { /* No secrets or remote paths in ambient logs. Client sees close on handshake/auth
                            failure. */
         }
@@ -625,6 +746,16 @@ struct Host::Impl {
         {
             std::lock_guard lock(m);
             authenticated.erase(socket);
+            if (reserved)
+                --public_sessions;
+            auto h = handshakes.find(socket);
+            if (h != handshakes.end() && guarded) {
+                if (!h->second.timed_out &&
+                    (authentication_timeout || std::chrono::steady_clock::now() >= h->second.deadline))
+                    auth_guard.timeout(source);
+                auth_guard.release(source);
+            }
+            handshakes.erase(socket);
             active.erase(std::remove(active.begin(), active.end(), socket), active.end());
         }
         link.forget(flow);
@@ -809,29 +940,35 @@ struct Host::Impl {
             }
         }
     }
-    void worker() {
-        for (;;) {
-            SOCKET s;
-            {
-                std::unique_lock lock(m);
-                cv.wait(lock, [&] { return stopped || !pending.empty(); });
-                if (stopped)
-                    return;
-                s = pending.front();
-                pending.pop_front();
-                active.push_back(s);
-            }
-            connection(s);
-        }
-    }
     void run() {
+        workers.emplace_back([this] {
+            while (!stopped) {
+                if (!internet_enabled.load()) {
+                    auto r = upnp.status();
+                    if (r.ipv4.status != UpnpStatus::idle || r.ipv6.status != UpnpStatus::idle)
+                        upnp.unmap();
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            }
+        });
         workers.emplace_back([this] {
             uint32_t ticks = 0;
             while (!stopped) {
                 expire_pointer_lease();
+                {
+                    std::lock_guard lock(m);
+                    auto now = std::chrono::steady_clock::now();
+                    for (auto& [socket, h] : handshakes)
+                        if (h.guarded && !h.timed_out && now >= h.deadline) {
+                            h.timed_out = true;
+                            auth_guard.timeout(h.address);
+                            shutdown(socket, SD_BOTH);
+                        }
+                }
                 if (++ticks % 5 == 0)
                     try {
                         auto current = load_config(state / L"config.dpapi");
+                        internet_enabled = current.internet_access;
                         file_jobs.authorize_all([&](const std::string& token) {
                             return current.root == config.root ? authorized_scopes(current, token).value_or(0)
                                                                : 0u;
@@ -860,8 +997,6 @@ struct Host::Impl {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
         });
-        for (int i = 0; i < 16; ++i)
-            workers.emplace_back([this] { worker(); });
         while (!stopped) {
             auto s = accept(listener.load(), nullptr, nullptr);
             if (s == INVALID_SOCKET) {
@@ -869,14 +1004,58 @@ struct Host::Impl {
                     break;
                 continue;
             }
+            for (auto it = connections.begin(); it != connections.end();) {
+                if (it->done->load()) {
+                    it->thread.join();
+                    it = connections.erase(it);
+                } else
+                    ++it;
+            }
+            sockaddr_storage peer{};
+            int size = sizeof(peer);
+            char text[NI_MAXHOST]{};
+            if (getpeername(s, reinterpret_cast<sockaddr*>(&peer), &size) ||
+                getnameinfo(reinterpret_cast<sockaddr*>(&peer), size, text, sizeof(text), nullptr, 0,
+                            NI_NUMERICHOST)) {
+                closesocket(s);
+                continue;
+            }
+            bool admitted = false;
             {
                 std::lock_guard lock(m);
-                if (pending.size() >= 8 || stopped)
-                    closesocket(s);
-                else {
-                    pending.push_back(s);
-                    cv.notify_one();
+                bool guarded = internet_enabled.load();
+                if (!stopped && active.size() < 64 && handshakes.size() < 32 &&
+                    (!guarded || auth_guard.acquire(text, GetTickCount64()))) {
+                    active.push_back(s);
+                    handshakes[s] = {normalize_address(text),
+                                     std::chrono::steady_clock::now() + std::chrono::seconds(10), guarded};
+                    admitted = true;
                 }
+            }
+            if (!admitted) {
+                closesocket(s);
+                continue;
+            }
+            auto done = std::make_shared<std::atomic_bool>(false);
+            try {
+                connections.emplace_back();
+                connections.back().done = done;
+                connections.back().thread = std::thread([this, s, done] {
+                    connection(s);
+                    done->store(true);
+                });
+            } catch (...) {
+                if (!connections.empty() && connections.back().done == done &&
+                    !connections.back().thread.joinable())
+                    connections.pop_back();
+                std::lock_guard lock(m);
+                auto h = handshakes.find(s);
+                if (h != handshakes.end() && h->second.guarded)
+                    auth_guard.release(h->second.address);
+                handshakes.erase(s);
+                std::erase(active, s);
+                closesocket(s);
+                continue;
             }
         }
         stop();
@@ -884,6 +1063,10 @@ struct Host::Impl {
             if (t.joinable())
                 t.join();
         workers.clear();
+        for (auto& c : connections)
+            if (c.thread.joinable())
+                c.thread.join();
+        connections.clear();
     }
     void stop() {
         stopped = true;
@@ -895,13 +1078,12 @@ struct Host::Impl {
             shutdown(s, SD_BOTH);
             closesocket(s);
         }
-        std::lock_guard lock(m);
-        for (auto sock : active)
-            shutdown(sock, SD_BOTH);
-        for (auto sock : pending)
-            closesocket(sock);
-        pending.clear();
-        cv.notify_all();
+        {
+            std::lock_guard lock(m);
+            for (auto sock : active)
+                shutdown(sock, SD_BOTH);
+        }
+        upnp.stop();
     }
 };
 Host::Host(const fs::path& s, const std::string& b, uint16_t p) : p_(std::make_unique<Impl>(s, b, p)) {}
@@ -913,6 +1095,47 @@ void Host::run() {
 }
 void Host::stop() {
     p_->stop();
+}
+std::string Host::listening_address() const {
+    return p_->actual_bind;
+}
+uint16_t Host::listening_port() const {
+    return p_->actual_port;
+}
+NetworkSecurityStats Host::security_stats() const {
+    std::lock_guard lock(p_->m);
+    return p_->auth_guard.stats();
+}
+UpnpReport Host::upnp_map(bool ipv4, bool ipv6) {
+    auto c = load_config(p_->state / L"config.dpapi");
+    if (!c.internet_access || c.legacy_enabled)
+        throw Error(Code::unauthorized, "请先禁用旧凭据并开启公网访问");
+    p_->internet_enabled = true;
+    UpnpRequest request;
+    request.internal_port = p_->actual_port;
+    request.external_port = c.external_port ? c.external_port : p_->actual_port;
+    for (auto& a : host_addresses()) {
+        if (a.virtual_adapter || a.deprecated || a.temporary)
+            continue;
+        if (ipv4 && request.ipv4.empty() && a.category == AddressKind::private_v4)
+            request.ipv4 = a.address;
+        if (ipv6 && request.ipv6.empty() && a.category == AddressKind::global_v6)
+            request.ipv6 = a.address;
+    }
+    if (request.ipv4.empty() && request.ipv6.empty())
+        throw Error(Code::not_found, "没有可用于路由器映射的稳定地址");
+    return p_->upnp.map(request);
+}
+UpnpReport Host::upnp_unmap() {
+    return p_->upnp.unmap();
+}
+UpnpReport Host::upnp_status() const {
+    return p_->upnp.status();
+}
+ReachabilityReport Host::reachability_report(const fs::path& exe) const {
+    return lantern::reachability_report(load_config(p_->state / L"config.dpapi"), exe, p_->actual_bind,
+                                        p_->actual_port, p_->listener.load() != INVALID_SOCKET,
+                                        p_->upnp.status());
 }
 std::string Host::discovery_status() const {
     return p_->discovery->status();

@@ -2,6 +2,7 @@
 #include "lantern/lan.hpp"
 #include "lantern/pairing_client.hpp"
 #include "lantern/win.hpp"
+#include "lantern/windows_client.hpp"
 #include <iostream>
 #include <shellapi.h>
 using namespace lantern;
@@ -14,25 +15,31 @@ static BOOL WINAPI console_signal(DWORD) {
     return FALSE;
 }
 static void usage() {
-    std::cout << "Lantern 0.1 experimental LAN build\n"
-                 "init STATE ROOT SCOPES  (1 read,2 write,4 view,8 control,16 audio; sum explicitly)\n"
-                 "grant STATE SCOPES     (replace allowed scope set, including 0 to deny all)\n"
-                 "identity STATE         (host certificate SHA256; no credential output)\n"
-                 "device-add STATE LABEL SCOPES (unique credential, locally shown once)\n"
-                 "device-list STATE; device-grant STATE ID SCOPES; device-remove STATE ID\n"
-                 "device-end STATE ID (end current connections; trust remains, clients may reconnect)\n"
-                 "device-secret STATE ID LOCAL-DPAPI-FILE; legacy-off STATE\n"
-                 "host STATE [BIND=0.0.0.0] [PORT=47443]\n"
-                 "invite STATE LABEL SCOPES [MINUTES=10] (prints a one-time pairing URI)\n"
-                 "pair LINK DEVICE-LABEL SECRET-FILE (DPAPI credential; never prints the token)\n"
-                 "firewall-allow EXE PORT (administrator; Private profile only)\n"
-                 "revoke STATE           (rotates credential; interrupts existing trust)\n"
-                 "secret STATE LOCAL-DPAPI-FILE  (protect pairing credential for this user)\n"
-                 "client HOST PORT PIN SECRET-FILE caps|list|stat|get|put|mkdir|move|copy|delete|frame|media "
-                 "ARGS...\n"
-                 "get REMOTE LOCAL; put LOCAL REMOTE; list [PATH] [OFFSET] [FILTER]; frame JPEG [MONITOR]\n"
-                 "media REMOTE [LOCAL-PORT=47880] [launch] (original byte range bridge for external player)\n"
-                 "open LOCAL; open-with LOCAL\n";
+    std::cout
+        << "Lantern 0.1 experimental LAN build\n"
+           "init STATE ROOT SCOPES  (1 read,2 write,4 view,8 control,16 audio; sum explicitly)\n"
+           "grant STATE SCOPES     (replace allowed scope set, including 0 to deny all)\n"
+           "identity STATE         (host certificate SHA256; no credential output)\n"
+           "device-add STATE LABEL SCOPES (unique credential, locally shown once)\n"
+           "device-list STATE; device-grant STATE ID SCOPES; device-remove STATE ID\n"
+           "device-end STATE ID (end current connections; trust remains, clients may reconnect)\n"
+           "device-secret STATE ID LOCAL-DPAPI-FILE; legacy-off STATE\n"
+           "host STATE [BIND=::] [PORT=47443] (dual stack; IPv4 fallback reported)\n"
+           "invite STATE LABEL SCOPES [MINUTES=10] [allow-remote] (prints a one-time pairing URI)\n"
+           "pair LINK DEVICE-LABEL SECRET-FILE (DPAPI credential; never prints the token)\n"
+           "firewall-allow EXE PORT (administrator; Private profile only)\n"
+           "endpoints STATE [PORT=47443]; internet STATE on|off [HOSTNAME] [PUBLIC-PORT]\n"
+           "firewall-public-allow EXE PORT; firewall-public-remove EXE PORT (elevated, Private TCP only)\n"
+           "upnp status; upnp map STATE [PORT=47443] (runs host until Ctrl+C, then deletes leases)\n"
+           "upnp unmap EXTERNAL-PORT [PINHOLE-ID] (explicit cleanup after crash)\n"
+           "client-probe HOST PORT PIN [OTHER-HOST...] (TCP/TLS only, no authentication)\n"
+           "revoke STATE           (rotates credential; interrupts existing trust)\n"
+           "secret STATE LOCAL-DPAPI-FILE  (protect pairing credential for this user)\n"
+           "client HOST PORT PIN SECRET-FILE caps|list|stat|get|put|mkdir|move|copy|delete|frame|media "
+           "ARGS...\n"
+           "get REMOTE LOCAL; put LOCAL REMOTE; list [PATH] [OFFSET] [FILTER]; frame JPEG [MONITOR]\n"
+           "media REMOTE [LOCAL-PORT=47880] [launch] (original byte range bridge for external player)\n"
+           "open LOCAL; open-with LOCAL\n";
 }
 int wmain(int argc, wchar_t** argv) {
     try {
@@ -61,24 +68,92 @@ int wmain(int argc, wchar_t** argv) {
                 throw Error(Code::invalid, "数字参数超出范围");
             return n;
         };
+        if (a[0] == "internet") {
+            need(3);
+            if (a.size() > 5 || (a[2] != "on" && a[2] != "off"))
+                throw Error(Code::invalid, "internet STATE on|off [HOSTNAME] [PUBLIC-PORT]");
+            HostAdministration(wide(a[1]))
+                .internet(a[2] == "on", a.size() > 3 ? a[3] : "",
+                          a.size() > 4 ? uint16_t(bounded_number(a[4], 1, 65535)) : 0);
+            std::cout << "Internet access " << a[2]
+                      << ". Firewall changes require an explicit elevated command.\n";
+            return 0;
+        }
+        if (a[0] == "endpoints") {
+            need(2);
+            auto c = load_config(fs::path(wide(a[1])) / L"config.dpapi");
+            auto port = a.size() > 2 ? uint16_t(bounded_number(a[2], 1, 65535)) : uint16_t(47443);
+            for (auto& e : host_endpoints(c, port))
+                std::cout << uint32_t(e.kind) << " " << format_endpoint({e.host, e.port})
+                          << " priority=" << e.priority << " expires=" << e.expires_at << "\n";
+            return 0;
+        }
+        if (a[0] == "client-probe") {
+            need(4);
+            std::vector<ConnectionEndpoint> endpoints{
+                connection_endpoint(a[1], uint16_t(bounded_number(a[2], 1, 65535)))};
+            for (size_t i = 4; i < a.size(); ++i)
+                endpoints.push_back(connection_endpoint(a[i], endpoints[0].port));
+            for (auto& r : probe_endpoints(endpoints, a[3]))
+                std::cout << format_endpoint({r.endpoint.host, r.endpoint.port})
+                          << " result=" << int(r.failure) << " tcp_tls_ms=" << r.elapsed_ms << "\n";
+            return 0;
+        }
+        if (a[0] == "firewall-public-allow" || a[0] == "firewall-public-remove") {
+            need(3);
+            auto port = uint16_t(bounded_number(a[2], 1, 65535));
+            if (a[0] == "firewall-public-allow")
+                firewall_public_allow(wide(a[1]), port);
+            else
+                firewall_public_remove(wide(a[1]));
+            return 0;
+        }
+        if (a[0] == "upnp") {
+            need(2);
+            if (a[1] == "status") {
+                UpnpIgd igd;
+                std::cout << "IGD discovery=" << int(igd.discover()) << " (read only, local router only)\n";
+                return 0;
+            }
+            if (a[1] == "unmap") {
+                need(3);
+                UpnpIgd igd;
+                auto report = igd.remove(
+                    uint16_t(bounded_number(a[2], 0, 65535)),
+                    a.size() > 3 ? std::optional(uint32_t(bounded_number(a[3], 0, 65535))) : std::nullopt);
+                std::cout << "IPv4=" << int(report.ipv4.status) << " IPv6=" << int(report.ipv6.status)
+                          << "\n";
+                return 0;
+            }
+            if (a[1] == "map") {
+                need(3);
+                Host host(wide(a[2]), default_host_bind,
+                          a.size() > 3 ? uint16_t(bounded_number(a[3], 1, 65535)) : 47443);
+                auto report = host.upnp_map();
+                if (report.ipv6.pinhole_id)
+                    std::cout << "IPv6 pinhole-id=" << *report.ipv6.pinhole_id << "\n";
+                std::cout << "IPv4=" << int(report.ipv4.status) << " IPv6=" << int(report.ipv6.status)
+                          << "; leases deleted on Ctrl+C\n";
+                running = &host;
+                SetConsoleCtrlHandler(console_signal, TRUE);
+                host.run();
+                running = nullptr;
+                return 0;
+            }
+            throw Error(Code::invalid, "upnp map|unmap|status");
+        }
         if (a[0] == "invite") {
             need(4);
-            if (a.size() > 5)
+            if (a.size() > 6 || (a.size() == 6 && a[5] != "allow-remote"))
                 throw Error(Code::invalid, "邀请命令参数过多");
             auto scopes = uint32_t(bounded_number(a[3], 1, 31));
-            auto minutes = a.size() == 5 ? bounded_number(a[4], 1, 1440) : 10;
-            std::vector<std::string> addresses;
-            for (auto& address : lan_addresses()) {
-                if (addresses.size() == 8)
-                    break;
-                if (std::find(addresses.begin(), addresses.end(), address.address) == addresses.end())
-                    addresses.push_back(address.address);
-            }
+            auto minutes = a.size() >= 5 ? bounded_number(a[4], 1, 1440) : 10;
+            auto addresses = host_endpoints(load_config(fs::path(wide(a[1])) / L"config.dpapi"));
             if (addresses.empty())
-                throw Error(Code::not_found, "没有已连接的局域网 IPv4 地址");
-            auto invite =
-                HostAdministration(wide(a[1])).invite(a[2], scopes, std::chrono::seconds(minutes * 60));
-            std::cout << pairing_uri(invite, addresses, 47443) << "\n";
+                throw Error(Code::not_found, "没有可用的连接入口");
+            auto invite = HostAdministration(wide(a[1]))
+                              .invite(a[2], scopes, std::chrono::seconds(minutes * 60), a.size() == 6);
+            std::cout << pairing_uri_endpoints(invite, addresses, 47443) << "\n";
             return 0;
         }
         if (a[0] == "pair") {
@@ -180,7 +255,13 @@ int wmain(int argc, wchar_t** argv) {
             need(2);
             auto path = fs::path(wide(a[1])) / L"config.dpapi";
             std::string token;
-            edit_config(path,[&](Config& config){config.token=random_token();config.devices.clear();config.legacy_enabled=true;config.legacy_epoch=0;token=config.token;});
+            edit_config(path, [&](Config& config) {
+                config.token = random_token();
+                config.devices.clear();
+                config.legacy_enabled = !config.internet_access;
+                config.legacy_epoch = 0;
+                token = config.token;
+            });
             std::cout << "All trust revoked. New pairing secret (local only): " << token << "\n";
             return 0;
         }
@@ -198,7 +279,8 @@ int wmain(int argc, wchar_t** argv) {
                    a.size() > 3 ? uint16_t(std::stoul(a[3])) : 47443);
             running = &h;
             SetConsoleCtrlHandler(console_signal, TRUE);
-            std::cout << "Host ready. No unattended service installed. Ctrl+C terminates sessions.\n";
+            std::cout << "Host ready on " << format_endpoint({h.listening_address(), h.listening_port()})
+                      << ". Ctrl+C terminates sessions.\n";
             h.run();
             running = nullptr;
             return 0;

@@ -136,8 +136,8 @@ bool constant_equal(const std::string& a, const std::string& b) {
     return difference == 0;
 }
 } // namespace
-PairingInvite HostAdministration::invite(const std::string& label, uint32_t scopes,
-                                         std::chrono::seconds ttl) {
+PairingInvite HostAdministration::invite(const std::string& label, uint32_t scopes, std::chrono::seconds ttl,
+                                         bool allow_remote) {
     if (!valid_pairing_label(label) || !scopes || ttl.count() < 1 || ttl.count() > 86400)
         throw Error(Code::invalid, "邀请名称须为1..64字节，有效期须为1秒到24小时");
     PairingInvite result;
@@ -145,6 +145,7 @@ PairingInvite HostAdministration::invite(const std::string& label, uint32_t scop
     result.code = result.id + random_token().substr(0, 32);
     result.label = label;
     result.scopes = scopes;
+    result.allow_remote = allow_remote;
     result.expires_at = pairing_unix_time() + uint64_t(ttl.count());
     wchar_t host[256]{};
     DWORD count = 256;
@@ -182,7 +183,8 @@ void HostAdministration::cancel_invite(const std::string& id) {
         std::erase_if(c.invites, [&](auto& i) { return i.id == id; });
     });
 }
-TrustedDevice HostAdministration::redeem_invite(const std::string& code, const std::string& label) {
+TrustedDevice HostAdministration::redeem_invite(const std::string& code, const std::string& label,
+                                                bool local_source) {
     if (!valid_pairing_label(label))
         throw Error(Code::invalid, "设备名称须为1..64字节");
     TrustedDevice result;
@@ -194,7 +196,7 @@ TrustedDevice HostAdministration::redeem_invite(const std::string& code, const s
                                   [&](auto& i) { return code.size() == 64 && i.id == code.substr(0, 32); });
         if (found == c.invites.end())
             return;
-        if (!constant_equal(found->code_hash, digest)) {
+        if (!constant_equal(found->code_hash, digest) || (!local_source && !found->allow_remote)) {
             ++found->failed_attempts;
             prune_invites(c);
             return;
@@ -217,5 +219,20 @@ TrustedDevice HostAdministration::redeem_invite(const std::string& code, const s
         throw Error(failure,
                     failure == Code::busy ? "设备数量已达上限" : "配对码无效或已过期，请在电脑刷新二维码");
     return result;
+}
+InternetSettings HostAdministration::network_settings() const {
+    auto c = load_config(state_ / L"config.dpapi");
+    return {c.internet_access, c.public_hostname, c.external_port};
+}
+void HostAdministration::internet(bool enabled, const std::string& hostname, uint16_t port) {
+    if (!hostname.empty() && !valid_hostname(hostname))
+        throw Error(Code::invalid, "公网域名格式无效");
+    edit_config(state_ / L"config.dpapi", [&](Config& c) {
+        if (enabled && c.legacy_enabled)
+            throw InternetAccessError();
+        c.internet_access = enabled;
+        c.public_hostname = hostname;
+        c.external_port = port;
+    });
 }
 } // namespace lantern

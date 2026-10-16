@@ -165,7 +165,10 @@ SOCKET listen_socket(const std::string& bind, uint16_t port) {
         setsockopt(candidate, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&exclusive, sizeof(exclusive));
         if (item->ai_family == AF_INET6) {
             DWORD only = bind == "::" ? 0 : 1;
-            setsockopt(candidate, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&only, sizeof(only));
+            if (setsockopt(candidate, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&only, sizeof(only))) {
+                closesocket(candidate);
+                continue;
+            }
         }
         if (!::bind(candidate, item->ai_addr, int(item->ai_addrlen)) && !listen(candidate, 12)) {
             selected = candidate;
@@ -189,6 +192,25 @@ static void send_all(SOCKET s, std::span<const uint8_t> b) {
     }
 }
 struct Tls::Impl {
+    std::function<void(bool)> before_close;
+    bool timed_out = false;
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max();
+    void time_left() {
+        if (deadline == std::chrono::steady_clock::time_point::max())
+            return;
+        auto n =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now())
+                .count();
+        if (n <= 0) {
+            timed_out = true;
+            throw TransportError("Connection deadline exceeded", WSAETIMEDOUT);
+        }
+        DWORD ms = DWORD(std::min<int64_t>(15000, n));
+        if (!ms)
+            ms = 1;
+        setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&ms), sizeof(ms));
+        setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&ms), sizeof(ms));
+    }
     std::function<void(size_t)> send_gate;
     SOCKET socket = INVALID_SOCKET;
     CredHandle cred{};
@@ -203,15 +225,21 @@ struct Tls::Impl {
         if (has_cred)
             FreeCredentialsHandle(&cred);
         if (socket != INVALID_SOCKET) {
+            if (before_close)
+                before_close(timed_out);
             shutdown(socket, SD_BOTH);
             closesocket(socket);
         }
     }
     void pull() {
+        time_left();
         uint8_t buf[16384];
         int n = recv(socket, (char*)buf, sizeof(buf), 0);
-        if (n <= 0)
-            throw TransportError("Connection closed or timed out");
+        if (n <= 0) {
+            auto error = n < 0 ? WSAGetLastError() : 0;
+            timed_out = error == WSAETIMEDOUT;
+            throw TransportError("Connection closed or timed out", error);
+        }
         if (encrypted.size() + n > 128 * 1024)
             throw Error(Code::invalid, "TLS input bound exceeded");
         encrypted.insert(encrypted.end(), buf, buf + n);
@@ -302,6 +330,7 @@ struct Tls::Impl {
     }
     void write(std::span<const uint8_t> data) {
         for (size_t at = 0; at < data.size();) {
+            time_left();
             size_t n = std::min<size_t>(sizes.cbMaximumMessage, data.size() - at);
             Bytes record(sizes.cbHeader + n + sizes.cbTrailer);
             std::copy_n(data.data() + at, n, record.data() + sizes.cbHeader);
@@ -350,10 +379,18 @@ struct Tls::Impl {
         return plain[plain_at++];
     }
 };
-Tls::Tls(SOCKET s, Identity* i, const std::string& pin) : p_(std::make_unique<Impl>()) {
+Tls::Tls(SOCKET s, Identity* i, const std::string& pin, std::chrono::steady_clock::time_point deadline,
+         std::function<void(bool)> before_close)
+    : p_(std::make_unique<Impl>()) {
     p_->socket = s;
+    p_->deadline = deadline;
+    p_->before_close = std::move(before_close);
     configure_socket(s);
     p_->handshake(i, pin);
+}
+void Tls::clear_deadline() noexcept {
+    p_->deadline = std::chrono::steady_clock::time_point::max();
+    configure_socket(p_->socket);
 }
 Tls::~Tls() = default;
 void Tls::set_send_gate(std::function<void(size_t)> gate) {
@@ -375,11 +412,11 @@ void Tls::send(std::span<const uint8_t> b) {
     if (initial < b.size())
         p_->write(b.subspan(initial));
 }
-Bytes Tls::receive() {
+Bytes Tls::receive(uint32_t limit) {
     uint32_t n = 0;
     for (int i = 0; i < 4; ++i)
         n = (n << 8) | p_->byte();
-    if (n > max_frame || n < 4)
+    if (n > std::min(max_frame, limit) || n < 4)
         throw Error(Code::invalid, "Invalid frame length");
     Bytes b(n);
     for (auto& c : b)

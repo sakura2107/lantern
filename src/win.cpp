@@ -176,7 +176,10 @@ void save_config(const fs::path& p, const Config& c) {
         invite_ids.push_back(i.id);
     }
     Writer w;
-    w.u16(3);
+    if ((c.internet_access && c.legacy_enabled) ||
+        (!c.public_hostname.empty() && !valid_hostname(c.public_hostname)))
+        throw Error(Code::conflict, "Invalid Internet access settings; disable legacy credentials first");
+    w.u16(4);
     w.str(utf8(fs::absolute(c.root).wstring()));
     w.str(c.token);
     w.u32(c.scopes);
@@ -190,7 +193,11 @@ void save_config(const fs::path& p, const Config& c) {
         w.u32(i.scopes);
         w.u64(i.expires_at);
         w.u32(i.failed_attempts);
+        w.u32(i.allow_remote ? 1 : 0);
     }
+    w.u32(c.internet_access ? 1 : 0);
+    w.str(c.public_hostname);
+    w.u32(c.external_port);
     auto b = protect(w.b);
     auto temp = p;
     temp += L".new-" + wide(random_token().substr(0, 12));
@@ -211,7 +218,7 @@ Config load_config(const fs::path& p) {
     auto b = unprotect(cipher);
     Reader r{b};
     auto version=r.u16();
-    if (version != 1 && version != 2 && version != 3)
+    if (version < 1 || version > 4)
         throw Error(Code::unsupported, "Configuration version");
     Config c;
     c.root = wide(r.str());
@@ -237,6 +244,12 @@ Config load_config(const fs::path& p) {
             i.scopes = r.u32();
             i.expires_at = r.u64();
             i.failed_attempts = r.u32();
+            if (version >= 4) {
+                auto remote = r.u32();
+                if (remote > 1)
+                    throw Error(Code::invalid, "Invalid invite mode");
+                i.allow_remote = remote != 0;
+            }
             if (i.id.size() != 32 || !valid_sha(i.id + i.id) || !valid_sha(i.code_hash) ||
                 !valid_pairing_label(i.label) || !i.scopes || (i.scopes & ~31u) || !i.expires_at ||
                 i.expires_at > 4102444800ULL || i.failed_attempts >= 5 ||
@@ -244,6 +257,16 @@ Config load_config(const fs::path& p) {
                 throw Error(Code::invalid, "Invitation configuration corrupt");
             c.invites.push_back(std::move(i));
         }
+    }
+    if (version >= 4) {
+        auto enabled = r.u32();
+        c.public_hostname = r.str(253);
+        auto port = r.u32();
+        if (enabled > 1 || port > 65535 || (enabled && c.legacy_enabled) ||
+            (!c.public_hostname.empty() && !valid_hostname(c.public_hostname)))
+            throw Error(Code::invalid, "Invalid Internet settings");
+        c.internet_access = enabled != 0;
+        c.external_port = uint16_t(port);
     }
     r.end();
     if (!valid_sha(c.token) || (c.scopes & ~31u))

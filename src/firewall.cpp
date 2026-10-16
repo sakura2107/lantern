@@ -106,6 +106,11 @@ bool constrained(INetFwRule* r) {
 }
 } // namespace
 namespace detail {
+void configure_public_firewall_rule(INetFwRule* rule, const std::wstring& exe, uint16_t port) {
+    configure_firewall_rule(rule, exe, port, NET_FW_IP_PROTOCOL_TCP);
+    checked(rule->put_RemoteAddresses(Bstr(L"*")));
+    checked(rule->put_Description(Bstr(L"Lantern 公网 TCP 主机；仅受信任的专用网络，用户显式启用")));
+}
 void configure_firewall_rule(INetFwRule* rule, const std::wstring& exe, uint16_t port, long protocol) {
     checked(rule->put_Enabled(VARIANT_FALSE));
     checked(rule->put_Description(Bstr(L"Lantern 私有局域网主机；仅专用网络和本地子网")));
@@ -129,7 +134,7 @@ void configure_firewall_rule(INetFwRule* rule, const std::wstring& exe, uint16_t
 } // namespace detail
 namespace {
 void configure_rule(INetFwRules* rules, const wchar_t* name, const std::wstring& exe, uint16_t port,
-                    long protocol) {
+                    long protocol, bool internet = false) {
     ComPtr<INetFwRule> rule;
     Bstr key(name);
     HRESULT hr = rules->Item(key, &rule);
@@ -137,12 +142,15 @@ void configure_rule(INetFwRules* rules, const wchar_t* name, const std::wstring&
     if (!existing)
         checked(CoCreateInstance(__uuidof(NetFwRule), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&rule)));
     checked(rule->put_Name(key));
-    detail::configure_firewall_rule(rule.Get(), exe, port, protocol);
+    if (internet)
+        detail::configure_public_firewall_rule(rule.Get(), exe, port);
+    else
+        detail::configure_firewall_rule(rule.Get(), exe, port, protocol);
     if (!existing)
         checked(rules->Add(rule.Get()));
 }
 } // namespace
-FirewallState firewall_state(const fs::path& exe, uint16_t port) noexcept {
+static FirewallState firewall_state_impl(const fs::path& exe, uint16_t port, bool internet) noexcept {
     try {
         if (!port)
             return FirewallState::unknown;
@@ -202,6 +210,14 @@ FirewallState firewall_state(const fs::path& exe, uint16_t port) noexcept {
                 !ports_match(property([&](BSTR* s) { return rule->get_LocalPorts(s); }), port))
                 continue;
             checked(rule->get_Action(&action));
+            if (internet) {
+                auto remote = property([&](BSTR* s) { return rule->get_RemoteAddresses(s); });
+                if (!remote.empty() && remote != L"*") {
+                    if (action == NET_FW_ACTION_BLOCK)
+                        uncertain = true;
+                    continue;
+                }
+            }
             if (constrained(rule.Get())) {
                 uncertain = true;
                 continue;
@@ -221,6 +237,56 @@ FirewallState firewall_state(const fs::path& exe, uint16_t port) noexcept {
     } catch (...) {
         return FirewallState::unknown;
     }
+}
+FirewallState firewall_state(const fs::path& exe, uint16_t port) noexcept {
+    return firewall_state_impl(exe, port, false);
+}
+FirewallState public_firewall_state(const fs::path& exe, uint16_t port) noexcept {
+    return firewall_state_impl(exe, port, true);
+}
+uint32_t firewall_current_profiles() noexcept {
+    try {
+        ComScope com;
+        long profiles = 0;
+        checked(policy()->get_CurrentProfileTypes(&profiles));
+        return uint32_t(profiles);
+    } catch (...) {
+        return 0;
+    }
+}
+static void require_elevation() {
+    HANDLE raw = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw))
+        win_error("Elevation token");
+    Handle token(raw);
+    TOKEN_ELEVATION info{};
+    DWORD bytes = 0;
+    if (!GetTokenInformation(token, TokenElevation, &info, sizeof(info), &bytes) || !info.TokenIsElevated)
+        throw Error(Code::unauthorized, "此命令需要管理员权限");
+}
+void firewall_public_allow(const fs::path& exe, uint16_t port) {
+    if (!port || !fs::is_regular_file(exe))
+        throw Error(Code::invalid, "请选择有效程序和端口");
+    require_elevation();
+    ComScope com;
+    ComPtr<INetFwRules> rules;
+    checked(policy()->get_Rules(&rules));
+    configure_rule(rules.Get(), L"Lantern 主机（公网）", exe_path(exe), port, NET_FW_IP_PROTOCOL_TCP, true);
+}
+void firewall_public_remove(const fs::path& exe) {
+    require_elevation();
+    ComScope com;
+    ComPtr<INetFwRules> rules;
+    checked(policy()->get_Rules(&rules));
+    ComPtr<INetFwRule> rule;
+    Bstr name(L"Lantern 主机（公网）");
+    auto hr = rules->Item(name, &rule);
+    if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND))
+        return;
+    checked(hr);
+    if (!same_exe(property([&](BSTR* s) { return rule->get_ApplicationName(s); }), exe_path(exe)))
+        throw Error(Code::conflict, "公网规则属于另一程序");
+    checked(rules->Remove(name));
 }
 void firewall_allow(const fs::path& exe, uint16_t port) {
     if (!port || !fs::is_regular_file(exe))
@@ -242,7 +308,7 @@ void firewall_allow(const fs::path& exe, uint16_t port) {
     configure_rule(rules.Get(), L"Lantern 主机", target, port, NET_FW_IP_PROTOCOL_TCP);
     configure_rule(rules.Get(), L"Lantern 主机（发现）", target, 47442, NET_FW_IP_PROTOCOL_UDP);
 }
-bool request_firewall_allow(const fs::path& exe, uint16_t port) noexcept {
+static bool request_firewall_change(const fs::path& exe, uint16_t port, const wchar_t* command) noexcept {
     try {
         if (!port || !fs::is_regular_file(exe))
             return false;
@@ -253,7 +319,7 @@ bool request_firewall_allow(const fs::path& exe, uint16_t port) noexcept {
         auto cli = fs::path(module).parent_path() / L"lantern.exe";
         if (!fs::is_regular_file(cli))
             return false;
-        auto parameters = L"firewall-allow \"" + exe_path(exe) + L"\" " + std::to_wstring(port);
+        auto parameters = std::wstring(command) + L" \"" + exe_path(exe) + L"\" " + std::to_wstring(port);
         SHELLEXECUTEINFOW call{sizeof(call)};
         call.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
         call.lpVerb = L"runas";
@@ -270,5 +336,11 @@ bool request_firewall_allow(const fs::path& exe, uint16_t port) noexcept {
     } catch (...) {
         return false;
     }
+}
+bool request_firewall_allow(const fs::path& exe, uint16_t port) noexcept {
+    return request_firewall_change(exe, port, L"firewall-allow");
+}
+bool request_public_firewall(const fs::path& exe, uint16_t port, bool allow) noexcept {
+    return request_firewall_change(exe, port, allow ? L"firewall-public-allow" : L"firewall-public-remove");
 }
 } // namespace lantern

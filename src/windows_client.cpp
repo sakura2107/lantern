@@ -46,7 +46,52 @@ std::vector<Entry> parse_entries(Reader& r, uint32_t bound) {
 }
 } // namespace
 std::shared_ptr<Client> ClientCredentials::connect(uint32_t scopes, uint32_t channel) const {
-    return std::make_shared<Client>(host, port, pin, token, scopes, channel);
+    auto candidates = endpoints;
+    if (candidates.empty()) {
+        auto c = std::make_shared<Client>(host, port, pin, token, scopes, channel);
+        c->selected_endpoint = connection_endpoint(host, port);
+        return c;
+    }
+    auto result = connect_endpoints(candidates, pin);
+    auto client = std::make_shared<Client>(std::move(result.tls), token, scopes, channel);
+    client->selected_endpoint = result.selected;
+    client->connection_attempts = std::move(result.attempts);
+    return client;
+}
+void merge_endpoints(ClientCredentials& c, const std::vector<ConnectionEndpoint>& fresh) {
+    c.endpoints = merge_endpoints(c.endpoints, fresh, pairing_unix_time());
+}
+std::vector<EndpointProbe> probe_endpoints(const ClientCredentials& c, std::chrono::milliseconds timeout) {
+    auto list = c.endpoints.empty() ? std::vector<ConnectionEndpoint>{connection_endpoint(c.host, c.port)}
+                                    : c.endpoints;
+    std::vector<EndpointProbe> reports;
+    for (auto& e : merge_endpoints({}, list, pairing_unix_time())) {
+        try {
+            auto result = connect_endpoints({e}, c.pin, timeout);
+            auto probe = result.attempts.front();
+            try {
+                Client client(std::move(result.tls), c.token, 0, 0);
+                Writer ping;
+                auto nonce = monotonic_us();
+                ping.u64(nonce);
+                auto start = std::chrono::steady_clock::now();
+                auto bytes = client.call(Op::ping, std::move(ping));
+                Reader r{bytes};
+                if (r.u64() != nonce)
+                    throw Error(Code::invalid, "Probe nonce mismatch");
+                r.end();
+                probe.rtt_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::steady_clock::now() - start)
+                                            .count());
+            } catch (...) {
+                probe.failure = EndpointFailure::transport;
+            }
+            reports.push_back(probe);
+        } catch (const EndpointConnectError& error) {
+            reports.insert(reports.end(), error.attempts.begin(), error.attempts.end());
+        }
+    }
+    return reports;
 }
 void ActiveConnection::set(std::shared_ptr<Client> c) {
     std::lock_guard lock(mutex_);
@@ -61,6 +106,7 @@ void save_credentials(const fs::path& p, const ClientCredentials& c) {
     Writer w;
     w.u32(1);
     credential_write(w, c);
+    write_endpoints(w, merge_endpoints({}, c.endpoints, pairing_unix_time()));
     atomic_private(p, w.b);
 }
 ClientCredentials load_credentials(const fs::path& p) {
@@ -69,6 +115,8 @@ ClientCredentials load_credentials(const fs::path& p) {
     if (r.u32() != 1)
         throw Error(Code::unsupported, "Client state version");
     auto c = credential_read(r);
+    if (r.at < r.b.size())
+        c.endpoints = read_endpoints(r);
     r.end();
     return c;
 }
@@ -169,7 +217,7 @@ WindowsTransfers::WindowsTransfers(fs::path p, std::function<void()> changed,
         auto b = unprotect(read_file(journal_, 1024 * 1024));
         Reader r{b};
         auto version = r.u32();
-        if (version < 1 || version > 3)
+        if (version < 1 || version > 4)
             throw Error(Code::unsupported, "Transfer journal version");
         auto n = r.u32();
         if (n > 32)
@@ -179,6 +227,8 @@ WindowsTransfers::WindowsTransfers(fs::path p, std::function<void()> changed,
             TransferTask t;
             t.id = r.str(64);
             t.credentials = credential_read(r);
+            if (version >= 4)
+                t.credentials.endpoints = read_endpoints(r);
             t.remote = r.str();
             t.local = fs::path(wide(r.str()));
             auto direction = r.u32(), state = r.u32();
@@ -228,11 +278,12 @@ WindowsTransfers::~WindowsTransfers() {
 }
 void WindowsTransfers::persist() {
     Writer w;
-    w.u32(3);
+    w.u32(4);
     w.u32(uint32_t(tasks_.size()));
     for (auto& t : tasks_) {
         w.str(t.id);
         credential_write(w, t.credentials);
+        write_endpoints(w, t.credentials.endpoints);
         w.str(t.remote);
         w.str(utf8(t.local.wstring()));
         w.u32(t.upload ? 1 : 0);

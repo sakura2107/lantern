@@ -1,5 +1,7 @@
 #pragma once
 #include "core.hpp"
+#include "network.hpp"
+#include "network_security.hpp"
 #include "pairing.hpp"
 #include <filesystem>
 #include <functional>
@@ -63,13 +65,16 @@ class Tls {
     std::unique_ptr<Impl> p_;
 
   public:
-    Tls(SOCKET, Identity* server, const std::string& expected_pin = "");
+    Tls(SOCKET, Identity* server, const std::string& expected_pin = "",
+        std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max(),
+        std::function<void(bool timed_out)> before_socket_close = {});
     ~Tls();
     Tls(const Tls&) = delete;
     void send(std::span<const uint8_t>);
-    Bytes receive();
+    Bytes receive(uint32_t limit = max_frame);
     void set_send_gate(std::function<void(size_t)>); // Owner thread, installed after authentication.
     void interrupt() noexcept; // May be called by another thread; owner must keep Tls alive.
+    void clear_deadline() noexcept;
 };
 SOCKET connect_socket(const std::string&, uint16_t);
 SOCKET listen_socket(const std::string&, uint16_t);
@@ -220,6 +225,9 @@ struct Config {
     uint64_t legacy_epoch=0;
     std::vector<TrustedDevice> devices;
     std::vector<InviteRecord> invites;
+    bool internet_access = false;
+    std::string public_hostname;
+    uint16_t external_port = 0;
 };
 void save_config(const fs::path&, const Config&);
 Config load_config(const fs::path&);
@@ -230,12 +238,14 @@ struct HostSession {
     std::string id,device_id,label,address;
     uint32_t scopes=0,channel=0;
 };
+struct UpnpReport;
+struct ReachabilityReport;
 class Host {
     struct Impl;
     std::unique_ptr<Impl> p_;
 
   public:
-    Host(const fs::path& state, const std::string& bind = "0.0.0.0", uint16_t port = 47443);
+    Host(const fs::path& state, const std::string& bind = "::", uint16_t port = 47443);
     ~Host();
     void run();
     void stop();
@@ -243,16 +253,28 @@ class Host {
     std::string discovery_status() const;
     std::vector<HostSession> sessions(); // Local management only; no credentials.
     bool end_session(const std::string&); // Ends this connection, retains device trust.
+    std::string listening_address() const;
+    uint16_t listening_port() const;
+    NetworkSecurityStats security_stats() const;
+    UpnpReport upnp_map(bool ipv4 = true, bool ipv6 = true);
+    UpnpReport upnp_unmap();
+    UpnpReport upnp_status() const;
+    ReachabilityReport reachability_report(const fs::path& exe) const;
 };
 class Client {
     std::unique_ptr<Tls> tls_;
     uint32_t scopes_;
     uint64_t transfer_bytes_=0;
+    void hello(const std::string&, uint32_t, uint32_t);
 
   public:
     /** hello_flags: 1 = automatic reconnect (session=end-v1 hosts only; 0 sends the original HELLO). */
     Client(const std::string& address, uint16_t port, const std::string& pin, const std::string& token,
            uint32_t scopes = files_read, uint32_t channel = UINT32_MAX, uint32_t hello_flags = 0);
+    Client(std::unique_ptr<Tls>, const std::string& token, uint32_t scopes = files_read,
+           uint32_t channel = UINT32_MAX, uint32_t hello_flags = 0);
+    std::optional<ConnectionEndpoint> selected_endpoint;
+    std::vector<EndpointProbe> connection_attempts;
     Bytes call(Op, Writer payload = {});
     void send(Op, Writer payload = {}); // Streaming readiness; no response is expected.
     Bytes receive(Op);

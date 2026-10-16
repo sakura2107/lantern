@@ -1,5 +1,6 @@
 #pragma once
 #include "core.hpp"
+#include "network.hpp"
 #include <optional>
 #include <string_view>
 namespace lantern {
@@ -8,6 +9,7 @@ struct PendingInvite {
     uint32_t scopes = 0;
     uint64_t expires_at = 0;
     uint32_t failed_attempts = 0;
+    bool allow_remote = false;
 };
 // Only this one-time return value contains the plaintext invitation code.
 struct PairingInvite : PendingInvite {
@@ -19,11 +21,14 @@ struct PairingLink {
     uint16_t port = 47443;
     std::string pin, code;
     uint64_t expires_at = 0;
+    std::vector<ConnectionEndpoint> endpoints;
 };
 uint64_t pairing_unix_time();
 bool valid_pairing_address(std::string_view);
 bool valid_pairing_label(const std::string&);
 std::string pairing_uri(const PairingInvite&, const std::vector<std::string>& addresses, uint16_t port);
+std::string pairing_uri_endpoints(const PairingInvite&, const std::vector<ConnectionEndpoint>&,
+                                  uint16_t default_port);
 std::optional<PairingLink> parse_pairing_uri(std::string_view) noexcept;
 struct QrMatrix {
     int size = 0;

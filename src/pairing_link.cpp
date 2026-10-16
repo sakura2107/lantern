@@ -1,3 +1,4 @@
+#include "lantern/network.hpp"
 #include "lantern/pairing.hpp"
 #include <charconv>
 #include <map>
@@ -125,7 +126,7 @@ std::optional<PairingLink> parse_pairing_uri(std::string_view uri) noexcept {
             if (uri.empty())
                 return {};
         }
-        if (fields.size() != 7 || fields.at("v") != "1")
+        if (fields.size() != 7 || (fields.at("v") != "1" && fields.at("v") != "2"))
             return {};
         PairingLink link;
         link.host_name = fields.at("n");
@@ -141,13 +142,49 @@ std::optional<PairingLink> parse_pairing_uri(std::string_view uri) noexcept {
             return {};
         link.port = uint16_t(port);
         std::string_view addresses = fields.at("a");
+        unsigned domains = 0;
         for (;;) {
             auto comma = addresses.find(',');
             auto address = addresses.substr(0, comma);
-            if (!valid_pairing_address(address) || link.addresses.size() >= 8 ||
-                std::find(link.addresses.begin(), link.addresses.end(), address) != link.addresses.end())
+            std::string host(address);
+            uint16_t endpoint_port = link.port;
+            bool valid = valid_pairing_address(address);
+            if (fields.at("v") == "2") {
+                std::string_view suffix;
+                if (!address.empty() && address.front() == '[') {
+                    auto end = address.find(']');
+                    if (end == address.npos)
+                        return {};
+                    host = std::string(address.substr(1, end - 1));
+                    suffix = address.substr(end + 1);
+                    auto a = numeric_address(host);
+                    valid = a && a->v6 && valid_connection_host(host);
+                } else {
+                    auto colon = address.find(':');
+                    host = std::string(address.substr(0, colon));
+                    suffix = colon == address.npos ? std::string_view() : address.substr(colon);
+                    valid = valid_pairing_address(host);
+                    if (valid_hostname(host))
+                        valid = ++domains <= 1;
+                }
+                if (!suffix.empty()) {
+                    if (suffix.front() != ':')
+                        return {};
+                    auto p = number(std::string(suffix.substr(1)));
+                    if (!p || p > 65535)
+                        return {};
+                    endpoint_port = uint16_t(p);
+                }
+                host = normalize_address(host);
+                std::transform(host.begin(), host.end(), host.begin(),
+                               [](char c) { return c >= 'A' && c <= 'Z' ? char(c + 32) : c; });
+            }
+            if (!valid || link.addresses.size() >= 8 ||
+                std::any_of(link.endpoints.begin(), link.endpoints.end(),
+                            [&](auto& e) { return e.host == host && e.port == endpoint_port; }))
                 return {};
-            link.addresses.emplace_back(address);
+            link.addresses.emplace_back(host);
+            link.endpoints.push_back(connection_endpoint(host, endpoint_port));
             if (comma == addresses.npos)
                 break;
             addresses.remove_prefix(comma + 1);
@@ -160,12 +197,48 @@ std::optional<PairingLink> parse_pairing_uri(std::string_view uri) noexcept {
 std::string pairing_uri(const PairingInvite& invite, const std::vector<std::string>& addresses,
                         uint16_t port) {
     std::string joined;
+    bool v2 = false;
     for (auto& a : addresses) {
         if (!joined.empty())
             joined += ',';
-        joined += a;
+        if (a.find(':') != a.npos) {
+            joined += '[' + a + ']';
+            v2 = true;
+        } else {
+            joined += a;
+            if (!valid_pairing_address(a))
+                v2 = true;
+        }
     }
-    auto uri = "lantern://pair?v=1&n=" + encode(invite.host_name) + "&a=" + joined +
+    auto uri = std::string("lantern://pair?v=") + (v2 ? "2" : "1") + "&n=" + encode(invite.host_name) +
+               "&a=" + joined + "&p=" + std::to_string(port) + "&f=" + invite.pin + "&c=" + invite.code +
+               "&x=" + std::to_string(invite.expires_at);
+    if (!parse_pairing_uri(uri))
+        throw Error(Code::invalid, "配对链接参数无效或已过期");
+    return uri;
+}
+std::string pairing_uri_endpoints(const PairingInvite& invite,
+                                  const std::vector<ConnectionEndpoint>& endpoints, uint16_t port) {
+    bool extended = std::any_of(endpoints.begin(), endpoints.end(),
+                                [](auto& e) { return !valid_pairing_address(e.host); });
+    if (!extended) {
+        std::vector<std::string> addresses;
+        for (auto& e : endpoints) {
+            if (e.port != port)
+                throw Error(Code::invalid, "IPv4-only pairing uses one common port");
+            addresses.push_back(e.host);
+        }
+        return pairing_uri(invite, addresses, port);
+    }
+    std::string joined;
+    for (auto& e : endpoints) {
+        if (!joined.empty())
+            joined += ',';
+        joined += e.host.find(':') != e.host.npos ? '[' + e.host + ']' : e.host;
+        if (e.port != port)
+            joined += ':' + std::to_string(e.port);
+    }
+    auto uri = "lantern://pair?v=2&n=" + encode(invite.host_name) + "&a=" + joined +
                "&p=" + std::to_string(port) + "&f=" + invite.pin + "&c=" + invite.code +
                "&x=" + std::to_string(invite.expires_at);
     if (!parse_pairing_uri(uri))

@@ -17,6 +17,11 @@ struct DevicePairing {
     DeviceSummary device;
     std::string pin, secret;
 };
+struct InternetSettings {
+    bool internet_access = false;
+    std::string public_hostname;
+    uint16_t external_port = 0;
+};
 // Local Windows-user access to a selected DPAPI state directory. Not a network admin API.
 class HostAdministration {
     fs::path state_;
@@ -35,10 +40,18 @@ class HostAdministration {
     void disable_legacy();
     DevicePairing pairing(const std::string& id) const;
     PairingInvite invite(const std::string& label, uint32_t scopes,
-                         std::chrono::seconds ttl = std::chrono::minutes(10));
+                         std::chrono::seconds ttl = std::chrono::minutes(10), bool allow_remote = false);
     std::vector<PendingInvite> invites() const;
     void cancel_invite(const std::string& invite_id);
     // Protocol backend: atomically consumes the invitation and saves its device.
-    TrustedDevice redeem_invite(const std::string& code, const std::string& device_label);
+    TrustedDevice redeem_invite(const std::string& code, const std::string& device_label,
+                                bool local_source = true);
+    InternetSettings network_settings() const;
+    void internet(bool enabled, const std::string& hostname = {}, uint16_t external_port = 0);
+};
+enum class InternetError { legacy_enabled };
+struct InternetAccessError : Error {
+    InternetError reason = InternetError::legacy_enabled;
+    InternetAccessError() : Error(Code::conflict, "请先禁用旧共享凭据，再开启公网访问") {}
 };
 } // namespace lantern

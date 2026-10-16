@@ -70,7 +70,8 @@ enum class Op : uint16_t {
     right_click = 52,
     clipboard_read = 53,
     clipboard_write = 54,
-    pair = 55
+    pair = 55,
+    endpoints = 56
 };
 struct Writer {
     Bytes b;

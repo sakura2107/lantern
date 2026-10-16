@@ -20,6 +20,7 @@ struct PairResult {
     uint16_t port;
     std::string pin, device_id, token;
     uint32_t scopes;
+    std::vector<ConnectionEndpoint> endpoints;
 };
 PairResult pair_with_link(const PairingLink&, const std::string& device_label);
 } // namespace lantern
