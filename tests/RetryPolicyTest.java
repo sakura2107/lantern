@@ -9,6 +9,11 @@ public final class RetryPolicyTest {
         check(RetryPolicy.transientFailure(new ConnectException()));check(RetryPolicy.transientFailure(new SocketTimeoutException()));
         check(RetryPolicy.transientFailure(new Remote.TransportError(new EOFException())));
         check(!RetryPolicy.transientFailure(new IOException("disk full")));check(!RetryPolicy.transientFailure(new IOException("bad protocol frame")));
+        check(RetryPolicy.transientFailure(new RetryPolicy.StreamBacklog()));
+        check(RetryPolicy.transientFailure(new IOException("stream worker",new RetryPolicy.StreamBacklog())));
+        RetryPolicy.StreamBacklog untrusted=new RetryPolicy.StreamBacklog();
+        untrusted.initCause(new SSLHandshakeException("pin changed"));
+        check(!RetryPolicy.transientFailure(untrusted));
         check(!RetryPolicy.transientFailure(new EOFException("complete frame has truncated metadata")));
         for(int code:new int[]{1,2,3,4,5,6,7,9,10})check(!RetryPolicy.transientFailure(new Remote.RemoteError(code,"terminal")));
         check(RetryPolicy.transientFailure(new Remote.RemoteError(8,"busy")));

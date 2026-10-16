@@ -290,7 +290,7 @@ void consume(Request request, AvcView.Target target) throws Exception {
             if (clock == 0)
                 clock = now - pts * 1000;
             if (now - (clock + pts * 1000) > 300_000_000L+(request.absolute?request.timeline.videoDelayBudget(now):0))
-                throw new IOException("桌面数据积压超过 300 ms，请降低画质后重连");
+                throw new RetryPolicy.StreamBacklog();
             received.incrementAndGet();
             encodedBytes.addAndGet(data.length);
             if ((flags & 2) != 0)
