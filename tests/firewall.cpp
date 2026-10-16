@@ -51,6 +51,16 @@ int wmain(int, wchar_t** argv) {
         check(state == FirewallState::allowed || state == FirewallState::not_allowed ||
               state == FirewallState::unknown);
         check(firewall_state(fs::path(argv[0]), 0) == FirewallState::unknown);
+        detail::configure_public_firewall_rule(rule.Get(), exe, 47443);
+        long profiles = 0;
+        check(SUCCEEDED(rule->get_Profiles(&profiles)) && profiles == NET_FW_PROFILE2_PRIVATE);
+        check(SUCCEEDED(rule->get_Protocol(&protocol)) && protocol == NET_FW_IP_PROTOCOL_TCP);
+        check(SUCCEEDED(rule->get_RemoteAddresses(&remote)) && std::wstring(remote) == L"*");
+        SysFreeString(remote);
+        auto internet = public_firewall_state(fs::path(argv[0]), 47443);
+        check(internet == FirewallState::allowed || internet == FirewallState::not_allowed ||
+              internet == FirewallState::unknown);
+        check(public_firewall_state(fs::path(argv[0]), 0) == FirewallState::unknown);
         std::cout << checks
                   << " firewall checks passed; unattached rule configuration + read-only OS policy query; no "
                      "rules added\n";

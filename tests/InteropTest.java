@@ -20,6 +20,7 @@ public final class InteropTest {
         var paired = Remote.pair(pairingLink, "Java phone fixture");
         check(paired.host.equals("127.0.0.1") && paired.token.matches("[0-9a-f]{64}"),
               "Java pinned TLS pairing with address failover");
+        check(paired.endpoints.size() == 2, "Java pairing retains every QR endpoint");
         try (Remote remote = new Remote(paired, 1, 3)) {
             check(!remote.list("", 0).isEmpty(), "Java QR credential accepted by HELLO");
         }
@@ -40,6 +41,47 @@ public final class InteropTest {
         }
         check(mismatch, "Java pin mismatch distinguished without sending invitation");
         var credentials = new Remote.Credentials("127.0.0.1", 47449, pin, token);
+        boolean cancelled = false;
+        try (Remote ignored = new Remote(credentials, 0, 0, transport -> transport.close())) {
+        } catch (NetworkDialer.ConnectException error) {
+            cancelled = error.reason == NetworkDialer.Failure.CANCELLED &&
+                        error.attempts.stream().allMatch(p -> p.failure == NetworkDialer.Failure.CANCELLED);
+        }
+        check(cancelled, "Java caller cancellation is not recorded as endpoint timeout");
+        try (java.net.ServerSocket slow1 =
+                 new java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress());
+             java.net.ServerSocket slow2 =
+                 new java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())) {
+            List<java.net.Socket> held = Collections.synchronizedList(new ArrayList<>());
+            for (java.net.ServerSocket listener : List.of(slow1, slow2)) {
+                Thread thread = new Thread(() -> {
+                    try {
+                        held.add(listener.accept());
+                    } catch (IOException ignored) {
+                    }
+                });
+                thread.setDaemon(true);
+                thread.start();
+            }
+            var endpoints = List.of(new ConnectionEndpoint(1, "127.0.0.1", slow1.getLocalPort(), 0, 0, 0),
+                                    new ConnectionEndpoint(1, "127.0.0.1", slow2.getLocalPort(), 1, 0, 0),
+                                    new ConnectionEndpoint(1, "127.0.0.1", 47449, 2, 0, 0));
+            long start = System.nanoTime();
+            try (Remote raced =
+                     new Remote(new Remote.Credentials("127.0.0.1", 47449, pin, token, endpoints), 0, 0)) {
+                long elapsed = (System.nanoTime() - start) / 1000000;
+                check(elapsed >= 450 && elapsed < 3000 && !raced.publicPath,
+                      "Java 250ms stagger and cancellation of slow TLS endpoints");
+                check(raced.endpoints().stream().noneMatch(ConnectionEndpoint::publicPath),
+                      "Java authenticated endpoints hide public routes when disabled");
+            } finally {
+                for (java.net.Socket socket : held)
+                    socket.close();
+            }
+        }
+        var probes = Remote.probeEndpoints(credentials);
+        check(probes.size() == 1 && probes.get(0).tlsOk && probes.get(0).rttMs != null,
+              "Java probe verifies TLS and authenticated ping RTT");
         boolean pinDenied = false;
         try (Remote ignored =
                  new Remote(new Remote.Credentials("127.0.0.1", 47449, "0".repeat(64), token), 1, 3)) {

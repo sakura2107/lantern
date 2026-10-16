@@ -360,18 +360,19 @@ int wmain(int argc, wchar_t** argv) {
             });
             check(it != snapshot.end() && it->state == TaskState::paused && it->priority == 2 &&
                       it->rate_limit == 65536,
-                  "journal v3 restores policy and paused state");
+                  "journal v4 restores policy and paused state");
             restored.stop();
         }
         auto plain = unprotect(read_file(journal));
         Reader r{plain};
-        check(r.u32() == 3, "new journal version explicit");
+        check(r.u32() == 4, "new journal version explicit");
         r.u32();
         r.str();
         r.str();
         r.u32();
         r.str();
         r.str();
+        (void)read_endpoints(r);
         r.str();
         r.str();
         r.u32();

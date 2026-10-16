@@ -291,6 +291,8 @@ int wmain(int argc, wchar_t** argv) {
             }
             auto address_link = wrong;
             address_link.port = 1;
+            for (auto& endpoint : address_link.endpoints)
+                endpoint.port = 1;
             try {
                 pair_with_link(address_link, "Offline");
                 check(false, "pair unreachable missing");
@@ -528,9 +530,18 @@ int wmain(int argc, wchar_t** argv) {
                         "audio-only configuration denies file access");
                 }
                 save_config(state / L"config.dpapi", {root, token, 15});
+                bool revoked = false;
+                try {
+                    audio_client.call(Op::audio_stream, audio_version);
+                } catch (const TransportError&) {
+                    revoked = true;
+                } catch (const Error& e) {
+                    revoked = e.code == Code::unauthorized;
+                }
+                check(revoked, "audio permission revocation closes or rejects live socket");
                 error(
-                    Code::unauthorized, [&] { audio_client.call(Op::audio_stream, audio_version); },
-                    "audio permission revocation on live control socket");
+                    Code::unauthorized, [&] { Client fresh_audio("127.0.0.1", 47449, pin, token, audio, 4); },
+                    "fresh HELLO also denies revoked audio permission");
             }
             if (argc == 4) {
                 Host pairing_host(state, "127.0.0.1", 47448);

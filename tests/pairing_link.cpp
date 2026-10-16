@@ -1,4 +1,5 @@
 #include "lantern/pairing.hpp"
+#include <cstring>
 #include <iostream>
 using namespace lantern;
 int main() {
@@ -29,7 +30,7 @@ int main() {
             bad.replace(at, from.size(), to);
             return bad;
         };
-        for (auto version : {"v=0", "v=2", "v=01"})
+        for (auto version : {"v=0", "v=3", "v=01"})
             check(!parse_pairing_uri(replace("v=1", version)));
         for (auto port : {"p=0", "p=65536", "p=-1", "p=1x", "p=047443"})
             check(!parse_pairing_uri(replace("p=47443", port)));
@@ -42,6 +43,26 @@ int main() {
         check(!parse_pairing_uri(replace("x=" + std::to_string(invite.expires_at), "x=1")));
         check(!parse_pairing_uri(replace("f=" + invite.pin, "f=abcd")));
         check(!parse_pairing_uri(replace("c=" + invite.code, "c=wrong")));
+        auto v2 = pairing_uri(invite, {"192.0.2.5", "2001:db8::1", "fd00::2", "example.com"}, 47443);
+        auto parsed2 = parse_pairing_uri(v2);
+        check(v2.find("v=2&") != v2.npos && parsed2 && parsed2->addresses[1] == "2001:db8:0:0:0:0:0:1" &&
+              parsed2->addresses.back() == "example.com");
+        check(uri.find("v=1&") != uri.npos);
+        auto ports =
+            pairing_uri_endpoints(invite,
+                                  std::vector<ConnectionEndpoint>{connection_endpoint("2001:db8::1", 47443),
+                                                                  connection_endpoint("example.com", 443)},
+                                  47443);
+        auto with_ports = parse_pairing_uri(ports);
+        check(with_ports && with_ports->endpoints[0].port == 47443 && with_ports->endpoints[1].port == 443);
+        for (auto addresses : {"[2001:db8::1],example.com,other.example", "2001:db8::1", "[fe80::1%3]",
+                               "[::]", "[ff02::1]", "[2001:::1]", "[2001:db8::1],[2001:db8:0:0:0:0:0:1]",
+                               "example.com.", "https://example.com", "[::ffff:192.0.2.1]"}) {
+            auto invalid = replace("v=1", "v=2");
+            auto at = invalid.find("a=192.168.1.5,10.0.0.2");
+            invalid.replace(at, strlen("a=192.168.1.5,10.0.0.2"), std::string("a=") + addresses);
+            check(!parse_pairing_uri(invalid));
+        }
         auto qr = qr_encode(uri);
         check(qr.size >= 21 && qr.size <= 177 && (qr.size - 21) % 4 == 0 &&
               qr.modules.size() == size_t(qr.size) * qr.size);

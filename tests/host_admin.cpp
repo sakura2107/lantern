@@ -198,7 +198,7 @@ int wmain(int argc, wchar_t** argv) {
             wizard.root(share);
             check(wizard.snapshot().root == fs::weakly_canonical(share), "root restored");
         }
-        bool ipv6_tested = false, ipv6_policy_blocked = false;
+        bool ipv6_tested = false;
         {
             Host ipv6(fresh, "::1", 47449);
             std::thread thread([&] { ipv6.run(); });
@@ -207,17 +207,6 @@ int wmain(int argc, wchar_t** argv) {
                 Client v6("::1", 47449, pair.pin, pair.secret, 1);
                 check(v6.list("").size() == 1, "real IPv6 pinned TLS file access");
                 ipv6_tested = true;
-            } catch (const TransportError& error) {
-                if (error.native_code == WSAEACCES) {
-                    ipv6_policy_blocked = true;
-                    std::cout << "SKIP IPv6 transport: OS denied ::1 connect with Windows 10013; parser "
-                                 "tests still execute"
-                              << std::endl;
-                } else {
-                    ipv6.stop();
-                    thread.join();
-                    throw;
-                }
             } catch (...) {
                 ipv6.stop();
                 thread.join();
@@ -305,8 +294,7 @@ int wmain(int argc, wchar_t** argv) {
         save_config(state / L"config.dpapi", original);
         std::ofstream report(root / L"host-admin.json");
         report << "{\"success\":true,\"kind\":\"measured\",\"ipv6_tls_tested\":"
-               << (ipv6_tested ? "true" : "false")
-               << ",\"ipv6_os_access_denied_10013\":" << (ipv6_policy_blocked ? "true" : "false")
+               << (ipv6_tested ? "true" : "false") << ",\"ipv6_os_access_denied_10013\":false"
                << ",\"checks\":" << checks
                << ",\"transport\":\"same-PC Schannel TLS "
                   "loopback\",\"real_sessions_tested\":true,\"credentials_logged\":false}";
