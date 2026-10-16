@@ -75,7 +75,7 @@ final class S {
     static final String ADDRESS_ONLY = "仅填写地址", USE_FINGERPRINT = "一致，使用此指纹";
     static final String FINGERPRINT_FILLED = "已填入指纹，填写设备密钥后连接";
     static final String DIAG_RUNNING = "正在测量 5 次加密往返，请稍候…";
-    static final String DIAG_TITLE = "网络诊断", DIAG_SUBTITLE = "%s，主机 %s";
+    static final String DIAG_TITLE = "网络诊断", DIAG_SUBTITLE = "手机用%s，经 %s";
     static final String DIAG_HANDSHAKE = "TLS 与身份验证", DIAG_RTT_MEDIAN = "往返延迟（中位）", DIAG_RTT_RANGE = "往返延迟范围",
                         DIAG_LIMIT = "当前文件传输上限";
     static final String DIAG_NOTE = "往返延迟包含主机处理时间，不代表可用带宽。使用移动网络时，局域网地址通常无法访问。";

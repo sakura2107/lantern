@@ -636,7 +636,7 @@ public final class MainActivity extends Activity {
                 android.net.ConnectivityManager manager=getSystemService(android.net.ConnectivityManager.class);android.net.NetworkCapabilities link=manager.getNetworkCapabilities(manager.getActiveNetwork());
                 String type=link==null?"无默认网络":link.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)?"Wi-Fi":link.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET)?"以太网":link.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR)?"移动网络":"其他网络";
                 if(isDestroyed())return;
-                Sheet sheet=new Sheet(this,S.DIAG_TITLE,String.format(Locale.ROOT,S.DIAG_SUBTITLE,type,display(c)));
+                Sheet sheet=new Sheet(this,S.DIAG_TITLE,String.format(Locale.ROOT,S.DIAG_SUBTITLE,type,where(c)));
                 LinearLayout grid=Ui.column(this);grid.setPadding(Theme.dp(16),Theme.dp(4),Theme.dp(16),Theme.dp(4));
                 diagRow(grid,S.DIAG_HANDSHAKE,String.format(Locale.ROOT,"%.1f ms",measured.handshakeMillis));
                 diagRow(grid,S.DIAG_RTT_MEDIAN,String.format(Locale.ROOT,"%.1f ms",measured.medianMillis));
