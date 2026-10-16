@@ -15,6 +15,7 @@
 #include <sstream>
 #include <wincodec.h>
 #include <wrl/client.h>
+#include <ws2tcpip.h>
 using namespace lantern;
 using Microsoft::WRL::ComPtr;
 namespace {
@@ -80,7 +81,11 @@ struct Update {
     std::vector<DiscoveredDevice> discovered;
     int connection = -1;
     std::optional<ClientCredentials> paired; // fills the device fields after link pairing
+    std::optional<ConnectionEndpoint> via;   // the entry the verified connection actually used
+    std::wstring report;                     // per-entry connection check, shown in a dialog
 };
+/** UI thread: the entry the last verified connection used (LAN, public IPv6, hostname…). */
+std::optional<ConnectionEndpoint> via;
 std::deque<Update> updates;
 bool update_posted = false;
 std::deque<std::function<void()>> work;
@@ -139,6 +144,55 @@ HWND ctl(int id) {
 ClientCredentials creds() {
     std::lock_guard lock(credentials_mutex);
     return credentials;
+}
+const wchar_t* endpoint_kind(EndpointKind k) {
+    switch (k) {
+    case EndpointKind::public_v6: return L"公网 IPv6";
+    case EndpointKind::public_v4: return L"公网 IPv4";
+    case EndpointKind::hostname: return L"域名";
+    default: return L"局域网";
+    }
+}
+/** For people: IPv6 with its zero run compressed (stored and sent entries keep every group). */
+std::wstring endpoint_text(const ConnectionEndpoint& e) {
+    IN6_ADDR v6{};
+    char out[INET6_ADDRSTRLEN]{};
+    if (e.host.find(':') != std::string::npos && InetPtonA(AF_INET6, e.host.c_str(), &v6) == 1 &&
+        InetNtopA(AF_INET6, &v6, out, sizeof(out)))
+        return L"[" + wide(out) + L"]:" + std::to_wstring(e.port);
+    return wide(format_endpoint({e.host, e.port}));
+}
+const wchar_t* failure_text(EndpointFailure f) {
+    const wchar_t* text[] = {L"可用",         L"域名解析失败", L"没有响应（超时）", L"被拒绝（没有在监听，或被路由器拦下）",
+                             L"证书指纹不匹配", L"连接中断",     L"已取消"};
+    return text[size_t(f)];
+}
+/** One clause per entry that was really tried, for the status line after a failed connection. */
+std::wstring attempts_text(const std::vector<EndpointProbe>& attempts) {
+    std::wstring s;
+    for (auto& a : attempts) {
+        if (a.failure == EndpointFailure::cancelled)
+            continue;
+        if (!s.empty())
+            s += L"；";
+        s += endpoint_text(a.endpoint) + L" " + failure_text(a.failure);
+    }
+    return s;
+}
+/** Worker thread, after a verified connection: count failed entries, learn the host's current ones. */
+void learn_endpoints(ClientCredentials& c, Client& client) {
+    if (c.endpoints.empty())
+        c.endpoints = {connection_endpoint(c.host, c.port)};
+    record_endpoint_results(c.endpoints, client.connection_attempts);
+    try {
+        merge_endpoints(c, client_endpoints(client)); // empty for hosts without endpoints=v1
+    } catch (...) {
+    }
+}
+std::wstring path_note(const ConnectionEndpoint& e) {
+    return is_public(e.kind) ? L"当前经公网（" + std::wstring(endpoint_kind(e.kind)) +
+                                   L"）连接；画面卡顿时可在“远程桌面”把画质调低一档。"
+                             : L"";
 }
 void publish(Update u) {
     std::lock_guard lock(updates_mutex);
@@ -512,6 +566,10 @@ void paint_rail(HDC dc) {
                   ui::fonts.strong, ui::pal.ink);
     auto c = creds();
     std::wstring where = c.host.empty() ? L"填写地址、指纹与密钥" : wide(format_endpoint({c.host, c.port}));
+    if (connection_state == 2 && via)
+        where = std::wstring(endpoint_kind(via->kind)) + L" · " + endpoint_text(*via);
+    else if (c.endpoints.size() > 1)
+        where += L" 等 " + std::to_wstring(c.endpoints.size()) + L" 个";
     ui::draw_text(dc, where, {chip.left + dp(30), chip.top + dp(36), chip.right - dp(10), chip.bottom - dp(10)},
                   ui::fonts.note, ui::pal.muted);
 }
@@ -1136,16 +1194,44 @@ void command(int id) {
         c.token = utf8(text(ctl(3)));
         if (!valid_sha(c.pin) || !valid_sha(c.token))
             throw Error(Code::invalid, "指纹和密钥须为64位十六进制");
+        // Same device: keep every entry it has learnt, and try the typed address as well.
+        auto saved = creds();
+        if (saved.pin == c.pin && saved.token == c.token && !saved.endpoints.empty() &&
+            valid_connection_host(c.host)) {
+            c.endpoints = saved.endpoints;
+            merge_endpoints(c, {connection_endpoint(c.host, c.port)});
+        }
         connection_state = 4;
-        enqueue([c] {
+        enqueue([c]() mutable {
             std::string caps;
+            std::shared_ptr<Client> client;
             try {
-                auto client = c.connect(0, 0);
+                client = c.connect(0, 0);
                 auto b = client->call(Op::capabilities);
                 Reader r{b};
                 caps = r.str();
                 r.end();
+                learn_endpoints(c, *client);
                 save_credentials(state_dir / L"device.dpapi", c);
+            } catch (const EndpointConnectError& e) {
+                Update failed;
+                failed.connection = 3;
+                if (e.reason == EndpointFailure::pin_mismatch)
+                    failed.status = L"电脑身份（证书指纹）与保存的不一致，已停止连接。请在主机管理里重新核对指纹。";
+                else {
+                    failed.status = L"连接失败：" + attempts_text(e.attempts);
+                    if (!c.endpoints.empty()) {
+                        record_endpoint_results(c.endpoints, e.attempts);
+                        try {
+                            save_credentials(state_dir / L"device.dpapi", c);
+                            std::lock_guard lock(credentials_mutex);
+                            credentials = c;
+                        } catch (...) {
+                        }
+                    }
+                }
+                publish(std::move(failed));
+                return;
             } catch (...) {
                 Update failed;
                 failed.connection = 3;
@@ -1159,7 +1245,8 @@ void command(int id) {
             }
             Update u;
             u.connection = 2;
-            u.status = L"设备已验证并保存（DPAPI）。" + wide(caps);
+            u.via = client->selected_endpoint;
+            u.status = L"设备已验证并保存（DPAPI）。" + (u.via ? path_note(*u.via) : L"") + wide(caps);
             publish(std::move(u));
         });
     } else if (id == 121) {
@@ -1184,9 +1271,12 @@ void command(int id) {
         std::wstring groups;
         for (size_t i = 0; i < 16 && i + 4 <= link->pin.size(); i += 4)
             groups += wide(link->pin.substr(i, 4)) + L" ";
-        auto question = L"将与这台电脑配对：\n\n名称：" + wide(link->host_name) + L"\n地址：" +
-                        wide(format_endpoint({link->addresses.front(), link->port})) + L"\n指纹开头：" + groups +
-                        L"…\n\n请确认它和电脑主机管理里显示的一致。";
+        auto where = link->endpoints.empty() ? wide(format_endpoint({link->addresses.front(), link->port}))
+                                             : endpoint_text(link->endpoints.front());
+        if (link->endpoints.size() > 1)
+            where += L" 等 " + std::to_wstring(link->endpoints.size()) + L" 个地址";
+        auto question = L"将与这台电脑配对：\n\n名称：" + wide(link->host_name) + L"\n地址：" + where +
+                        L"\n指纹开头：" + groups + L"…\n\n请确认它和电脑主机管理里显示的一致。";
         if (MessageBoxW(window, question.c_str(), L"确认电脑", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
             return;
         wchar_t name[256]{};
@@ -1205,11 +1295,13 @@ void command(int id) {
                 c.port = r.port;
                 c.pin = r.pin;
                 c.token = r.token;
+                c.endpoints = r.endpoints;
                 auto client = c.connect(0, 0);
                 auto b = client->call(Op::capabilities);
                 Reader rd{b};
                 auto caps = rd.str();
                 rd.end();
+                learn_endpoints(c, *client);
                 save_credentials(state_dir / L"device.dpapi", c);
                 {
                     std::lock_guard lock(credentials_mutex);
@@ -1219,7 +1311,8 @@ void command(int id) {
                 Update u;
                 u.connection = 2;
                 u.paired = c;
-                u.status = L"已配对并保存（DPAPI）。" + wide(caps);
+                u.via = client->selected_endpoint;
+                u.status = L"已配对并保存（DPAPI）。" + (u.via ? path_note(*u.via) : L"") + wide(caps);
                 publish(std::move(u));
             } catch (const PairingError& e) {
                 const wchar_t* why[] = {
@@ -1251,26 +1344,31 @@ void command(int id) {
             throw Error(Code::io, "主机管理程序不可用，请使用完整Windows包");
     } else if (id == 22) {
         auto c = creds();
+        if (c.host.empty())
+            throw Error(Code::invalid, "请先验证并保存设备");
+        status(L"正在逐个检查电脑的地址…");
         enqueue([c] {
-            auto began = std::chrono::steady_clock::now();
-            auto client = c.connect(0, 0);
-            double tls = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began)
-                             .count(),
-                   sum = 0;
-            for (int i = 0; i < 5; ++i) {
-                Writer w;
-                w.u64(i);
-                auto t = std::chrono::steady_clock::now();
-                auto b = client->call(Op::ping, std::move(w));
-                Reader r{b};
-                if (r.u64() != uint64_t(i))
-                    throw Error(Code::invalid, "Ping nonce");
-                r.end();
-                sum +=
-                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+            // Each saved entry on its own: TCP, pinned TLS, HELLO without scopes, then one real ping.
+            auto reports = probe_endpoints(c);
+            std::wstring text;
+            size_t usable = 0, tried = 0;
+            for (auto& p : reports) {
+                if (p.failure == EndpointFailure::cancelled)
+                    continue;
+                ++tried;
+                text += endpoint_text(p.endpoint) + L"    " + endpoint_kind(p.endpoint.kind) + L"    ";
+                if (p.failure == EndpointFailure::none) {
+                    ++usable;
+                    text += !p.rtt_ms ? L"可用" : *p.rtt_ms ? L"可用 · 往返 " + std::to_wstring(*p.rtt_ms) + L" ms" : L"可用 · 往返不到 1 ms";
+                } else
+                    text += failure_text(p.failure);
+                text += L"\n";
             }
-            status(L"TLS建连 " + std::to_wstring(tls) + L" ms · RTT平均 " + std::to_wstring(sum / 5) +
-                   L" ms（不是带宽测量）");
+            Update u;
+            u.report = text + L"\n往返时间是一次实际的 ping，不代表带宽。公网地址连不上时，请在主机管理的“公网访问”页"
+                              L"检查防火墙和路由器。";
+            u.status = L"网络诊断：" + std::to_wstring(usable) + L" / " + std::to_wstring(tried) + L" 个地址可用。";
+            publish(std::move(u));
         });
     } else if (id == 11 || id == 33 || id == 36)
         refresh();
@@ -2085,8 +2183,15 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             for (auto& u : list) {
                 if (!u.status.empty())
                     SetWindowTextW(statusbox, u.status.c_str());
-                if (u.connection >= 0)
+                if (u.connection >= 0) {
                     connection_state = u.connection;
+                    if (u.connection != 2)
+                        via.reset();
+                }
+                if (u.via)
+                    via = u.via;
+                if (!u.report.empty())
+                    MessageBoxW(window, u.report.c_str(), L"网络诊断", MB_OK | MB_ICONINFORMATION);
                 if (u.paired) {
                     SetWindowTextW(ctl(1), wide(format_endpoint({u.paired->host, u.paired->port})).c_str());
                     SetWindowTextW(ctl(2), wide(u.paired->pin).c_str());

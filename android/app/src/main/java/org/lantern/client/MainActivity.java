@@ -293,7 +293,85 @@ public final class MainActivity extends Activity {
         };
         frames.execute(frameTask);
     }
-    Remote.Credentials credentialsForAddress(String address,String fingerprint,String key){try{Endpoint endpoint=Endpoint.parse(address,47443);return new Remote.Credentials(endpoint.host,endpoint.port,fingerprint,key);}catch(IOException error){throw new IllegalArgumentException(error.getMessage());}}
+    /** The typed address, plus every entry learnt for the computer with this fingerprint (never another one's). */
+    Remote.Credentials credentialsForAddress(String address,String fingerprint,String key){
+        Endpoint endpoint;
+        try{endpoint=Endpoint.parse(address,47443);}catch(IOException error){throw new IllegalArgumentException(error.getMessage());}
+        List<ConnectionEndpoint> learnt=savedEndpoints(fingerprint);
+        if(learnt.isEmpty()||!ConnectionEndpoint.validHost(endpoint.host))
+            return new Remote.Credentials(endpoint.host,endpoint.port,fingerprint,key);
+        return new Remote.Credentials(endpoint.host,endpoint.port,fingerprint,key,learnt)
+            .mergeEndpoints(java.util.Collections.singletonList(ConnectionEndpoint.of(endpoint.host,endpoint.port)));
+    }
+    // ---------------------------------------------------------------- connection entries
+    static final String ENDPOINTS_KEY = "endpoints_v1", ENDPOINTS_PIN = "endpoints_pin";
+    /** The entry the live connection uses (LAN, public IPv6, hostname…); null until verified. */
+    volatile ConnectionEndpoint via;
+    List<ConnectionEndpoint> savedEndpoints(String fingerprint){
+        var p=getSharedPreferences("device",0);
+        return fingerprint.equals(p.getString(ENDPOINTS_PIN,""))?ConnectionEndpoint.loadPreferences(p.getString(ENDPOINTS_KEY,null))
+                                                               :java.util.Collections.emptyList();
+    }
+    void saveEndpoints(Remote.Credentials c){
+        if(c.endpoints.isEmpty())return;
+        getSharedPreferences("device",0).edit().putString(ENDPOINTS_KEY,c.saveEndpointPreferences()).putString(ENDPOINTS_PIN,c.pin).apply();
+    }
+    /** After a verified connection: count the entries that failed, ask the computer for its current ones. */
+    Remote.Credentials learn(Remote.Credentials c,Remote remote){
+        List<ConnectionEndpoint> base=c.endpoints;
+        if(base.isEmpty()&&ConnectionEndpoint.validHost(c.host))base=java.util.Collections.singletonList(ConnectionEndpoint.of(c.host,c.port));
+        List<ConnectionEndpoint> fresh;
+        try{fresh=remote.endpoints();}catch(Exception older){fresh=java.util.Collections.emptyList();}
+        return new Remote.Credentials(c.host,c.port,c.pin,c.token,ConnectionEndpoint.recordResults(base,remote.connectionAttempts)).mergeEndpoints(fresh);
+    }
+    /** IPv6 with the longest zero run compressed, for people; stored entries keep every group. */
+    static String hostText(ConnectionEndpoint e){
+        String h=e.host;
+        if(h.indexOf(':')>=0){
+            String[] g=h.split(":",-1);int best=-1,len=0;
+            for(int i=0;i<g.length;){int j=i;while(j<g.length&&g[j].equals("0"))j++;if(j-i>len&&j-i>1){best=i;len=j-i;}i=j==i?i+1:j;}
+            if(best>=0){StringBuilder s=new StringBuilder();for(int i=0;i<best;i++)s.append(i>0?":":"").append(g[i]);s.append("::");for(int i=best+len;i<g.length;i++)s.append(i>best+len?":":"").append(g[i]);h=s.toString();}
+            h="["+h+"]";
+        }
+        return h+":"+e.port;
+    }
+    /** “局域网 · 192.168.1.5:47443” once verified; the saved address otherwise. */
+    String where(Remote.Credentials c){
+        ConnectionEndpoint e=via;
+        if(e==null||e.kind<1||e.kind>5)return display(c);
+        String text=hostText(e);
+        return S.PATH_LABELS[e.kind]+" · "+(e.port==47443?text.substring(0,text.lastIndexOf(':')):text);
+    }
+    static String attemptsText(NetworkDialer.ConnectException error){
+        StringBuilder s=new StringBuilder();
+        for(NetworkDialer.Probe p:error.attempts){
+            if(p.failure==NetworkDialer.Failure.CANCELLED)continue;
+            if(s.length()>0)s.append("；");
+            s.append(hostText(p.endpoint)).append(' ').append(p.failure==null?S.ENDPOINT_OK:S.ENDPOINT_FAILURES[p.failure.ordinal()]);
+        }
+        return String.format(Locale.ROOT,S.CONNECT_ALL_FAILED,s);
+    }
+    /** Every saved entry on its own and at the same time (an unreachable LAN address must not add 10 s each). */
+    static List<NetworkDialer.Probe> probeEntries(Remote.Credentials c){
+        List<ConnectionEndpoint> all=c.candidates();
+        List<NetworkDialer.Probe> out=new ArrayList<>();
+        if(all.size()<2)return out;
+        java.util.concurrent.ExecutorService pool=java.util.concurrent.Executors.newFixedThreadPool(all.size());
+        try{
+            List<java.util.concurrent.Future<List<NetworkDialer.Probe>>> runs=new ArrayList<>();
+            for(ConnectionEndpoint e:all)
+                runs.add(pool.submit(()->Remote.probeEndpoints(new Remote.Credentials(e.host,e.port,c.pin,c.token,java.util.Collections.singletonList(e)))));
+            for(int i=0;i<runs.size();i++)
+                try{out.addAll(runs.get(i).get(15,java.util.concurrent.TimeUnit.SECONDS));}
+                catch(Exception slow){out.add(new NetworkDialer.Probe(all.get(i),NetworkDialer.Failure.TIMEOUT,15000,0,false,false,null));}
+        }finally{pool.shutdownNow();}
+        return out;
+    }
+    static String probeText(NetworkDialer.Probe p){
+        if(p.failure!=null)return S.ENDPOINT_FAILURES[p.failure.ordinal()];
+        if(p.rttMs==null)return S.ENDPOINT_OK;
+        return p.rttMs<1?S.ENDPOINT_RTT_FAST:String.format(Locale.ROOT,S.ENDPOINT_RTT,p.rttMs);
+    }
 
     volatile MediaTimeline timeline=new MediaTimeline();
     final AtomicBoolean discoveryCancel=new AtomicBoolean();
@@ -339,14 +417,28 @@ public final class MainActivity extends Activity {
             controlRequested = false; control.set(false); inputEpoch.incrementAndGet(); abortInput(); controlLabels();
             credentials = c;
             offset = 0;ui.setConnection(AppShell.CONNECTING,display(c));
+            via = null;
             job(() -> {
+                Remote.Credentials learnt;
+                ConnectionEndpoint used;
                 // Deliberate connection: clears a host-side "ended" hold for this device (session=end-v1).
                 try (Remote remote = new Remote(c.asDeliberate(), 0, 0)) {
                     String caps = Remote.str(Remote.reader(remote.call(30, new byte[0])));
                     Remote.sessionEndPin = caps.contains("session=end-v1") ? c.pin : null;
+                    learnt = learn(c, remote);
+                    used = remote.selectedEndpoint;
                 } catch(Exception error) {
                     String reason=error.getMessage();
-                    runOnUiThread(()->{if(credentials!=c)return;ui.setConnection(AppShell.FAILED,display(c));if(reason!=null&&!reason.isEmpty())ui.deviceState.setText(String.format(Locale.ROOT,S.HERO_FAILED_REASON,reason));});
+                    if(error instanceof NetworkDialer.ConnectException){
+                        NetworkDialer.ConnectException failed=(NetworkDialer.ConnectException)error;
+                        if(failed.reason!=NetworkDialer.Failure.PIN_MISMATCH){
+                            reason=attemptsText(failed);
+                            // Same computer, entries that keep failing are dropped after a few tries.
+                            if(!c.endpoints.isEmpty())saveEndpoints(new Remote.Credentials(c.host,c.port,c.pin,c.token,ConnectionEndpoint.recordResults(c.endpoints,failed.attempts)));
+                        }
+                    }
+                    String why=reason;
+                    runOnUiThread(()->{if(credentials!=c)return;ui.setConnection(AppShell.FAILED,display(c));if(why!=null&&!why.isEmpty())ui.deviceState.setText(String.format(Locale.ROOT,S.HERO_FAILED_REASON,why));});
                     throw error;
                 }
                 Secrets.save(this, c.token);
@@ -355,7 +447,10 @@ public final class MainActivity extends Activity {
                     .putString("host", c.host).putInt("port",c.port)
                     .putString("pin", c.pin)
                     .apply();
-                runOnUiThread(()->{if(credentials!=c)return;ui.connected(display(c));ui.select(AppShell.FILES);transfers.setCredentials(c);refreshDesktopUi();startPresence(c);});
+                saveEndpoints(learnt);
+                // Later connections race every entry; identity checks below follow the new object.
+                if (credentials == c) { credentials = learnt; via = used; }
+                runOnUiThread(()->{if(credentials!=learnt)return;ui.connected(where(learnt));ui.select(AppShell.FILES);transfers.setCredentials(learnt);refreshDesktopUi();startPresence(learnt);if(used!=null&&used.publicPath())status(S.PATH_PUBLIC_NOTICE);});
                 try { refresh(); }
                 catch(Remote.RemoteError error) {
                     if(error.code!=2) throw error;
@@ -408,7 +503,9 @@ public final class MainActivity extends Activity {
         StringBuilder groups = new StringBuilder();
         for (int i = 0; i < 16; i += 4)
             groups.append(link.pin, i, i + 4).append(' ');
-        String address = link.addresses.get(0) + ":" + link.port;
+        String address = link.endpoints.isEmpty() ? link.addresses.get(0) + ":" + link.port
+                         : link.endpoints.size() == 1 ? hostText(link.endpoints.get(0))
+                         : String.format(Locale.ROOT, S.MORE_ADDRESSES, hostText(link.endpoints.get(0)), link.endpoints.size());
         Sheet.confirm(this, S.PAIR_CONFIRM_TITLE,
                       String.format(Locale.ROOT, S.PAIR_CONFIRM, link.hostName, address, groups.toString().trim()),
                       S.PAIR_CONFIRM_ACTION, false, () -> pairWith(link));
@@ -438,6 +535,7 @@ public final class MainActivity extends Activity {
                 });
                 return;
             }
+            saveEndpoints(c); // every entry from the code; pairDevice() reads them back for this fingerprint
             runOnUiThread(() -> {
                 host.setText((c.host.indexOf(':') >= 0 ? "[" + c.host + "]" : c.host) + ":" + c.port);
                 pin.setText(c.pin);
@@ -457,6 +555,7 @@ public final class MainActivity extends Activity {
         Remote.Credentials c = credentials;
         if (c == null) return;
         credentials = null;
+        via = null;
         presenceSeq.incrementAndGet();
         closePresence();
         if (desktopLayout != null) desktopLayout.setFullscreen(false);
@@ -491,8 +590,19 @@ public final class MainActivity extends Activity {
             try (Remote r = new Remote(c, 0, 0, s -> presenceSocket = s)) {
                 String caps = Remote.str(Remote.reader(r.call(30, new byte[0])));
                 if (caps.contains("session=end-v1")) Remote.sessionEndPin = c.pin;
-                if (failures > 0)
-                    runOnUiThread(() -> { if (presenceSeq.get() == seq && credentials == c) ui.setConnection(AppShell.CONNECTED, display(c)); });
+                // Wi-Fi to mobile data and back: the winning entry tells which path we are on now.
+                ConnectionEndpoint used = r.selectedEndpoint, before = via;
+                boolean moved = used != null && (before == null || !before.host.equals(used.host) || before.port != used.port);
+                via = used;
+                if (caps.contains(";endpoints=v1"))
+                    try { // keeps a new IPv6 prefix for the next time this phone is away from home
+                        Remote.Credentials fresh = c.mergeEndpoints(r.endpoints());
+                        if (!fresh.saveEndpointPreferences().equals(c.saveEndpointPreferences())) saveEndpoints(fresh);
+                    } catch (Exception ignored) {}
+                if (failures > 0 || moved) {
+                    boolean announce = moved && before != null && used.publicPath();
+                    runOnUiThread(() -> { if (presenceSeq.get() == seq && credentials == c) { ui.setConnection(AppShell.CONNECTED, where(c)); if (announce) status(S.PATH_PUBLIC_NOTICE); } });
+                }
                 failures = 0;
                 while (presenceSeq.get() == seq && credentials == c) {
                     Thread.sleep(10_000);
@@ -521,6 +631,7 @@ public final class MainActivity extends Activity {
         status(S.DIAG_RUNNING);cancelled.set(false);
         job(()->{
             NetworkProbe.Result measured=NetworkProbe.measure(c,cancelled);
+            List<NetworkDialer.Probe> entries=probeEntries(c);
             runOnUiThread(()->{
                 android.net.ConnectivityManager manager=getSystemService(android.net.ConnectivityManager.class);android.net.NetworkCapabilities link=manager.getNetworkCapabilities(manager.getActiveNetwork());
                 String type=link==null?"无默认网络":link.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)?"Wi-Fi":link.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET)?"以太网":link.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR)?"移动网络":"其他网络";
@@ -532,6 +643,14 @@ public final class MainActivity extends Activity {
                 diagRow(grid,S.DIAG_RTT_RANGE,String.format(Locale.ROOT,"%.1f – %.1f ms",measured.minMillis,measured.maxMillis));
                 diagRow(grid,S.DIAG_LIMIT,String.format(Locale.ROOT,"%.1f MiB/s",TransferPacer.SHARED.rate()/1048576.0));
                 sheet.view(grid).view(Sheet.paragraph(this,S.DIAG_NOTE));
+                if(entries.size()>1){
+                    LinearLayout list=Ui.column(this);list.setPadding(Theme.dp(16),Theme.dp(4),Theme.dp(16),Theme.dp(4));
+                    list.addView(Ui.medium(this,S.DIAG_ENTRIES,15,Theme.INK),Ui.lp(-1,-2));
+                    for(NetworkDialer.Probe p:entries)
+                        if(p.failure!=NetworkDialer.Failure.CANCELLED)
+                            diagRow(list,S.PATH_LABELS[Math.max(0,Math.min(5,p.endpoint.kind))]+"  "+hostText(p.endpoint),probeText(p));
+                    sheet.view(list).view(Sheet.paragraph(this,S.DIAG_ENTRIES_NOTE));
+                }
                 sheet.buttons(null,S.DONE,Ui.SECONDARY,null).show();
             });
         });

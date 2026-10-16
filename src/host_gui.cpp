@@ -9,6 +9,7 @@
 #include <shlobj.h>
 #include <thread>
 #include <wrl/client.h>
+#include <ws2tcpip.h>
 using namespace lantern;
 namespace {
 HWND window, status;
@@ -34,18 +35,39 @@ std::thread firewall_worker;
 std::wstring network_note;
 constexpr UINT firewall_msg = WM_APP + 21;
 constexpr wchar_t phone_glyph = 0xE8EA; // Segoe MDL2/Fluent "CellPhone"
+constexpr wchar_t globe_glyph = 0xE774; // Segoe MDL2/Fluent "Globe"
+uint64_t address_fingerprint = 0;
+
+// Internet access (page 3). `settings` mirrors config.dpapi; the report is gathered off the UI thread.
+namespace internet {
+InternetSettings settings;
+std::optional<ReachabilityReport> report;
+bool busy = false;           // a firewall or router request is in flight
+bool show_addresses = false; // the readiness card lists every address instead
+struct Check {
+    ui::Tone tone; // Positive ready, Lamp needs attention, Danger blocks, Muted information only
+    std::wstring title, detail;
+};
+std::vector<Check> checks();
+std::wstring headline();
+void refresh(); // asks a worker for a fresh report
+} // namespace internet
 
 // Presentation strings. Business/status messages stay next to the code that produces them.
 namespace ui_text {
-const wchar_t* const titles[] = {L"设备与权限", L"当前连接", L"主机设置"};
+const wchar_t* const titles[] = {L"设备与权限", L"当前连接", L"主机设置", L"公网访问"};
 const wchar_t* const subtitles[] = {L"逐设备授权；列表显示与主机上限取交集后的生效权限",
                                     L"此窗口启动的主机的实时连接，一台设备可有多个逻辑通道",
-                                    L"本机主机身份、授权目录、权限上限与网络监听"};
+                                    L"本机主机身份、授权目录、权限上限与网络监听",
+                                    L"让已配对的设备在外面也能连回这台电脑；默认关闭"};
 constexpr const wchar_t* identity = L"主机身份与授权目录";
 constexpr const wchar_t* ceiling = L"全局权限上限";
 constexpr const wchar_t* ceiling_hint = L"任何设备的生效权限都不会超过这里勾选的项目。";
 constexpr const wchar_t* network = L"网络与运行";
-constexpr const wchar_t* network_hint = L"127.0.0.1 仅本机可连；局域网使用本机 LAN 地址或 0.0.0.0。";
+constexpr const wchar_t* network_hint = L"127.0.0.1 仅本机可连；:: 同时监听 IPv4 和 IPv6（默认）；0.0.0.0 只用 IPv4。";
+constexpr const wchar_t* readiness = L"准备情况";
+constexpr const wchar_t* addresses = L"本机地址";
+constexpr const wchar_t* addresses_hint = L"“使用中”的地址会告诉已配对的设备；临时地址可能每天变化，不会使用。";
 constexpr const wchar_t* add_device = L"新增设备";
 constexpr const wchar_t* selected_device = L"选中设备";
 constexpr const wchar_t* devices_empty = L"还没有设备。在下方输入名称并新增设备。";
@@ -58,6 +80,7 @@ HWND c(int id) {
     return controls.at(id);
 }
 bool loopback_bind(const std::string& bind);
+uint16_t port_field();
 std::wstring text(HWND h) {
     int n = GetWindowTextLengthW(h);
     std::wstring s(n + 1, 0);
@@ -173,8 +196,8 @@ void layout() {
     scene.hairlines.push_back({rail - 1, 0, rail, h});
     scene.dots.push_back({dp(30), dp(40), dp(6), ui::pal.lamp});
     scene.text({dp(46), dp(24), rail - dp(12), dp(56)}, L"Lantern 主机", &ui::fonts.heading);
-    int navs[] = {52, 50, 51};
-    for (int i = 0; i < 3; ++i)
+    int navs[] = {52, 50, 51, 53};
+    for (int i = 0; i < 4; ++i)
         move(navs[i], dp(12), dp(84) + i * dp(46), rail - dp(24), dp(42));
     // Content frame.
     int x0 = rail + dp(32), R = w - dp(32), y0 = dp(108), bottom = h - dp(60);
@@ -307,6 +330,80 @@ void layout() {
         fit_columns(c(40), {160, 150, 110, 220}, 4);
         move(41, R - dw, bottom - bh, dw, bh);
     }
+    if (page == 3) {
+        int cw = std::min(R - x0, dp(820)), cx = x0 + pad, cr = x0 + cw - pad;
+        bool on = internet::settings.internet_access;
+        auto relabel = [](int id, const wchar_t* label) {
+            if (text(c(id)) != label)
+                SetWindowTextW(c(id), label);
+        };
+        relabel(70, on ? L"关闭公网访问" : L"开启公网访问");
+        ui::item(c(70))->kind = on ? ui::Kind::Danger : ui::Kind::Primary;
+        auto& up = internet::report;
+        bool mapped = up && (up->upnp.ipv4.status == UpnpStatus::success || up->upnp.ipv6.status == UpnpStatus::success);
+        relabel(75, mapped ? L"撤销路由器放行" : L"让路由器自动放行");
+        int y = y0 + pad;
+        int tw = ui::preferred_width(c(70), bh);
+        scene.text({cx, y, cr - tw - dp(12), y + dp(24)}, on ? L"公网访问已开启" : L"公网访问已关闭",
+                   &ui::fonts.heading, on ? ui::Tone::Positive : ui::Tone::Ink);
+        move(70, cr - tw, y - dp(6), tw, bh);
+        scene.text({cx, y + dp(28), cr - tw - dp(12), y + dp(48)}, internet::headline(), &ui::fonts.note,
+                   ui::Tone::Muted);
+        ui::Flow n(cx, cr, y + dp(60), dp(10));
+        auto labeled = [&](const wchar_t* label, int id, int width) {
+            int lw = ui::text_width(ui::fonts.body, label) + dp(10);
+            auto r = n.next(lw + width, bh);
+            scene.text({r.left, r.top, r.left + lw, r.bottom}, label, &ui::fonts.body, ui::Tone::Muted);
+            ui::field(scene, c(id), {r.left + lw, r.top, r.right, r.bottom});
+        };
+        labeled(L"域名（可选）", 71, dp(250));
+        labeled(L"对外端口", 72, dp(110));
+        n.place(c(73), bh);
+        y = n.bottom() + pad;
+        scene.card({x0, y0, x0 + cw, y});
+
+        int top = y + dp(16);
+        y = top + pad;
+        bool list = internet::show_addresses;
+        scene.text({cx, y, cr, y + dp(24)}, list ? ui_text::addresses : ui_text::readiness, &ui::fonts.heading);
+        relabel(78, list ? L"返回准备情况" : L"全部地址");
+        ui::item(c(78))->glyph = list ? ui::glyph::back : ui::glyph::view;
+        int rw = ui::preferred_width(c(76), dp(32)), aw = ui::preferred_width(c(78), dp(32));
+        move(76, cr - rw, y - dp(4), rw, dp(32));
+        move(78, cr - rw - dp(6) - aw, y - dp(4), aw, dp(32));
+        y += dp(34);
+        auto rows = internet::checks();
+        int body = std::max<int>(dp(28) * int(rows.size()), dp(200));
+        ShowWindow(c(77), list ? SW_SHOW : SW_HIDE);
+        if (list) {
+            scene.text({cx, y, cr, y + dp(20)}, ui_text::addresses_hint, &ui::fonts.note, ui::Tone::Muted);
+            move(77, cx - dp(12), y + dp(28), cr - cx + dp(24), body - dp(28));
+            fit_columns(c(77), {110, 170, 150}, 0);
+            y += body;
+        } else {
+            int tcol = dp(132);
+            for (auto& k : rows) {
+                scene.dots.push_back({cx + dp(5), y + dp(13), dp(4), ui::tone(k.tone)});
+                scene.text({cx + dp(18), y, cx + tcol, y + dp(26)}, k.title, &ui::fonts.strong);
+                scene.text({cx + tcol, y, cr, y + dp(26)}, k.detail, &ui::fonts.body, ui::Tone::Muted);
+                y += dp(28);
+            }
+        }
+        auto& r = internet::report;
+        bool actions = on && !list;
+        bool firewall_button = actions && !(r && r->public_firewall == FirewallState::allowed);
+        ShowWindow(c(74), firewall_button ? SW_SHOW : SW_HIDE);
+        ShowWindow(c(75), actions ? SW_SHOW : SW_HIDE);
+        if (actions) {
+            ui::Flow b(cx, cr, y + dp(10), dp(8));
+            if (firewall_button)
+                b.place(c(74), bh);
+            b.place(c(75), bh);
+            y = b.bottom();
+        }
+        y += pad;
+        scene.card({x0, top, x0 + cw, y});
+    }
     EnableWindow(c(15), admin && !host);
     EnableWindow(c(38), admin && !host);
     EnableWindow(c(60), admin != nullptr);
@@ -314,6 +411,9 @@ void layout() {
     EnableWindow(c(16), host && !stopping);
     for (int id : {10, 11, 12, 13, 14, 35})
         EnableWindow(c(id), !host);
+    for (int id : {70, 71, 72, 73, 74, 76, 78})
+        EnableWindow(c(id), admin && !internet::busy);
+    EnableWindow(c(75), host && !stopping && !internet::busy);
     InvalidateRect(window, nullptr, FALSE);
 }
 void refresh_rail() {
@@ -321,7 +421,7 @@ void refresh_rail() {
     GetClientRect(window, &rc);
     RECT chip{0, rc.bottom - ui::dp(96), rail_width(), rc.bottom};
     InvalidateRect(window, &chip, FALSE);
-    for (int id : {50, 51, 52})
+    for (int id : {50, 51, 52, 53})
         InvalidateRect(c(id), nullptr, FALSE);
 }
 /** Host state chip at the foot of the rail. */
@@ -346,7 +446,7 @@ void paint_rail(HDC dc) {
 }
 void restyle() {
     ui::frame(window);
-    for (int id : {20, 40})
+    for (int id : {20, 40, 77})
         ui::style_list(c(id));
     ui::style_scroll(c(32));
 }
@@ -459,7 +559,13 @@ void load() {
     auto next = std::make_unique<HostAdministration>(state);
     admin = std::move(next);
     SetWindowTextW(c(10), state.c_str()); // show the normalised path (native separators)
+    internet::settings = admin->network_settings();
+    internet::report.reset();
+    SetWindowTextW(c(71), wide(internet::settings.public_hostname).c_str());
+    SetWindowTextW(c(72), internet::settings.external_port ? std::to_wstring(internet::settings.external_port).c_str()
+                                                           : L"");
     refresh_devices();
+    internet::refresh();
     save_settings();
     message(L"已加载本机主机配置；尚未启动网络监听。");
 }
@@ -489,37 +595,72 @@ void restore_settings() {
 bool loopback_bind(const std::string& bind) {
     return bind.empty() || bind.starts_with("127.") || bind == "::1" || bind == "localhost";
 }
-/** Addresses a phone can try: the bound one, or (wildcard) physical adapters first. Never 0.0.0.0. */
-std::vector<std::string> reachable_addresses(const std::string& bind) {
-    if (bind != default_host_bind)
-        return valid_pairing_address(bind) && !loopback_bind(bind) ? std::vector<std::string>{bind}
-                                                                   : std::vector<std::string>{};
-    std::vector<std::string> physical, virtual_ones;
+/** The internet settings as the endpoint model wants them; nothing else in Config affects the list. */
+Config endpoint_config() {
+    Config c;
+    c.internet_access = internet::settings.internet_access;
+    c.public_hostname = internet::settings.public_hostname;
+    c.external_port = internet::settings.external_port;
+    return c;
+}
+/** What a device can try for this listener: the host's own entry list, limited to what `bind` accepts. */
+std::vector<ConnectionEndpoint> reachable_endpoints(const Config& config, const std::string& bind,
+                                                    uint16_t port) {
+    if (loopback_bind(bind))
+        return {};
+    std::vector<HostAddress> addresses;
     try {
-        for (auto& a : lan_addresses())
-            (a.virtual_adapter ? virtual_ones : physical).push_back(a.address);
+        addresses = host_addresses();
     } catch (...) {
     }
-    auto& chosen = physical.empty() ? virtual_ones : physical;
-    if (chosen.size() > 8)
-        chosen.resize(8);
-    return chosen;
+    std::erase_if(addresses, [&](const HostAddress& a) {
+        if (bind == "::")
+            return false;
+        if (bind == "0.0.0.0")
+            return a.address.find(':') != std::string::npos;
+        return normalize_address(a.address) != normalize_address(bind);
+    });
+    return host_endpoints(config, port, addresses);
+}
+/** For people: IPv6 with its zero run compressed (the stored and advertised form keeps every group). */
+std::wstring display_host(const std::string& value) {
+    IN6_ADDR v6{};
+    char out[INET6_ADDRSTRLEN]{};
+    if (value.find(':') != std::string::npos && InetPtonA(AF_INET6, value.c_str(), &v6) == 1 &&
+        InetNtopA(AF_INET6, &v6, out, sizeof(out)))
+        return wide(out);
+    return wide(value);
+}
+std::wstring endpoint_text(const std::string& name, uint16_t port) {
+    auto h = display_host(name);
+    return (name.find(':') != std::string::npos ? L"[" + h + L"]" : h) + L":" + std::to_wstring(port);
+}
+std::wstring endpoint_text(const ConnectionEndpoint& e) {
+    return endpoint_text(e.host, e.port);
+}
+/** The bind the network note describes: the running host's real one, otherwise the field. */
+std::string current_bind() {
+    return host ? listen_bind : utf8(text(c(13)));
 }
 /** One line under “网络与运行”: who can connect, and whether the firewall lets them. */
 void refresh_network_note() {
-    auto bind = utf8(text(c(13)));
-    auto port = text(c(14));
+    auto bind = current_bind();
     if (loopback_bind(bind)) {
-        network_note = L"当前只允许本机连接。把监听地址改为 0.0.0.0，同一局域网里的手机才能连上。";
+        network_note = L"当前只允许本机连接。把监听地址改为 ::，同一局域网里的手机才能连上。";
     } else {
-        auto addresses = reachable_addresses(bind);
-        if (addresses.empty())
+        auto endpoints = reachable_endpoints(endpoint_config(), bind, host ? listen_port : port_field());
+        std::erase_if(endpoints, [](auto& e) { return is_public(e.kind); });
+        if (endpoints.empty())
             network_note = L"没有找到可用的局域网地址，请确认电脑已连接 Wi-Fi 或网线。";
         else {
-            network_note = L"手机可通过 " + wide(addresses[0]) + L":" + port + L" 连接";
-            if (addresses.size() > 1)
-                network_note += L"（另有 " + std::to_wstring(addresses.size() - 1) + L" 个地址）";
+            network_note = L"手机可通过 " + endpoint_text(endpoints[0]) + L" 连接";
+            if (endpoints.size() > 1)
+                network_note += L"（另有 " + std::to_wstring(endpoints.size() - 1) + L" 个地址）";
         }
+        if (host && bind == "0.0.0.0" && utf8(text(c(13))) == "::")
+            network_note += L" · 未能启用 IPv6，正在只用 IPv4";
+        if (internet::settings.internet_access)
+            network_note += L" · 公网访问已开启";
         if (!firewall_known)
             network_note += L" · 正在检查防火墙…";
         else if (firewall == FirewallState::allowed)
@@ -577,14 +718,16 @@ void command(int id);
 // closing the window cancels the invitation and wipes both.
 namespace pairing {
 constexpr UINT made_msg = WM_APP + 30;
-constexpr int refresh_id = 310, copy_id = 311, done_id = 312, fix_id = 313, scope_base = 300;
+constexpr int refresh_id = 310, copy_id = 311, done_id = 312, fix_id = 313, remote_id = 314, scope_base = 300;
 struct Made {
     std::string id;
     uint64_t expires = 0;
     std::wstring host, uri, error;
     QrMatrix qr;
-    std::vector<std::string> addresses;
+    std::vector<ConnectionEndpoint> endpoints;
     std::set<std::string> known;
+    uint64_t fingerprint = 0;
+    bool remote = false;
 };
 HWND w;
 ui::Scene scene;
@@ -595,9 +738,10 @@ uint64_t expires = 0;
 std::wstring host_name, uri, status;
 ui::Tone tone = ui::Tone::Muted;
 QrMatrix qr;
-std::vector<std::string> addresses;
+std::vector<ConnectionEndpoint> endpoints;
 std::set<std::string> known;
-bool busy = false, done = false;
+bool busy = false, done = false, remote = false;
+uint64_t made_for = 0; // address fingerprint the current code was made for
 int ticks = 0;
 RECT qr_box{}, info_box{}, status_box{};
 
@@ -607,7 +751,7 @@ Ready readiness() {
         return Ready::no_config;
     if (!host || stopping)
         return Ready::stopped;
-    if (loopback_bind(listen_bind) || reachable_addresses(listen_bind).empty())
+    if (loopback_bind(listen_bind) || reachable_endpoints(endpoint_config(), listen_bind, listen_port).empty())
         return Ready::loopback;
     return Ready::ok;
 }
@@ -650,7 +794,10 @@ void generate() {
     auto old = invite_id;
     wipe();
     layout();
-    worker = std::thread([old, st = state, bind = listen_bind, port = listen_port, scopes] {
+    // Remote redemption only while Internet access is on, and only when asked for this code.
+    bool allow_remote = remote && internet::settings.internet_access;
+    worker = std::thread([old, st = state, config = endpoint_config(), bind = listen_bind, port = listen_port,
+                          scopes, allow_remote] {
         auto made = std::make_unique<Made>();
         try {
             HostAdministration a(st);
@@ -661,14 +808,27 @@ void generate() {
                 }
             for (auto& d : a.snapshot().devices)
                 made->known.insert(d.id);
-            made->addresses = reachable_addresses(bind);
-            if (made->addresses.empty())
+            made->fingerprint = host_address_fingerprint();
+            made->endpoints = reachable_endpoints(config, bind, port);
+            if (made->endpoints.empty())
                 throw Error(Code::io, "没有找到可用的局域网地址");
-            auto invite = a.invite("扫码配对", scopes);
+            auto invite = a.invite("扫码配对", scopes, std::chrono::minutes(10), allow_remote);
             made->id = invite.id;
             made->expires = invite.expires_at;
             made->host = wide(invite.host_name);
-            auto link = pairing_uri(invite, made->addresses, port);
+            made->remote = allow_remote;
+            // A local-only code is redeemed on the LAN, and the device asks for public entries once it is
+            // connected. Plain IPv4 keeps the code small and the v1 format that v0.2 phones can read.
+            std::vector<std::string> v4;
+            for (auto& e : made->endpoints)
+                if (e.kind == EndpointKind::lan_v4 && e.port == port)
+                    v4.push_back(e.host);
+            if (!allow_remote)
+                std::erase_if(made->endpoints, [](auto& e) { return is_public(e.kind); });
+            if (!allow_remote && !v4.empty())
+                std::erase_if(made->endpoints, [](auto& e) { return e.kind != EndpointKind::lan_v4; });
+            auto link = !allow_remote && !v4.empty() ? pairing_uri(invite, v4, port)
+                                                     : pairing_uri_endpoints(invite, made->endpoints, port);
             made->qr = qr_encode(link);
             made->uri = wide(link);
             std::fill(link.begin(), link.end(), '\0');
@@ -757,7 +917,14 @@ void layout() {
     ui::Flow f(x, R, y + dp(28), dp(8));
     for (int i = 0; i < 5; ++i)
         f.place(controls[scope_base + i], dp(34));
-    y = f.bottom() + dp(14);
+    y = f.bottom() + dp(10);
+    bool internet_on = internet::settings.internet_access;
+    ShowWindow(controls[remote_id], internet_on ? SW_SHOW : SW_HIDE);
+    if (internet_on) {
+        ui::Flow g(x, R, y, dp(8));
+        g.place(controls[remote_id], dp(34));
+        y = g.bottom() + dp(10);
+    }
     status_box = {x, y, R, y + dp(40)};
     int bh = dp(36), by = H - dp(24) - bh;
     ui::Flow b(x, R, by, dp(8));
@@ -839,8 +1006,12 @@ void paint(HDC dc) {
             line1 = std::wstring(clock) + L" 后失效 · 只能使用一次";
         }
         std::wstring line2 = host_name;
-        if (!addresses.empty())
-            line2 += L" · " + wide(addresses[0]) + L":" + std::to_wstring(listen_port);
+        if (!endpoints.empty())
+            line2 += L" · " + endpoint_text(endpoints[0]);
+        if (endpoints.size() > 1)
+            line2 += L" 等 " + std::to_wstring(endpoints.size()) + L" 个地址";
+        if (internet::settings.internet_access)
+            line2 += remote ? L" · 外网也可扫码" : L" · 仅限局域网扫码";
         RECT a = info_box;
         a.bottom = a.top + ui::dp(22);
         ui::draw_text(dc, line1, a, ui::fonts.body, expired ? ui::pal.danger : ui::pal.ink,
@@ -869,6 +1040,7 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             controls[copy_id] = ui::button(h, copy_id, ui::Kind::Ghost, L"复制链接", ui::glyph::copy);
             controls[done_id] = ui::button(h, done_id, ui::Kind::Primary, L"完成");
             controls[fix_id] = ui::button(h, fix_id, ui::Kind::Primary, L"改为局域网并启动主机", ui::glyph::play);
+            controls[remote_id] = ui::button(h, remote_id, ui::Kind::Chip, L"允许在外网扫码");
             for (auto [id, c] : controls)
                 ShowWindow(c, SW_SHOW);
             ui::frame(h);
@@ -898,8 +1070,11 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 host_name = made->host;
                 uri = std::move(made->uri);
                 qr = std::move(made->qr);
-                addresses = made->addresses;
+                endpoints = made->endpoints;
                 known = made->known;
+                made_for = made->fingerprint;
+                remote = made->remote;
+                SendMessageW(controls[remote_id], BM_SETCHECK, remote ? BST_CHECKED : BST_UNCHECKED, 0);
                 status = L"等待手机扫码…";
                 tone = ui::Tone::Muted;
             }
@@ -914,13 +1089,25 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 ui::clicked(HWND(lp));
             if (id >= scope_base && id < scope_base + 5) {
                 generate();
+            } else if (id == remote_id) {
+                bool want = SendMessageW(controls[remote_id], BM_GETCHECK, 0, 0) == BST_CHECKED;
+                if (want && MessageBoxW(h,
+                                        L"允许这个二维码在外网使用？\n\n"
+                                        L"10 分钟内，拿到二维码或链接的人（包括看到截图的人）可以在任何地方把自己的设备加进来。\n\n"
+                                        L"只有手机不在家、又必须现在配对时才需要打开。用完请关闭这个窗口。",
+                                        L"外网扫码", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+                    SendMessageW(controls[remote_id], BM_SETCHECK, BST_UNCHECKED, 0);
+                    return 0;
+                }
+                remote = want;
+                generate();
             } else if (id == refresh_id) {
                 generate();
             } else if (id == copy_id) {
                 copy_link();
             } else if (id == fix_id) {
                 if (loopback_bind(utf8(text(c(13)))))
-                    SetWindowTextW(c(13), L"0.0.0.0");
+                    SetWindowTextW(c(13), wide(default_host_bind).c_str());
                 if (host) {
                     status = L"请先在“主机设置”里停止主机，再改为局域网监听。";
                     tone = ui::Tone::Danger;
@@ -979,8 +1166,9 @@ void open() {
     status.clear();
     done = false;
     busy = false;
+    remote = false;
     ticks = 0;
-    RECT client{0, 0, ui::dp(468), ui::dp(660)};
+    RECT client{0, 0, ui::dp(468), ui::dp(internet::settings.internet_access ? 704 : 660)};
     AdjustWindowRectExForDpi(&client, WS_POPUP | WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME, ui::dpi);
     RECT owner{};
     GetWindowRect(window, &owner);
@@ -1006,7 +1194,427 @@ void host_changed() {
     }
     layout();
 }
+/** The PC's addresses changed (new IPv6 prefix, another Wi-Fi): a live code would point at stale ones. */
+void addresses_changed(uint64_t now) {
+    if (w && !done && !busy && !invite_id.empty() && now != made_for)
+        generate();
+}
 } // namespace pairing
+
+// ---------------------------------------------------------------- Internet access page
+namespace internet {
+constexpr UINT report_msg = WM_APP + 40, action_msg = WM_APP + 41;
+enum class Action { firewall_add, firewall_remove, upnp_map, upnp_unmap };
+struct Done {
+    Action action;
+    bool ok = false;
+    UpnpReport upnp;
+    std::wstring error;
+};
+// `probe` touches the running Host (report, router); joined before the Host is destroyed.
+// `elevate` only waits for the UAC-elevated CLI and never touches the Host.
+std::thread probe, elevate;
+bool checking = false, again = false;
+bool router_wanted = false; // the user asked the router this run; re-asked when addresses change
+NetworkSecurityStats stats;
+const wchar_t* upnp_text(UpnpStatus s, bool v6) {
+    switch (s) {
+    case UpnpStatus::success: return v6 ? L"路由器已放行 IPv6" : L"路由器已映射 IPv4 端口";
+    case UpnpStatus::no_igd: return L"没有发现支持 UPnP 的路由器";
+    case UpnpStatus::unsupported: return v6 ? L"路由器不支持自动放行 IPv6" : L"路由器不支持端口映射";
+    case UpnpStatus::denied: return L"路由器拒绝了自动配置";
+    case UpnpStatus::cgnat: return L"没有公网 IPv4（运营商 NAT），已跳过";
+    case UpnpStatus::network_error: return L"与路由器通信失败";
+    case UpnpStatus::expired: return L"路由器放行已过期";
+    default: return L"未请求";
+    }
+}
+bool router_active() {
+    return report && (report->upnp.ipv4.status == UpnpStatus::success ||
+                      report->upnp.ipv6.status == UpnpStatus::success);
+}
+void join_probe() {
+    if (probe.joinable())
+        probe.join();
+}
+void refresh() {
+    if (!admin)
+        return;
+    if (checking) {
+        again = true;
+        return;
+    }
+    join_probe();
+    checking = true;
+    auto exe = own_executable();
+    auto running = host && !stopping ? host.get() : nullptr;
+    probe = std::thread([running, exe, st = state, bind = utf8(text(c(13))), port = port_field()] {
+        auto made = std::make_unique<ReachabilityReport>();
+        try {
+            *made = running ? running->reachability_report(exe)
+                            : reachability_report(load_config(st / L"config.dpapi"), exe, bind, port, false);
+        } catch (...) {
+            made.reset();
+        }
+        if (PostMessageW(window, report_msg, 0, LPARAM(made.get())))
+            made.release();
+    });
+}
+void finish(Done& d);
+/** The UAC prompt can stay open for a minute, so this runs on its own thread. */
+void request_firewall(bool allow) {
+    if (elevate.joinable())
+        elevate.join();
+    busy = true;
+    message(allow ? L"正在请求管理员权限，添加“Lantern 主机（公网）”防火墙规则…"
+                  : L"正在请求管理员权限，删除“Lantern 主机（公网）”防火墙规则…");
+    layout();
+    elevate = std::thread([allow, exe = own_executable(), port = host ? listen_port : port_field()] {
+        auto d = std::make_unique<Done>();
+        d->action = allow ? Action::firewall_add : Action::firewall_remove;
+        d->ok = request_public_firewall(exe, port, allow);
+        if (PostMessageW(window, action_msg, 0, LPARAM(d.get())))
+            d.release();
+    });
+}
+void router(bool map) {
+    if (!host || stopping)
+        throw Error(Code::invalid, "请先启动主机");
+    join_probe();
+    busy = true;
+    message(map ? L"正在询问路由器…" : L"正在撤销路由器放行…");
+    layout();
+    probe = std::thread([map, running = host.get()] {
+        auto d = std::make_unique<Done>();
+        d->action = map ? Action::upnp_map : Action::upnp_unmap;
+        try {
+            d->upnp = map ? running->upnp_map() : running->upnp_unmap();
+            d->ok = true;
+        } catch (const std::exception& e) {
+            d->error = wide(e.what());
+        }
+        if (PostMessageW(window, action_msg, 0, LPARAM(d.get())))
+            d.release();
+    });
+}
+/** Hostname and public port from the page; empty port means “same as the listening port”. */
+std::pair<std::string, uint16_t> fields() {
+    auto name = utf8(text(c(71)));
+    name.erase(0, name.find_first_not_of(' '));
+    name.erase(name.find_last_not_of(' ') + 1);
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char ch) { return char(ch >= 'A' && ch <= 'Z' ? ch + 32 : ch); });
+    if (!name.empty() && !valid_hostname(name))
+        throw Error(Code::invalid, "域名格式无效：只填主机名，例如 home.example.com，不要带 http:// 或端口");
+    auto value = text(c(72));
+    uint16_t port = 0;
+    if (!value.empty()) {
+        auto n = std::stoul(value);
+        if (!n || n > 65535)
+            throw Error(Code::invalid, "对外端口必须为 1..65535，或留空表示和监听端口相同");
+        port = uint16_t(n);
+    }
+    return {name, port};
+}
+void reload() {
+    settings = admin->network_settings();
+    refresh_network_note();
+    pairing::host_changed();
+    refresh();
+    layout();
+}
+void save_fields() {
+    auto [name, port] = fields();
+    admin->internet(settings.internet_access, name, port);
+    reload();
+    message(name.empty() ? L"已保存。没有填写域名时，手机只用电脑当前的公网 IPv6 地址。"
+                         : L"已保存。域名的 DNS 记录需要你自己的动态域名服务来更新，Lantern 只负责把它告诉手机。");
+}
+void enable() {
+    if (!admin)
+        throw Error(Code::invalid, "请先在“主机设置”中加载或新建主机配置");
+    auto [name, port] = fields();
+    if (snapshot.legacy) {
+        if (MessageBoxW(window,
+                        L"开启公网访问前，需要先禁用旧共享凭据。\n\n仍在使用旧密钥的连接会断开；"
+                        L"逐设备配对的手机和电脑不受影响。\n\n现在禁用并继续？",
+                        L"禁用旧共享凭据", MB_YESNO | MB_ICONWARNING) != IDYES)
+            return;
+        admin->disable_legacy();
+        refresh_devices();
+    }
+    if (MessageBoxW(window,
+                    L"开启后，这台电脑会接受来自互联网的连接：\n\n"
+                    L"· 只有已配对的设备能登录，每台设备的权限不变；\n"
+                    L"· 握手超时、来源限流、失败退避等公网防护会同时启用；\n"
+                    L"· 还需要 Windows 防火墙和路由器放行，外网才连得进来。\n\n"
+                    L"新设备仍建议在家里扫码配对。继续？",
+                    L"开启公网访问", MB_YESNO | MB_ICONQUESTION) != IDYES)
+        return;
+    admin->internet(true, name, port);
+    // An explicit IPv4 listener cannot be reached over IPv6; offer dual stack, never change it silently.
+    if (!host && utf8(text(c(13))) == "0.0.0.0" &&
+        MessageBoxW(window, L"当前监听地址是 0.0.0.0，只接受 IPv4。把它改为 ::，同时接受 IPv4 和 IPv6？",
+                    L"监听地址", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+        SetWindowTextW(c(13), wide(default_host_bind).c_str());
+        save_settings();
+    }
+    reload();
+    message(host && listen_bind != "::"
+                ? L"公网访问已开启。主机正在只用 IPv4 监听；停止主机、把监听地址改为 :: 后再启动，才能用 IPv6。"
+                : L"公网访问已开启。下一步：添加公网防火墙规则，并确认路由器放行。");
+}
+void finish_disable() {
+    admin->internet(false, settings.public_hostname, settings.external_port);
+    bool unmap = host && !stopping && router_active();
+    router_wanted = false;
+    reload();
+    if (unmap)
+        router(false);
+    message(L"公网访问已关闭，只接受局域网连接。");
+}
+void disable() {
+    // The rule is removed first; if that is refused, the hardened mode stays on rather than pretending.
+    if (!report || report->public_firewall != FirewallState::not_allowed)
+        request_firewall(false);
+    else
+        finish_disable();
+}
+void finish(Done& d) {
+    busy = false;
+    switch (d.action) {
+    case Action::firewall_add:
+        message(d.ok ? L"已添加公网防火墙规则（仅专用网络，TCP）。"
+                     : L"没有添加防火墙规则（未获得管理员授权或操作失败）。");
+        break;
+    case Action::firewall_remove:
+        if (d.ok) {
+            finish_disable();
+            return;
+        }
+        MessageBoxW(window,
+                    L"没能删除公网防火墙规则（未获得管理员授权或操作失败），所以公网访问仍保持开启，防护继续有效。\n\n"
+                    L"你可以：\n· 再点一次“关闭公网访问”重试；\n· 或停止主机；\n"
+                    L"· 或在“Windows Defender 防火墙 → 高级设置 → 入站规则”里删除“Lantern 主机（公网）”，再回来关闭。",
+                    L"公网访问仍开启", MB_OK | MB_ICONWARNING);
+        message(L"公网防火墙规则没有删除，公网访问保持开启。");
+        break;
+    case Action::upnp_map:
+    case Action::upnp_unmap: {
+        if (!d.ok) {
+            message(L"路由器：" + d.error);
+            break;
+        }
+        router_wanted = d.action == Action::upnp_map;
+        auto port = std::to_wstring(d.upnp.ipv6.external_port ? d.upnp.ipv6.external_port : listen_port);
+        if (d.action == Action::upnp_unmap)
+            message(L"已撤销路由器放行。");
+        else if (d.upnp.ipv4.status == UpnpStatus::success || d.upnp.ipv6.status == UpnpStatus::success)
+            message(std::wstring(L"IPv6：") + upnp_text(d.upnp.ipv6.status, true) + L"；IPv4：" +
+                    upnp_text(d.upnp.ipv4.status, false) + L"。主机运行期间会自动续期，停止时撤销。");
+        else
+            message(std::wstring(L"路由器没有自动放行（") + upnp_text(d.upnp.ipv6.status, true) +
+                    L"）。请在路由器的 IPv6 防火墙里手动放行 TCP 端口 " + port + L"。");
+        break;
+    }
+    }
+    refresh();
+    layout();
+}
+void toggle() {
+    if (settings.internet_access)
+        disable();
+    else
+        enable();
+}
+/** New addresses (a new IPv6 prefix): re-check, and renew the router's permission if it was asked. */
+void addresses_changed() {
+    refresh();
+    if (router_wanted && host && !stopping && !busy && settings.internet_access)
+        try {
+            router(true);
+        } catch (...) {
+        }
+}
+std::wstring minutes_left(uint64_t expires) {
+    auto now = pairing_unix_time();
+    return expires > now ? L"，剩余 " + std::to_wstring((expires - now + 59) / 60) + L" 分钟" : L"";
+}
+std::wstring headline() {
+    if (!admin)
+        return L"请先在“主机设置”中加载或新建主机配置。";
+    if (!settings.internet_access)
+        return L"关闭时只接受局域网连接，和 v0.2 完全一样。开启前会先禁用旧共享凭据。";
+    int blocking = 0;
+    for (auto& k : checks())
+        blocking += k.tone == ui::Tone::Danger || k.tone == ui::Tone::Lamp;
+    if (!host)
+        return L"已开启。启动主机后，已配对的设备在外面也能连回来。";
+    if (!blocking)
+        return L"本机侧已准备好。请用手机的移动数据实际连一次确认。";
+    return L"还有 " + std::to_wstring(blocking) + L" 项需要处理，见下方。";
+}
+std::vector<Check> checks() {
+    using ui::Tone;
+    std::vector<Check> out;
+    if (!admin)
+        return out;
+    if (!report) {
+        out.push_back({Tone::Muted, L"检查中", L"正在读取本机网络状态…"});
+        return out;
+    }
+    auto& r = *report;
+    auto port = std::to_wstring(r.port);
+    // Listener.
+    if (!r.listening)
+        out.push_back({Tone::Muted, L"主机监听", r.bind == "::" ? L"主机未运行；启动后同时监听 IPv4 和 IPv6"
+                                                              : L"主机未运行"});
+    else if (r.dual_stack)
+        out.push_back({Tone::Positive, L"主机监听", L"IPv4 + IPv6 双栈，端口 " + port});
+    else if (r.bind == "0.0.0.0")
+        out.push_back({Tone::Lamp, L"主机监听",
+                       utf8(text(c(13))) == "::" ? L"未能启用 IPv6，正在只用 IPv4"
+                                                 : L"只监听 IPv4；停止主机，把监听地址改为 :: 后再启动"});
+    else
+        out.push_back({Tone::Lamp, L"主机监听", L"只监听 " + wide(r.bind) + L"；改为 :: 才能从公网连接"});
+    // IPv6.
+    std::vector<const HostAddress*> stable6;
+    bool temporary6 = false, public4 = false;
+    for (auto& a : r.addresses) {
+        if (a.category == AddressKind::global_v6 && !a.deprecated) {
+            if (a.temporary)
+                temporary6 = true;
+            else
+                stable6.push_back(&a);
+        }
+        if (a.category == AddressKind::public_v4 && !a.deprecated)
+            public4 = true;
+    }
+    if (!stable6.empty())
+        out.push_back({Tone::Positive, L"公网 IPv6",
+                       display_host(stable6.front()->address) +
+                           (stable6.size() > 1 ? L" 等 " + std::to_wstring(stable6.size()) + L" 个" : L"")});
+    else if (temporary6)
+        out.push_back({Tone::Lamp, L"公网 IPv6", L"只有临时地址，可能每天变化；请检查路由器的 IPv6 设置"});
+    else
+        out.push_back({Tone::Lamp, L"公网 IPv6", L"暂未发现公网 IPv6；等待网络，或检查路由器是否开启 IPv6"});
+    // IPv4.
+    auto& v4 = r.upnp.ipv4;
+    if (v4.status == UpnpStatus::success)
+        out.push_back({Tone::Positive, L"公网 IPv4",
+                       endpoint_text(v4.external_address, v4.external_port) + L"（路由器映射" +
+                           minutes_left(v4.expires_at) + L"）"});
+    else if (public4)
+        out.push_back({Tone::Positive, L"公网 IPv4", L"这台电脑直接拥有公网 IPv4 地址"});
+    else if (r.cgnat)
+        out.push_back({Tone::Muted, L"公网 IPv4", L"没有公网 IPv4（运营商 NAT），可以只用 IPv6"});
+    else
+        out.push_back({Tone::Muted, L"公网 IPv4", L"未检测到；有公网 IPv4 时可让路由器做端口映射"});
+    // Legacy credential.
+    if (r.legacy_enabled)
+        out.push_back({settings.internet_access ? Tone::Danger : Tone::Muted, L"旧共享凭据",
+                       L"仍启用；开启公网访问时会先禁用"});
+    else
+        out.push_back({Tone::Positive, L"旧共享凭据", L"已禁用，只接受逐设备凭据"});
+    // Firewall.
+    // NET_FW_PROFILE2_PRIVATE = 2, PUBLIC = 4. Several adapters can be active; warn when none is Private.
+    bool public_only = (r.current_profiles & 4) && !(r.current_profiles & 2);
+    auto attention = settings.internet_access ? Tone::Lamp : Tone::Muted; // only matters once it is on
+    if (public_only)
+        out.push_back({attention, L"防火墙",
+                       L"网络被识别为“公用”，Lantern 的规则不在此生效；如果是自家网络，可在 Windows 设置里改为专用网络"});
+    else if (r.public_firewall == FirewallState::allowed)
+        out.push_back({Tone::Positive, L"防火墙", L"已放行 TCP " + port + L"（仅专用网络）"});
+    else if (r.public_firewall == FirewallState::not_allowed)
+        out.push_back({settings.internet_access ? Tone::Danger : Tone::Muted, L"防火墙",
+                       L"没有公网规则，外网连接会被拦截"});
+    else
+        out.push_back({attention, L"防火墙", L"无法确认（可能由组策略管理）"});
+    // Router.
+    auto& v6 = r.upnp.ipv6;
+    if (v6.status == UpnpStatus::success)
+        out.push_back({Tone::Positive, L"路由器", std::wstring(L"已自动放行 IPv6") + minutes_left(v6.expires_at)});
+    else if (v6.status == UpnpStatus::idle)
+        out.push_back({Tone::Muted, L"路由器",
+                       L"路由器通常会拦截外网访问：点“让路由器自动放行”，或在路由器里手动放行 TCP " + port});
+    else
+        out.push_back({attention, L"路由器",
+                       std::wstring(upnp_text(v6.status, true)) + L"；请在路由器里手动放行 TCP " + port});
+    // Hostname.
+    if (settings.public_hostname.empty())
+        out.push_back({Tone::Muted, L"域名", L"未设置；电脑的 IPv6 前缀变化后，设备需要回家连一次才能拿到新地址"});
+    else
+        out.push_back({Tone::Positive, L"域名",
+                       endpoint_text(settings.public_hostname,
+                                     settings.external_port ? settings.external_port : r.port) +
+                           L"（DNS 记录由你的动态域名服务更新）"});
+    // Protection counters (running host only; never credentials).
+    if (host && settings.internet_access)
+        out.push_back({Tone::Muted, L"公网防护",
+                       L"已拒绝 " + std::to_wstring(stats.rejected) + L" 次 · 限流 " +
+                           std::to_wstring(stats.throttled) + L" 次 · 握手超时 " + std::to_wstring(stats.timeouts) +
+                           L" 次"});
+    return out;
+}
+/** Every address the PC has, and whether devices are told about it. */
+void fill_addresses() {
+    auto list = c(77);
+    ListView_DeleteAllItems(list);
+    if (!report)
+        return;
+    int row = 0;
+    for (auto& a : report->addresses) {
+        const wchar_t* kind = a.category == AddressKind::private_v4 ? L"局域网 IPv4"
+                              : a.category == AddressKind::ula_v6   ? L"局域网 IPv6"
+                              : a.category == AddressKind::global_v6 ? L"公网 IPv6"
+                              : a.category == AddressKind::public_v4 ? L"公网 IPv4"
+                              : a.category == AddressKind::cgnat_v4  ? L"运营商 NAT"
+                                                                      : L"其他";
+        bool local = a.category == AddressKind::private_v4 || a.category == AddressKind::ula_v6;
+        const wchar_t* use = a.deprecated  ? L"已弃用"
+                             : a.temporary ? L"可能临时，不使用"
+                             : a.category == AddressKind::cgnat_v4 ? L"不使用"
+                             : !local && !settings.internet_access ? L"公网未开启"
+                             : a.virtual_adapter                   ? L"使用中（虚拟网卡）"
+                                                                   : L"使用中";
+        cell(list, row, 0, display_host(a.address));
+        cell(list, row, 1, kind);
+        cell(list, row, 2, wide(a.adapter_name));
+        cell(list, row, 3, use);
+        ++row;
+    }
+}
+void received(std::unique_ptr<ReachabilityReport> r) {
+    checking = false;
+    if (r)
+        report = std::move(*r);
+    if (host)
+        stats = host->security_stats();
+    fill_addresses();
+    if (again) {
+        again = false;
+        refresh();
+    }
+    if (page == 3 || page == 2)
+        layout();
+}
+/** Once a second on the Internet page: only the counters change without an event. */
+void tick() {
+    if (!host || !settings.internet_access)
+        return;
+    auto next = host->security_stats();
+    if (next.rejected != stats.rejected || next.throttled != stats.throttled || next.timeouts != stats.timeouts) {
+        stats = next;
+        if (page == 3)
+            layout();
+    }
+}
+void shutdown() {
+    join_probe();
+    if (elevate.joinable())
+        elevate.join();
+}
+} // namespace internet
 
 struct SetupRoot {
     fs::path root;
@@ -1177,10 +1785,27 @@ void command(int id) {
         message(L"正在请求管理员权限，为“专用网络”添加防火墙规则…");
         check_firewall(true);
     }
-    else if (id >= 50 && id <= 52) {
+    else if (id >= 50 && id <= 53) {
         page = id - 50;
         layout();
         refresh_sessions();
+        if (page == 3)
+            internet::refresh();
+    } else if (id == 70)
+        internet::toggle();
+    else if (id == 73)
+        internet::save_fields();
+    else if (id == 74)
+        internet::request_firewall(true);
+    else if (id == 75)
+        internet::router(!internet::router_active());
+    else if (id == 78) {
+        internet::show_addresses = !internet::show_addresses;
+        layout();
+    } else if (id == 76) {
+        address_fingerprint = host_address_fingerprint();
+        refresh_network_note();
+        internet::refresh();
     } else if (id == 15) {
         if (!admin)
             throw Error(Code::invalid, "请先加载主机状态目录");
@@ -1190,9 +1815,10 @@ void command(int id) {
         if (used != value.size() || !port || port > 65535)
             throw Error(Code::invalid, "端口必须为1..65535");
         host = std::make_unique<Host>(state, utf8(text(c(13))), uint16_t(port));
-        listen_address = text(c(13)) + L":" + text(c(14));
-        listen_bind = utf8(text(c(13)));
-        listen_port = uint16_t(port);
+        // The real listener: “::” falls back to IPv4 when the system cannot open a dual-stack socket.
+        listen_bind = host->listening_address();
+        listen_port = host->listening_port();
+        listen_address = endpoint_text(listen_bind, listen_port);
         auto capacity = utf8(text(c(36)));
         size_t capacity_used = 0;
         auto mbps = std::stoul(capacity, &capacity_used);
@@ -1207,11 +1833,14 @@ void command(int id) {
         });
         save_settings();
         message(loopback_bind(listen_bind)
-                    ? L"主机已启动，但只允许本机连接；要让手机连接，请停止后把监听地址改为 0.0.0.0。"
+                    ? L"主机已启动，但只允许本机连接；要让手机连接，请停止后把监听地址改为 ::。"
+                : listen_bind != utf8(text(c(13)))
+                    ? L"主机已启动，但系统未能启用 IPv6，正在只用 IPv4 监听。局域网连接不受影响。"
                     : L"主机已启动。点“扫码添加设备”，用手机扫一下就能连上。" + wide(host->discovery_status()));
         refresh_network_note();
         check_firewall(false);
         pairing::host_changed();
+        internet::refresh();
         layout();
     } else if (id == 16)
         stop();
@@ -1222,6 +1851,7 @@ void command(int id) {
                         MB_YESNO | MB_ICONWARNING) == IDYES) {
             admin->disable_legacy();
             refresh_devices();
+            internet::refresh();
             message(L"旧共享凭据已禁用，逐设备信任保留。");
         }
     } else if (id == 28) {
@@ -1283,9 +1913,10 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             using ui::Kind;
             namespace g = ui::glyph;
             // Rail.
-            const std::pair<int, const wchar_t*> navs[] = {{52, L"主机设置"}, {50, L"设备与权限"}, {51, L"当前连接"}};
-            const wchar_t icons[] = {g::settings, g::people, g::plug};
-            for (int i = 0; i < 3; ++i) {
+            const std::pair<int, const wchar_t*> navs[] = {
+                {52, L"主机设置"}, {50, L"设备与权限"}, {51, L"当前连接"}, {53, L"公网访问"}};
+            const wchar_t icons[] = {g::settings, g::people, g::plug, globe_glyph};
+            for (int i = 0; i < 4; ++i) {
                 auto nav = button(navs[i].first, -1, Kind::Nav, navs[i].second, icons[i], ui::Surface::Rail);
                 int target = navs[i].first - 50;
                 ui::item(nav)->on = [target] { return page == target; };
@@ -1352,6 +1983,23 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             column(list, 3, L"请求权限", 220);
             column(list, 4, L"连接 ID", 450);
             button(41, 1, Kind::Danger, L"终止选中的连接", g::cancel, ui::Surface::Bg);
+            // Internet access.
+            button(70, 3, Kind::Primary, L"开启公网访问", globe_glyph);
+            child(71, 3, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP);
+            SendMessageW(c(71), EM_SETCUEBANNER, TRUE, (LPARAM)L"例如 home.example.com");
+            child(72, 3, L"EDIT", L"", ES_NUMBER | WS_TABSTOP);
+            SendMessageW(c(72), EM_SETCUEBANNER, TRUE, (LPARAM)L"同监听端口");
+            button(73, 3, Kind::Secondary, L"保存", g::save);
+            button(74, 3, Kind::Secondary, L"添加公网防火墙规则", g::shield);
+            button(75, 3, Kind::Secondary, L"让路由器自动放行", g::sync);
+            button(76, 3, Kind::Ghost, L"重新检查", g::refresh);
+            button(78, 3, Kind::Ghost, L"全部地址", g::view);
+            list = child(77, 3, WC_LISTVIEWW, L"", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_TABSTOP);
+            ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+            column(list, 0, L"地址", 300);
+            column(list, 1, L"类型", 110);
+            column(list, 2, L"网卡", 170);
+            column(list, 3, L"状态", 150);
             scopes(200, 1);
             scopes(100, 1);
             restyle();
@@ -1362,11 +2010,21 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         }
         case WM_APP + 2:
             restore_settings();
+            address_fingerprint = host_address_fingerprint();
             refresh_network_note();
             check_firewall(false);
             layout();
             refresh_rail();
             return 0;
+        case internet::report_msg:
+            internet::received(std::unique_ptr<ReachabilityReport>(reinterpret_cast<ReachabilityReport*>(l)));
+            return 0;
+        case internet::action_msg: {
+            std::unique_ptr<internet::Done> done(reinterpret_cast<internet::Done*>(l));
+            if (!closing)
+                internet::finish(*done);
+            return 0;
+        }
         case firewall_msg:
             firewall = FirewallState(w);
             firewall_known = true;
@@ -1460,6 +2118,22 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
                 refresh_sessions();
                 if (before != sessions.size())
                     refresh_rail();
+                static int ticks = 0;
+                if (++ticks % 3 == 0) {
+                    // A new IPv6 prefix or another Wi-Fi: refresh everything that names an address.
+                    uint64_t now = address_fingerprint;
+                    try {
+                        now = host_address_fingerprint();
+                    } catch (...) {
+                    }
+                    if (now != address_fingerprint) {
+                        address_fingerprint = now;
+                        refresh_network_note();
+                        pairing::addresses_changed(now);
+                        internet::addresses_changed();
+                    }
+                }
+                internet::tick();
             }
             return 0;
         case WM_APP + 1:
@@ -1467,11 +2141,16 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
                 server.join();
             if (stopper.joinable())
                 stopper.join();
+            internet::join_probe(); // it may hold the Host pointer
             host.reset();
             stopping = false;
+            internet::router_wanted = false;
+            internet::busy = false;
             refresh_sessions();
             pairing::host_changed();
             refresh_network_note();
+            if (!closing)
+                internet::refresh();
             if (closing)
                 DestroyWindow(h);
             else {
@@ -1497,6 +2176,7 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         case WM_DESTROY:
             if (firewall_worker.joinable())
                 firewall_worker.join();
+            internet::shutdown();
             PostQuitMessage(0);
             return 0;
         case WM_CTLCOLORSTATIC:

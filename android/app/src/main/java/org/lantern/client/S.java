@@ -42,8 +42,8 @@ final class S {
     static final String HERO_CONNECTED = "已连接", HERO_CONNECTED_TO = "%s";
     static final String HERO_CONNECTED_DETAIL = "电脑身份已验证。文件、画面、控制和声音分别授权，可以单独开启。";
     static final String HERO_FAILED = "无法连接电脑";
-    static final String HERO_FAILED_DETAIL = "确认电脑上的 Lantern 主机已启动、手机和电脑在同一网络，并核对指纹和密钥。";
-    static final String HERO_FAILED_REASON = "%s\n确认电脑上的 Lantern 主机已启动、手机和电脑在同一网络，并核对指纹和密钥。";
+    static final String HERO_FAILED_DETAIL = "确认电脑上的 Lantern 主机已启动、手机能连到电脑所在的网络（在外面需要电脑开启公网访问），并核对指纹和密钥。";
+    static final String HERO_FAILED_REASON = "%s\n确认电脑上的 Lantern 主机已启动、手机能连到电脑所在的网络（在外面需要电脑开启公网访问），并核对指纹和密钥。";
     static final String HERO_INVALID = "电脑地址格式不对";
     static final String HERO_INVALID_DETAIL = "填写 IPv4、IPv6 或主机名，端口可选，例如 192.168.1.10 或 192.168.1.10:47443。";
     static final String FINGERPRINT_SHORT = "指纹 %s";
@@ -235,9 +235,19 @@ final class S {
         "二维码无效或已过期，请在电脑上刷新二维码；如果手机时间不准，也请校正。",
         "电脑端 Lantern 版本过旧，请更新后重新生成二维码。",
         "配对码无效、已被使用或已过期，请在电脑上刷新二维码。",
-        "连不上电脑：请确认手机和电脑在同一个局域网、主机已启动，并已允许通过防火墙。",
+        "连不上电脑：请确认主机已启动并已允许通过防火墙。在家时连同一个 Wi-Fi；在外面扫码，需要电脑开启公网访问并允许外网扫码。",
         "电脑身份和二维码不一致，已停止配对。请重新核对电脑上的二维码。",
         "尝试太频繁了，请一分钟后再试。",
         "电脑的回应无效，没有保存任何凭据。请检查两端的版本。",
         "连接中断，无法确认是否已配对。请在电脑的设备列表里检查，删掉多余的条目后重新生成二维码。"};
+    // Public network: entries learnt from the computer (LAN, public IPv6, hostname, public IPv4).
+    static final String[] PATH_LABELS = {"", "局域网", "局域网", "公网 IPv6", "域名", "公网 IPv4"}; // by entry kind
+    static final String PATH_PUBLIC_NOTICE = "正在经公网连接电脑；画面卡顿时可以在画质里选低一档。";
+    static final String[] ENDPOINT_FAILURES = { // NetworkDialer.Failure order
+        "域名解析失败", "没有响应（超时）", "被拒绝（没有在监听，或被路由器拦下）", "证书指纹不匹配", "连接中断", "已取消"};
+    static final String ENDPOINT_OK = "可用", ENDPOINT_RTT = "可用 · 往返 %d ms", ENDPOINT_RTT_FAST = "可用 · 往返不到 1 ms";
+    static final String CONNECT_ALL_FAILED = "所有地址都连不上：%s";
+    static final String MORE_ADDRESSES = "%s 等 %d 个地址";
+    static final String DIAG_ENTRIES = "各个地址";
+    static final String DIAG_ENTRIES_NOTE = "用移动数据时，局域网地址连不上是正常的。公网地址连不上时，请在电脑主机管理的“公网访问”页检查防火墙和路由器。";
 }
