@@ -140,7 +140,48 @@ Windows自动同步默认关闭，500ms轮询、代际取消、双端不同内�
 - Android 任务日志新增 kind=3、content URI 与 sourceHash；旧 kind 0..2 保留。摘要用于拒绝跨源版本续传。仅具备持久读取授权、已知长度和可寻址能力的来源使用该类型，其余使用原快照方案。
 - Android 已增加前台手动剪贴板 UI，复用 Op53/54；多显示器和快捷键复用既有接口。原生 UTF-8 字符串解析拒绝损坏序列。
 
-## QR pairing v1（Op55，后端接口）
+## 公网后端增量（2026-10-16，外层协议仍为 1）
+
+以下新增约定优先于下方历史 v0.2 说明。完整调用方式见 [PUBLIC-NETWORK-HANDOFF.md](PUBLIC-NETWORK-HANDOFF.md)。HELLO 成功回复、请求权限和通道格式保持兼容。
+
+### 认证后的入口枚举
+
+能力串新增 `endpoints=v1`。客户端先执行 HELLO，再查询 CAPS；没有此能力时不发送 Op56，继续使用原有单地址连接。Op56 空请求，成功响应在原响应头后为：
+
+```text
+u32 API_version=1, u32 count (0..8)
+repeated count times:
+  u32 kind, str host (<=253 bytes), u32 port (1..65535), u32 priority,
+  u64 expires_at (Unix seconds; 0 unspecified), u32 failures (server sends 0)
+```
+
+类型：1 LAN IPv4，2 ULA IPv6，3 稳定公网 IPv6，4 DNS 主机名，5 看起来像公网的 IPv4 / UPnP 映射。优先级数值越小越靠前；客户端始终先排 LAN，再比较优先级。主机默认优先级依次为 100、200、300、400、500，虚拟网卡另加 10。IPv6 的 `host` 无方括号，地址比较使用八组小写规范形式，IPv4 映射地址归一到 IPv4。DNS 使用 ASCII 名称（国际域名由界面先转换为 punycode）。不接受 URL、凭据、路径或 zone ID。
+
+主机只广告实际监听地址覆盖的网卡；去掉临时、弃用、CGNAT 地址。公网开关关闭时不广告 3..5；开启时加入配置域名和有效的 IPv4 UPnP 映射。IPv6 始终使用监听端口；IPv4 映射、域名可以使用外部端口。入口只能在认证后请求；认证前 Op56 返回 unauthorized 并断开。发现协议完全不变，不携带公网入口。
+
+### 配对链接 v2
+
+七个参数和长度限制与 v1 相同，`v=2` 时 `a` 内每项语法是 `IPv4[:port]`、`[IPv6][:port]` 或 `hostname[:port]`。省略项内端口时使用 `p`。最多 8 项、最多 1 个 DNS 名称；按规范化后的 host+port 拒绝重复。拒绝 IPv6 zone、链路本地、多播、未指定地址、损坏/非规范端口、非法 DNS 标签。全字符串仍最多 2048 字节。IPv6 方括号属于 URI 内容，不属于最终连接主机名。
+
+示意结构（占位指纹/配对码需换成实际 64 位十六进制，时间需未过期）：
+
+```text
+lantern://pair?v=2&n=Lantern&a=192.0.2.2,[2001:db8::1],example.com:443&p=47443&f=<64-hex>&c=<64-hex>&x=<Unix-seconds>
+```
+
+生成器仅在含 IPv6 或域名时生成 v2；纯 IPv4 仍生成 v1、使用一个共同端口。如果只含 IPv4 却要求不同端口，生成器返回 invalid，由界面选共同端口或加入已配置域名。新客户端同时支持两版，配对后保存所有入口；成功的端口可能不同于 `p`。只有一次兑换请求会发送出去，竞争失败的 TLS 连接不发送码，兑换响应丢失不会自动重试。
+
+邀请新增持久化 `allow_remote`，默认 false。兑换仍是 Op55 原帧格式；默认仅接受私有 IPv4、ULA、链路本地和回环来源。公网来源返回 unauthorized，也计入指定邀请的 5 次失败。IPv4 映射来源先规范化；PAIR 来源限速的 IPv6 按 /64 聚合。
+
+### 本地持久化版本
+
+Host Config 写 v4，读 v1..v4。在 v3 的**每一条邀请**末尾加入 `u32 allow_remote (0/1)`；全部邀请后加入 `u32 internet_access (0/1), str public_hostname (<=253), u32 external_port (0 means unspecified)`。旧配置读取时新增字段为 false/空/0；开启公网且旧共享凭据仍启用的配置拒绝保存/载入。配置编辑继续用跨进程锁和原子 DPAPI 快照。
+
+Windows 客户端凭据仍以 `u32 1` 和旧 host/port/pin/token 字段开头，可选尾部为上面的 count+entries；旧文件没有尾部也可读。传输 journal 写 v4、读 v1..v4，在每项旧凭据字段后插入入口列表，再接原有任务字段。Android 提供非秘密入口偏好文本 v1，令牌的 Keystore 行为不变。
+
+**旧版程序不能读 Host Config v4 和新的传输 journal；Windows 主机、Windows 客户端、Android 客户端应一起升级。**线上的旧 HELLO 客户端仍能连接新主机，单地址能力回退不要求旧主机支持 Op56。
+
+## QR pairing v1（Op55，v0.2 历史约定，新增部分以上节为准）
 
 客户端从受信任的电脑屏幕扫描二维码，先使用链接中的完整 SHA-256 固定 TLS 证书，再发送第一帧：
 
