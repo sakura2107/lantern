@@ -82,6 +82,17 @@ public final class InteropTest {
         var probes = Remote.probeEndpoints(credentials);
         check(probes.size() == 1 && probes.get(0).tlsOk && probes.get(0).rttMs != null,
               "Java probe verifies TLS and authenticated ping RTT");
+        TransferPacer pacer = TransferPacer.SHARED;
+        pacer.sample(2.85);
+        for (int i=0;i<50;i++) pacer.sample(60);
+        check(pacer.rate() == TransferPacer.UNLIMITED,
+              "Public RTT following LAN cannot cap subsequent TLS transfers");
+        double beforeProbe = pacer.latestRtt;
+        var measured = NetworkProbe.measure(credentials,new AtomicBoolean());
+        check(measured.minMillis>0 && measured.maxMillis>=measured.minMillis,
+              "Network diagnostics measure real authenticated RTT");
+        check(pacer.latestRtt == beforeProbe && pacer.rate() == TransferPacer.UNLIMITED,
+              "Running diagnostics has no side effect on file pacing");
         boolean pinDenied = false;
         try (Remote ignored =
                  new Remote(new Remote.Credentials("127.0.0.1", 47449, "0".repeat(64), token), 1, 3)) {

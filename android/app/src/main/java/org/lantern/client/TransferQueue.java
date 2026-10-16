@@ -94,22 +94,8 @@ final class TransferQueue implements AutoCloseable {
             storageError = "任务记录无法恢复，请保留数据并检查：" + e.getMessage();
             status(storageError);
         }
-        probes.scheduleWithFixedDelay(() -> {
-            pump();
-            Task task = running;
-            Remote.Credentials c = credentials;
-            if (task == null || !matches(task, c))
-                return;
-            try (Remote r = new Remote(c, 0, 0)) {
-                long start = System.nanoTime();
-                long nonce = start;
-                DataInputStream reply = Remote.reader(r.call(50, Remote.body(o -> o.writeLong(nonce))));
-                if (reply.readLong() != nonce || reply.available() != 0)
-                    throw new IOException("网络探测响应错误");
-                TransferPacer.SHARED.sample((System.nanoTime() - start) / 1e6);
-            } catch (Exception ignored) {
-            }
-        }, 1, 1, TimeUnit.SECONDS);
+        // Keep retry scheduling, without opening an extra TLS/ping connection each second.
+        probes.scheduleWithFixedDelay(this::pump, 1, 1, TimeUnit.SECONDS);
     }
     void attach(MainActivity ui){activity=new java.lang.ref.WeakReference<>(ui);}
     void detach(MainActivity ui){if(activity.get()==ui)activity.clear();}

@@ -17,7 +17,7 @@ final class NetworkProbe {
                 if(cancel.get())throw new IOException("诊断已取消");
                 long nonce=System.nanoTime();DataInputStream reply=Remote.reader(r.call(50,Remote.body(o->o.writeLong(nonce))));
                 if(reply.readLong()!=nonce||reply.available()!=0)throw new IOException("网络探测响应不匹配");
-                samples[i]=(System.nanoTime()-nonce)/1e6;TransferPacer.SHARED.sample(samples[i]);
+                samples[i]=(System.nanoTime()-nonce)/1e6;
                 if(i+1<samples.length)Thread.sleep(100);
             }
             Arrays.sort(samples);return new Result(connect,samples);

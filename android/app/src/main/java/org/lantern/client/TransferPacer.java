@@ -2,32 +2,35 @@ package org.lantern.client;
 import java.io.IOException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/** Shared bulk gate: bounded bursts, one queue, RTT feedback and explicit media reservation. */
+/** Optional user-selected bulk limit. TCP controls congestion; RTT is telemetry only. */
 final class TransferPacer {
     static final TransferPacer SHARED = new TransferPacer();
-    volatile long userLimit = 32L * 1024 * 1024;
+    // The existing UI stores 32 MiB/s for its "no additional limit" choice.
+    // Keep that preferences value, but do not sleep or impose a ceiling for it.
+    static final long UNLIMITED = 32L * 1024 * 1024;
+    volatile long userLimit = UNLIMITED;
+    // Retained for existing UI/provider callers; media activity never reduces the rate.
     volatile boolean realtime, movie;
-    volatile double baseRtt, latestRtt;
-    long adaptive = 32L * 1024 * 1024, next;
+    volatile double latestRtt;
+    long next;
     synchronized void sample(double milliseconds) {
         if (milliseconds <= 0 || !Double.isFinite(milliseconds))
             return;
         latestRtt = milliseconds;
-        if (baseRtt == 0 || milliseconds < baseRtt)
-            baseRtt = milliseconds;
-        if (milliseconds > baseRtt + 15)
-            adaptive = Math.max(256 * 1024, adaptive / 2);
-        else
-            adaptive = Math.min(32L * 1024 * 1024, adaptive + 256 * 1024);
     }
     synchronized long rate() {
-        return Math.min(userLimit, Math.min(adaptive, movie      ? 2L * 1024 * 1024
-                                                      : realtime ? 4L * 1024 * 1024
-                                                                 : 32L * 1024 * 1024));
+        // Legacy numeric presentation API. UNLIMITED is a selection, not a measured rate.
+        return userLimit > 0 ? userLimit : UNLIMITED;
     }
     void acquire(int bytes, AtomicBoolean cancel) throws Exception {
+        if (cancel.get())
+            throw new IOException("传输已暂停，进度保留");
         long due;
         synchronized (this) {
+            if (userLimit <= 0 || userLimit >= UNLIMITED) {
+                next = 0;
+                return;
+            }
             long now = System.nanoTime();
             long cost = bytes * 1_000_000_000L / rate();
             next = Math.max(now, next) + cost;
@@ -36,6 +39,10 @@ final class TransferPacer {
         while (System.nanoTime() < due) {
             if (cancel.get())
                 throw new IOException("传输已暂停，进度保留");
+            if (userLimit <= 0 || userLimit >= UNLIMITED) {
+                synchronized (this) { next = 0; }
+                return;
+            }
             Thread.sleep(Math.min(20, Math.max(1, (due - System.nanoTime()) / 1_000_000)));
         }
     }
