@@ -11,16 +11,18 @@ import java.util.*;
 public final class PairingLink {
     public final String hostName, pin, code;
     public final List<String> addresses;
+    public final List<ConnectionEndpoint> endpoints;
     public final int port;
     public final long expiresAt;
-    private PairingLink(String name, List<String> addresses, int port, String pin, String code,
-                        long expires) {
+    private PairingLink(String name, List<String> addresses, int port, String pin, String code, long expires,
+                        List<ConnectionEndpoint> endpoints) {
         hostName = name;
         this.addresses = Collections.unmodifiableList(addresses);
         this.port = port;
         this.pin = pin;
         this.code = code;
         expiresAt = expires;
+        this.endpoints = Collections.unmodifiableList(endpoints);
     }
     static boolean validLabel(String text) {
         if (text == null || text.isEmpty())
@@ -101,7 +103,7 @@ public final class PairingLink {
                     return null;
                 fields.put(key, decode(item.substring(eq + 1)));
             }
-            if (fields.size() != 7 || !"1".equals(fields.get("v")))
+            if (fields.size() != 7 || !("1".equals(fields.get("v")) || "2".equals(fields.get("v"))))
                 return null;
             String name = fields.get("n"), pin = fields.get("f").toLowerCase(Locale.ROOT),
                    code = fields.get("c");
@@ -111,12 +113,50 @@ public final class PairingLink {
                 expires > 4102444800L)
                 return null;
             List<String> addresses = new ArrayList<>();
+            List<ConnectionEndpoint> endpoints = new ArrayList<>();
+            int domains = 0;
             for (String a : fields.get("a").split(",", -1)) {
-                if (!validAddress(a) || addresses.size() >= 8 || addresses.contains(a))
+                String host = a;
+                boolean valid = validAddress(a);
+                int endpointPort = (int)port;
+                if ("2".equals(fields.get("v"))) {
+                    String suffix = "";
+                    if (a.startsWith("[")) {
+                        int end = a.indexOf(']');
+                        if (end < 0)
+                            return null;
+                        host = a.substring(1, end);
+                        suffix = a.substring(end + 1);
+                        byte[] numeric = ConnectionEndpoint.numeric(host);
+                        valid = numeric != null && numeric.length == 16 && ConnectionEndpoint.validHost(host);
+                    } else {
+                        int colon = a.indexOf(':');
+                        host = colon < 0 ? a : a.substring(0, colon);
+                        suffix = colon < 0 ? "" : a.substring(colon);
+                        valid = validAddress(host);
+                        if (ConnectionEndpoint.hostname(host))
+                            valid = ++domains <= 1;
+                    }
+                    if (!suffix.isEmpty()) {
+                        if (!suffix.startsWith(":"))
+                            return null;
+                        long p = number(suffix.substring(1));
+                        if (p < 1 || p > 65535)
+                            return null;
+                        endpointPort = (int)p;
+                    }
+                    host = ConnectionEndpoint.normalize(host);
+                }
+                boolean duplicate = false;
+                for (ConnectionEndpoint e : endpoints)
+                    if (e.host.equals(host) && e.port == endpointPort)
+                        duplicate = true;
+                if (!valid || addresses.size() >= 8 || duplicate)
                     return null;
-                addresses.add(a);
+                addresses.add(host);
+                endpoints.add(ConnectionEndpoint.of(host, endpointPort));
             }
-            return new PairingLink(name, addresses, (int)port, pin, code, expires);
+            return new PairingLink(name, addresses, (int)port, pin, code, expires, endpoints);
         } catch (Exception ignored) {
             return null;
         }

@@ -114,6 +114,8 @@ if(WIN32)
         "${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/java/org/lantern/client/Native.java"
         "${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/java/org/lantern/client/Remote.java"
         "${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/java/org/lantern/client/PairingLink.java"
+        "${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/java/org/lantern/client/ConnectionEndpoint.java"
+        "${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/java/org/lantern/client/NetworkDialer.java"
         "${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/java/org/lantern/client/FileItem.java"
         "${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/java/org/lantern/client/TransferPacer.java"
         "${CMAKE_CURRENT_SOURCE_DIR}/android/app/src/main/java/org/lantern/client/RetryPolicy.java"

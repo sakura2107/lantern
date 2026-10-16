@@ -28,120 +28,89 @@ final class Remote implements AutoCloseable {
             reason = r;
         }
     }
-    private static final class PairPinException extends java.security.cert.CertificateException {}
     /** Blocking worker-thread API. Does not alter the existing HELLO/credential constructors. */
     static Credentials pair(PairingLink link, String deviceLabel) throws PairingException {
         if (link == null || link.expiresAt <= System.currentTimeMillis() / 1000 ||
             !PairingLink.validLabel(deviceLabel))
             throw new PairingException(PairFailure.INVALID_LINK,
                                        "配对链接无效或已过期，或设备名称超过64字节");
-        boolean pinFailed = false;
-        for (String host : link.addresses) {
-            java.net.Socket raw = new java.net.Socket();
-            SSLSocket tls = null;
-            boolean sent = false;
+        List<ConnectionEndpoint> endpoints = link.endpoints;
+        NetworkDialer.Result connected;
+        try {
+            connected = NetworkDialer.connect(endpoints, link.pin, 10000, null);
+        } catch (NetworkDialer.ConnectException error) {
+            throw new PairingException(error.reason == NetworkDialer.Failure.PIN_MISMATCH
+                                           ? PairFailure.PIN_MISMATCH
+                                           : PairFailure.UNREACHABLE,
+                                       error.reason == NetworkDialer.Failure.PIN_MISMATCH
+                                           ? "主机证书指纹不匹配，请核对二维码"
+                                           : "所有地址均无法连接，请检查网络和防火墙");
+        } catch (Exception error) {
+            throw new PairingException(PairFailure.UNREACHABLE, "无法连接主机");
+        }
+        java.net.Socket raw = connected.transport;
+        SSLSocket tls = connected.tls;
+        boolean sent = false;
+        try {
+            DataOutputStream out = new DataOutputStream(tls.getOutputStream());
+            byte[] packet = body(o -> {
+                o.writeShort(1);
+                o.writeShort(55);
+                str(o, link.code);
+                str(o, deviceLabel);
+            });
+            sent = true;
+            out.writeInt(packet.length);
+            out.write(packet);
+            out.flush();
+            DataInputStream input = new DataInputStream(tls.getInputStream());
+            int count = input.readInt();
+            if (count < 8 || count > 2048)
+                throw new PairingException(PairFailure.PROTOCOL_ERROR, "主机配对响应无效");
+            byte[] bytes = new byte[count];
+            input.readFully(bytes);
+            DataInputStream reply = reader(bytes);
+            int version = reply.readUnsignedShort(), op = reply.readUnsignedShort(), error = reply.readInt();
+            if (error == 6 && (op == 55 || op == 1))
+                throw new PairingException(PairFailure.HOST_TOO_OLD, "主机版本过旧，请更新电脑端");
+            if (version != 1 || op != 55)
+                throw new PairingException(PairFailure.PROTOCOL_ERROR, "主机配对响应无效");
+            if (error != 0) {
+                str(reply);
+                if (reply.available() != 0)
+                    throw new IOException();
+                if (error == 2)
+                    throw new PairingException(PairFailure.INVALID_INVITE,
+                                               "配对码无效或已过期，请在电脑刷新二维码");
+                if (error == 8)
+                    throw new PairingException(PairFailure.BUSY, "配对尝试过于频繁或设备已满，请稍后重试");
+                throw new PairingException(PairFailure.PROTOCOL_ERROR, "主机拒绝配对请求");
+            }
+            String id = str(reply), token = str(reply);
+            int scopes = reply.readInt();
+            if (!id.matches("[0-9a-f]{64}") || !token.matches("[0-9a-f]{64}") || scopes < 1 || scopes > 31 ||
+                reply.available() != 0)
+                throw new PairingException(PairFailure.PROTOCOL_ERROR, "主机配对响应无效");
+            return new Credentials(connected.selected.host, connected.selected.port, link.pin, token,
+                                   endpoints);
+        } catch (PairingException error) {
+            throw error;
+        } catch (Exception error) {
+            if (sent)
+                throw new PairingException(PairFailure.OUTCOME_UNKNOWN,
+                                           "配对响应中断，结果无法确认；请检查电脑设备列表并重新生成邀请");
+            throw new PairingException(PairFailure.PROTOCOL_ERROR, "配对请求无法完成");
+        } finally {
             try {
-                raw.connect(new java.net.InetSocketAddress(host, link.port), 10000);
-                raw.setTcpNoDelay(true);
-                raw.setSoTimeout(15000);
-                X509TrustManager verifier = new X509TrustManager() {
-                    public X509Certificate[] getAcceptedIssuers() {
-                        return new X509Certificate[0];
-                    }
-                    public void checkClientTrusted(X509Certificate[] c, String a)
-                        throws java.security.cert.CertificateException {
-                        throw new PairPinException();
-                    }
-                    public void checkServerTrusted(X509Certificate[] chain, String auth)
-                        throws java.security.cert.CertificateException {
-                        try {
-                            if (chain.length == 0)
-                                throw new PairPinException();
-                            chain[0].checkValidity();
-                            String actual =
-                                hex(MessageDigest.getInstance("SHA-256").digest(chain[0].getEncoded()));
-                            if (!MessageDigest.isEqual(actual.getBytes(StandardCharsets.US_ASCII),
-                                                       link.pin.getBytes(StandardCharsets.US_ASCII)))
-                                throw new PairPinException();
-                        } catch (Exception ignored) {
-                            throw new PairPinException();
-                        }
-                    }
-                };
-                TrustManager[] trust = {verifier};
-                SSLContext context = SSLContext.getInstance("TLSv1.2");
-                context.init(null, trust, new SecureRandom());
-                tls = (SSLSocket)context.getSocketFactory().createSocket(raw, host, link.port, true);
-                tls.setSoTimeout(15000);
-                tls.setEnabledProtocols(new String[] {"TLSv1.2"});
-                tls.startHandshake();
-                DataOutputStream out = new DataOutputStream(tls.getOutputStream());
-                byte[] packet = body(o -> {
-                    o.writeShort(1);
-                    o.writeShort(55);
-                    str(o, link.code);
-                    str(o, deviceLabel);
-                });
-                sent = true;
-                out.writeInt(packet.length);
-                out.write(packet);
-                out.flush();
-                DataInputStream input = new DataInputStream(tls.getInputStream());
-                int count = input.readInt();
-                if (count < 8 || count > 2048)
-                    throw new PairingException(PairFailure.PROTOCOL_ERROR, "主机配对响应无效");
-                byte[] bytes = new byte[count];
-                input.readFully(bytes);
-                DataInputStream reply = reader(bytes);
-                int version = reply.readUnsignedShort(), op = reply.readUnsignedShort(),
-                    error = reply.readInt();
-                if (error == 6 && (op == 55 || op == 1))
-                    throw new PairingException(PairFailure.HOST_TOO_OLD, "主机版本过旧，请更新电脑端");
-                if (version != 1 || op != 55)
-                    throw new PairingException(PairFailure.PROTOCOL_ERROR, "主机配对响应无效");
-                if (error != 0) {
-                    str(reply);
-                    if (reply.available() != 0)
-                        throw new IOException();
-                    if (error == 2)
-                        throw new PairingException(PairFailure.INVALID_INVITE,
-                                                   "配对码无效或已过期，请在电脑刷新二维码");
-                    if (error == 8)
-                        throw new PairingException(PairFailure.BUSY,
-                                                   "配对尝试过于频繁或设备已满，请稍后重试");
-                    throw new PairingException(PairFailure.PROTOCOL_ERROR, "主机拒绝配对请求");
-                }
-                String id = str(reply), token = str(reply);
-                int scopes = reply.readInt();
-                if (!id.matches("[0-9a-f]{64}") || !token.matches("[0-9a-f]{64}") || scopes < 1 ||
-                    scopes > 31 || reply.available() != 0)
-                    throw new PairingException(PairFailure.PROTOCOL_ERROR, "主机配对响应无效");
-                return new Credentials(host, link.port, link.pin, token);
-            } catch (PairingException error) {
-                throw error;
-            } catch (Exception error) {
-                for (Throwable cause = error; cause != null; cause = cause.getCause())
-                    if (cause instanceof PairPinException)
-                        pinFailed = true;
-                if (sent)
-                    throw new PairingException(
-                        PairFailure.OUTCOME_UNKNOWN,
-                        "配对响应中断，结果无法确认；请检查电脑设备列表并重新生成邀请");
-            } finally {
+                raw.close();
+            } catch (IOException ignored) {
+            }
+            if (tls != null)
                 try {
-                    raw.close();
+                    tls.close();
                 } catch (IOException ignored) {
                 }
-                if (tls != null)
-                    try {
-                        tls.close();
-                    } catch (IOException ignored) {
-                    }
-            }
         }
-        throw new PairingException(pinFailed ? PairFailure.PIN_MISMATCH : PairFailure.UNREACHABLE,
-                                   pinFailed ? "主机证书指纹不匹配，请重新核对二维码"
-                                             : "所有地址均无法连接，请检查同一局域网和防火墙");
     }
     static final class TransportError extends IOException {
         TransportError(IOException cause){super("连接中断："+cause.getClass().getSimpleName(),cause);}
@@ -155,18 +124,46 @@ final class Remote implements AutoCloseable {
         final int port;
         /** True only for the connection the user starts with “连接电脑”; everything else is automatic. */
         final boolean deliberate;
+        final List<ConnectionEndpoint> endpoints;
         Credentials(String h, String p, String t) {
             this(h, 47443, p, t);
         }
         Credentials(String h, int number, String p, String t) { this(h, number, p, t, false); }
         private Credentials(String h, int number, String p, String t, boolean d) {
+            this(h, number, p, t, d, Collections.emptyList());
+        }
+        Credentials(String h, int number, String p, String t, List<ConnectionEndpoint> list) {
+            this(h, number, p, t, false, list);
+        }
+        private Credentials(String h, int number, String p, String t, boolean d,
+                            List<ConnectionEndpoint> list) {
             host = h;
             port = number;
             pin = p;
             token = t;
             deliberate = d;
+            endpoints =
+                ConnectionEndpoint.merge(Collections.emptyList(), list, System.currentTimeMillis() / 1000);
         }
-        Credentials asDeliberate() { return new Credentials(host, port, pin, token, true); }
+        Credentials asDeliberate() {
+            return new Credentials(host, port, pin, token, true, endpoints);
+        }
+        Credentials mergeEndpoints(List<ConnectionEndpoint> fresh) {
+            return new Credentials(
+                host, port, pin, token, deliberate,
+                ConnectionEndpoint.merge(endpoints, fresh, System.currentTimeMillis() / 1000));
+        }
+        String saveEndpointPreferences() {
+            return ConnectionEndpoint.savePreferences(endpoints);
+        }
+        Credentials loadEndpointPreferences(String value) {
+            return new Credentials(host, port, pin, token, deliberate,
+                                   ConnectionEndpoint.loadPreferences(value));
+        }
+        List<ConnectionEndpoint> candidates() {
+            return endpoints.isEmpty() ? Collections.singletonList(ConnectionEndpoint.of(host, port))
+                                       : endpoints;
+        }
     }
     /** Host (by certificate pin) that advertised session=end-v1, i.e. accepts the HELLO flags field. */
     static volatile String sessionEndPin;
@@ -201,38 +198,24 @@ final class Remote implements AutoCloseable {
     final SSLSocket socket;
     final DataInputStream input;
     final DataOutputStream output;
+    final ConnectionEndpoint selectedEndpoint;
+    final boolean publicPath;
+    final List<NetworkDialer.Probe> connectionAttempts;
     interface SocketReady { void opened(java.net.Socket transport) throws IOException; }
     Remote(Credentials c, int scopes, int lane) throws Exception { this(c, scopes, lane, null); }
     Remote(Credentials c, int scopes, int lane, SocketReady opening) throws Exception {
         credentials=c;grantedScopes=scopes;
         if (!c.pin.matches("[0-9a-f]{64}")) throw new IOException("请核对主机 SHA256 指纹");
-        TrustManager[] trust = {new X509TrustManager() {
-            public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
-            public void checkClientTrusted(X509Certificate[] chain, String algorithm) throws java.security.cert.CertificateException {
-                throw new java.security.cert.CertificateException("Client trust unsupported");
-            }
-            public void checkServerTrusted(X509Certificate[] chain, String algorithm) throws java.security.cert.CertificateException {
-                try {
-                    if (chain.length == 0) throw new GeneralSecurityException("No certificate");
-                    chain[0].checkValidity();
-                    String actual = hex(MessageDigest.getInstance("SHA-256").digest(chain[0].getEncoded()));
-                    if (!MessageDigest.isEqual(actual.getBytes(StandardCharsets.US_ASCII), c.pin.getBytes(StandardCharsets.US_ASCII)))
-                        throw new GeneralSecurityException("主机证书指纹不匹配");
-                } catch (Exception error) { throw new java.security.cert.CertificateException(error); }
-            }
-        }};
-        SSLContext context = SSLContext.getInstance("TLSv1.2");
-        context.init(null, trust, new SecureRandom());
-        transport = new java.net.Socket();
+        NetworkDialer.Result connected =
+            c.endpoints.isEmpty() ? NetworkDialer.connectLegacy(c.host, c.port, c.pin, 10000, opening)
+                                  : NetworkDialer.connect(c.candidates(), c.pin, 10000, opening);
+        transport = connected.transport;
+        selectedEndpoint = connected.selected;
+        publicPath = connected.publicPath;
+        connectionAttempts = connected.attempts;
         SSLSocket connecting = null;
         try {
-            if (opening != null) opening.opened(transport);
-            transport.connect(new java.net.InetSocketAddress(c.host, c.port), 10000);
-            transport.setTcpNoDelay(true);
-            socket = connecting = (SSLSocket)context.getSocketFactory().createSocket(transport, c.host, c.port, true);
-            socket.setSoTimeout(15000);
-            socket.setEnabledProtocols(new String[] {"TLSv1.2"});
-            socket.startHandshake();
+            socket = connecting = connected.tls;
             input = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 65536));
             output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), CHUNK + 1024));
             // The flags field is only sent to hosts that advertised session=end-v1; older hosts reject it.
@@ -242,11 +225,45 @@ final class Remote implements AutoCloseable {
                 if (flags) o.writeInt(c.deliberate ? 0 : HELLO_AUTOMATIC);
             }));
             if (reader(answer).readInt() != scopes) throw new IOException("权限不匹配");
+            socket.setSoTimeout(15000);
         } catch (Exception error) {
             transport.close();
             if (connecting != null) try { connecting.close(); } catch (IOException ignored) {}
             throw error;
         }
+    }
+    List<ConnectionEndpoint> endpoints() throws Exception {
+        if (!str(reader(call(30, new byte[0]))).contains(";endpoints=v1"))
+            return Collections.emptyList();
+        DataInputStream r = reader(call(56, new byte[0]));
+        if (r.readInt() != 1)
+            throw new IOException("入口协议版本无效");
+        List<ConnectionEndpoint> out = ConnectionEndpoint.read(r);
+        if (r.available() != 0)
+            throw new IOException("入口响应无效");
+        return out;
+    }
+    static List<NetworkDialer.Probe> probeEndpoints(Credentials c) throws Exception {
+        List<NetworkDialer.Probe> reports = new ArrayList<>();
+        for (ConnectionEndpoint e : c.candidates()) {
+            long start = System.nanoTime();
+            try (Remote remote = new Remote(
+                     new Credentials(e.host, e.port, c.pin, c.token, Collections.singletonList(e)), 0, 0)) {
+                long begin = System.nanoTime(), nonce = begin;
+                DataInputStream r = reader(remote.call(50, body(o -> o.writeLong(nonce))));
+                if (r.readLong() != nonce || r.available() != 0)
+                    throw new IOException("诊断响应无效");
+                reports.add(new NetworkDialer.Probe(e, null, (begin - start) / 1000000, 0, true, true,
+                                                    (System.nanoTime() - begin) / 1000000));
+            } catch (NetworkDialer.ConnectException error) {
+                reports.addAll(error.attempts);
+            } catch (Exception error) {
+                reports.add(new NetworkDialer.Probe(e, NetworkDialer.Failure.TRANSPORT,
+                                                    (System.nanoTime() - start) / 1000000, 0, false, false,
+                                                    null));
+            }
+        }
+        return reports;
     }
     // Cancellation only closes the raw socket. No TLS close_notify writes on the UI thread.
     void abort() throws IOException { transport.close(); }
