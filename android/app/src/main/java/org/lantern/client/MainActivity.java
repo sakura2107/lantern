@@ -641,7 +641,9 @@ public final class MainActivity extends Activity {
                 diagRow(grid,S.DIAG_HANDSHAKE,String.format(Locale.ROOT,"%.1f ms",measured.handshakeMillis));
                 diagRow(grid,S.DIAG_RTT_MEDIAN,String.format(Locale.ROOT,"%.1f ms",measured.medianMillis));
                 diagRow(grid,S.DIAG_RTT_RANGE,String.format(Locale.ROOT,"%.1f – %.1f ms",measured.minMillis,measured.maxMillis));
-                diagRow(grid,S.DIAG_LIMIT,String.format(Locale.ROOT,"%.1f MiB/s",TransferPacer.SHARED.rate()/1048576.0));
+                TransferPacer pacer=TransferPacer.SHARED;double down=pacer.down.rate(),up=pacer.up.rate();
+                diagRow(grid,S.DIAG_SPEED,down+up<1024?S.DIAG_IDLE:String.format(Locale.ROOT,S.QUEUE_SPEED,Ui.rate(down),Ui.rate(up)));
+                if(pacer.limited())diagRow(grid,S.LIMIT_TITLE,Ui.limit(pacer.userLimit));
                 sheet.view(grid).view(Sheet.paragraph(this,S.DIAG_NOTE));
                 if(entries.size()>1){
                     LinearLayout list=Ui.column(this);list.setPadding(Theme.dp(16),Theme.dp(4),Theme.dp(16),Theme.dp(4));

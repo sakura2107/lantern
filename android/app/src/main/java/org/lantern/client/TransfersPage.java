@@ -142,7 +142,6 @@ final class TransfersPage {
         }
         Set<String> alive = new HashSet<>();
         int moving = 0, waiting = 0, attention = 0;
-        double totalRate = 0;
         anyPausable = false; anyResumable = false;
         for (TaskItem t : next) {
             alive.add(t.id);
@@ -156,7 +155,6 @@ final class TransfersPage {
                     sample.bytes = t.current; sample.at = now;
                 }
                 t.rate = sample.rate;
-                totalRate += sample.rate;
                 moving++;
             } else {
                 sample.rate = 0; sample.bytes = t.current; sample.at = now;
@@ -176,14 +174,17 @@ final class TransfersPage {
         else headline.setText(S.QUEUE_QUIET);
         TransferPacer pacer = TransferPacer.SHARED;
         StringBuilder d = new StringBuilder();
-        if (moving > 0) d.append(String.format(Locale.ROOT, S.QUEUE_RATE, Ui.rate(totalRate))).append('\n');
-        d.append(String.format(Locale.ROOT, S.QUEUE_LIMIT, Ui.limit(pacer.rate())));
-        if (pacer.latestRtt > 0) d.append(String.format(Locale.ROOT, S.QUEUE_RTT, pacer.latestRtt));
-        if (pacer.realtime) d.append(S.QUEUE_REALTIME);
+        // Measured speed per direction; a cap is mentioned only when the user chose one.
+        if (moving > 0) {
+            d.append(String.format(Locale.ROOT, S.QUEUE_SPEED, Ui.rate(pacer.down.rate()), Ui.rate(pacer.up.rate())));
+            if (pacer.limited()) d.append(String.format(Locale.ROOT, S.QUEUE_LIMIT, Ui.limit(pacer.userLimit)));
+        }
+        if (pacer.latestRtt > 0) d.append(d.length() > 0 ? "\n" : "").append(String.format(Locale.ROOT, S.QUEUE_RTT, pacer.latestRtt));
         detail.setText(d);
-        // The effective cap is in the line above; the button stays short so all three fit at large font scales.
+        detail.setVisibility(d.length() > 0 ? View.VISIBLE : View.GONE);
+        // The button stays short so all three fit at large font scales.
         limit.setText(S.LIMIT_SHORT);
-        limit.setContentDescription(String.format(Locale.ROOT, S.LIMIT_BUTTON, Ui.limit(pacer.userLimit)));
+        limit.setContentDescription(String.format(Locale.ROOT, S.LIMIT_BUTTON, limitText(pacer)));
         pauseAll.setText(anyPausable || !anyResumable ? S.PAUSE_ALL : S.RESUME_ALL);
         pauseAll.setEnabled(anyPausable || anyResumable);
         boolean finished = false;
@@ -326,13 +327,18 @@ final class TransfersPage {
         }));
     }
 
+    static String limitText(TransferPacer pacer) {
+        return pacer.limited() ? Ui.limit(pacer.userLimit) : S.LIMIT_NONE;
+    }
     void showLimit() {
-        long[] mib = {1, 4, 16, 32};
+        // UNLIMITED keeps its stored 32 MiB/s value so existing preferences still read as “不限速”.
+        long[] choices = {TransferPacer.UNLIMITED, 16L << 20, 4L << 20, 1L << 20};
         TransferPacer pacer = TransferPacer.SHARED;
-        Sheet sheet = new Sheet(a, S.LIMIT_TITLE, String.format(Locale.ROOT, S.LIMIT_DETAIL, Ui.limit(pacer.rate())));
-        for (long m : mib) {
-            long bytes = m * 1024 * 1024;
-            sheet.option(m + " MiB/s", m == 32 ? S.LIMIT_MAX : null, pacer.userLimit == bytes, () -> {
+        Sheet sheet = new Sheet(a, S.LIMIT_TITLE, String.format(Locale.ROOT, S.LIMIT_DETAIL, limitText(pacer)));
+        for (long bytes : choices) {
+            boolean none = bytes == TransferPacer.UNLIMITED;
+            boolean chosen = none ? !pacer.limited() : pacer.userLimit == bytes;
+            sheet.option(none ? S.LIMIT_NONE : Ui.limit(bytes), none ? S.LIMIT_NONE_DETAIL : null, chosen, () -> {
                 pacer.userLimit = bytes;
                 a.getSharedPreferences("device", 0).edit().putLong("transfer_limit", bytes).apply();
                 a.renderTransfers();

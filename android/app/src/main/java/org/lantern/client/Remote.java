@@ -464,6 +464,7 @@ void download(String path, File dest, AtomicBoolean cancel, Progress progress) t
                 throw new IOException("源文件意外结束");
             out.write(b);
             out.getFD().sync();
+            TransferPacer.SHARED.down.add(b.length);
             offset += b.length;
             progress.update(offset, f.size);
         }
@@ -499,7 +500,7 @@ void upload(UploadSource source,String path,AtomicBoolean cancel,Progress progre
     DataInputStream ack=reader(call(5,body(o->{str(o,path);o.writeLong(size);str(o,hash);})));String id=str(ack);long offset=ack.readLong();if(offset<0||offset>size||!id.matches("[0-9a-f]{64}")||ack.available()!=0)throw new IOException("上传恢复信息无效");
     source.seek(offset);byte[] buffer=new byte[CHUNK];progress.update(offset,size);
     while(offset<size){if(cancel.get())throw new IOException("已取消；远端暂存保留");int count=source.read(buffer,(int)Math.min(CHUNK,size-offset));if(count<=0)throw new IOException("源文件长度变化");TransferPacer.SHARED.acquire(count,cancel);long current=offset;
-        DataInputStream answer=reader(call(6,body(o->{str(o,id);o.writeLong(current);o.writeInt(count);o.write(buffer,0,count);})));long next=answer.readLong();if(next!=offset+count||answer.available()!=0)throw new IOException("上传确认偏移错误");offset=next;progress.update(offset,size);
+        DataInputStream answer=reader(call(6,body(o->{str(o,id);o.writeLong(current);o.writeInt(count);o.write(buffer,0,count);})));long next=answer.readLong();if(next!=offset+count||answer.available()!=0)throw new IOException("上传确认偏移错误");TransferPacer.SHARED.up.add(count);offset=next;progress.update(offset,size);
     }
     source.validate();if(cancel.get())throw new IOException("已取消，远端暂存已保留");call(7,body(o->str(o,id)));
 }

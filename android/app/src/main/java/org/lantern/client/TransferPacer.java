@@ -13,6 +13,27 @@ final class TransferPacer {
     volatile boolean realtime, movie;
     volatile double latestRtt;
     long next;
+    /** Bytes file transfers actually moved, per direction: what the speed lines show instead of a cap. */
+    static final class Meter {
+        static final long SLOT = 500_000_000L; // ns
+        static final int SLOTS = 6;
+        final long[] slot = new long[SLOTS], count = new long[SLOTS];
+        synchronized void add(long bytes) {
+            long s = System.nanoTime() / SLOT;
+            int i = (int)(s % SLOTS);
+            if (slot[i] != s) { slot[i] = s; count[i] = 0; }
+            count[i] += bytes;
+        }
+        /** Bytes per second over the last complete 2.5 s; the slot still filling is left out. */
+        synchronized double rate() {
+            long s = System.nanoTime() / SLOT, sum = 0;
+            for (int i = 0; i < SLOTS; i++)
+                if (slot[i] < s && slot[i] > s - SLOTS) sum += count[i];
+            return sum * 1e9 / (SLOT * (SLOTS - 1));
+        }
+    }
+    final Meter down = new Meter(), up = new Meter();
+    boolean limited() { long l = userLimit; return l > 0 && l < UNLIMITED; }
     synchronized void sample(double milliseconds) {
         if (milliseconds <= 0 || !Double.isFinite(milliseconds))
             return;

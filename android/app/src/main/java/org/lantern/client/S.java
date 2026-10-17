@@ -77,7 +77,7 @@ final class S {
     static final String DIAG_RUNNING = "正在测量 5 次加密往返，请稍候…";
     static final String DIAG_TITLE = "网络诊断", DIAG_SUBTITLE = "手机用%s，经 %s";
     static final String DIAG_HANDSHAKE = "TLS 与身份验证", DIAG_RTT_MEDIAN = "往返延迟（中位）", DIAG_RTT_RANGE = "往返延迟范围",
-                        DIAG_LIMIT = "当前文件传输上限";
+                        DIAG_SPEED = "文件传输速度", DIAG_IDLE = "当前没有传输";
     static final String DIAG_NOTE = "往返延迟包含主机处理时间，不代表可用带宽。使用移动网络时，局域网地址通常无法访问。";
 
     // Desktop page
@@ -184,10 +184,9 @@ final class S {
     // Transfers page
     static final String QUEUE_IDLE = "没有传输任务", QUEUE_QUIET = "没有进行中的传输";
     static final String QUEUE_MOVING = "%d 项正在传输", QUEUE_WAITING = "%d 项等待中", QUEUE_ATTENTION = "%d 项需要处理";
-    static final String QUEUE_RATE = "当前速度 %s";
-    static final String QUEUE_LIMIT = "生效上限 %s";
-    static final String QUEUE_RTT = "，网络往返 %.1f ms";
-    static final String QUEUE_REALTIME = "\n画面或声音开启时，文件传输会自动让出带宽";
+    static final String QUEUE_SPEED = "下载 %s · 上传 %s";
+    static final String QUEUE_LIMIT = "，已限速 %s";
+    static final String QUEUE_RTT = "网络往返 %.1f ms";
     static final String LIMIT_BUTTON = "限速 %s", LIMIT_SHORT = "限速";
     static final String PAUSE_ALL = "全部暂停", RESUME_ALL = "全部继续", CLEAR_DONE = "清理已完成";
     static final String PAUSED_BY_USER = "已手动暂停", PAUSED_ALL = "已暂停全部任务，进度已保留", RESUMED_N = "已继续 %d 个任务";
@@ -215,8 +214,8 @@ final class S {
     static final String CONFLICT_NEW_NAME = "新名称", SAVE_AS = "另存";
     static final String CLEAR_TITLE = "清理已完成的任务？", CLEAR_DETAIL = "会删除手机里已完成的下载缓存，电脑上的原文件保留。";
     static final String CLEAR_CONFIRM = "清理";
-    static final String LIMIT_TITLE = "传输限速", LIMIT_DETAIL = "当前生效 %s。画面或声音开启时会自动进一步限制，保证实时流畅。";
-    static final String LIMIT_MAX = "不额外限制";
+    static final String LIMIT_TITLE = "传输限速", LIMIT_DETAIL = "默认不限速，速度由网络决定。只有想给其他应用留出带宽时才需要限速。当前：%s。";
+    static final String LIMIT_NONE = "不限速", LIMIT_NONE_DETAIL = "推荐";
 
     // Scan-to-pair
     static final String SCAN_PAIR = "扫码配对", PASTE_PAIR_LINK = "粘贴链接", CANCEL_SCAN = "取消";
