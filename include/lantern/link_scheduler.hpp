@@ -53,8 +53,13 @@ class LinkScheduler {
         if (!bytes || bytes > 32768)
             throw Error(Code::invalid, "TLS scheduler record bound");
         std::unique_lock lock(mutex_);
-        if (queue_.size() >= 64)
-            throw Error(Code::busy, "Link queue full");
+        // Each connection thread waits with at most one record, so a full queue only means many
+        // connections at once: wait for room instead of failing (which used to close control).
+        while (queue_.size() >= 64) {
+            if (cancelled())
+                throw Error(Code::cancelled, "Link send cancelled");
+            changed_.wait_for(lock, std::chrono::milliseconds(50));
+        }
         Pending p{flow, lane, bytes, std::max(virtual_, finish_[flow]) + double(bytes) / weight(lane)};
         queue_.push_back(&p);
         auto remove = [&] {

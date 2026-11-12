@@ -412,7 +412,9 @@ int wmain(int argc, wchar_t** argv) {
                 if (!uploaded)
                     uploaded = n;
             });
-            check(uploaded == chunk_size, "upload resumed offset");
+            // Chunks already on the wire when the cancel came are kept by the host (pipelined upload),
+            // so the resume starts at or after the first acknowledged chunk, never before it.
+            check(uploaded >= chunk_size && uploaded % chunk_size == 0, "upload resumed offset");
             check(hash_file(root / L"uploaded.bin") == hash, "upload verified");
             c.mutate(Op::mkdir, "folder");
             c.mutate(Op::copy, "source.bin", "folder/copy.bin");

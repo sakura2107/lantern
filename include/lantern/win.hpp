@@ -266,6 +266,7 @@ class Client {
     uint32_t scopes_;
     uint64_t transfer_bytes_=0;
     void hello(const std::string&, uint32_t, uint32_t);
+    void drain(Op, size_t answers) noexcept; // discard answers already on the wire (pipelined transfers)
 
   public:
     /** hello_flags: 1 = automatic reconnect (session=end-v1 hosts only; 0 sends the original HELLO). */

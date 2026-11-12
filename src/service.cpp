@@ -795,7 +795,10 @@ struct Host::Impl {
             opened.str("host-qpc-us");
         tls.send(opened.b);
         try {
-            DWORD ready_timeout = 15000, send_timeout = 300;
+            // One frame in flight: while a send is slow no new frame is captured, so the next one is
+            // the latest picture and delay does not pile up. Only ten seconds without any progress
+            // counts as a lost connection; a slow network no longer ends the stream.
+            DWORD ready_timeout = 15000, send_timeout = 10000;
             int send_buffer = 256 * 1024;
             setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ready_timeout, sizeof(ready_timeout));
             setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&send_timeout, sizeof(send_timeout));
@@ -830,8 +833,6 @@ struct Host::Impl {
                 packet.u32(frame.flags);
                 packet.blob(frame.annex_b);
                 tls.send(packet.b); // One encoded frame, bounded socket buffer; no unbounded sender queue.
-                if (std::chrono::steady_clock::now() - began > std::chrono::milliseconds(300))
-                    throw Error(Code::busy, "Desktop send stalled; reconnect at lower bitrate");
                 next_frame += frame_period;
                 auto now = std::chrono::steady_clock::now();
                 if (next_frame + frame_period < now)
@@ -887,7 +888,9 @@ struct Host::Impl {
         }
         tls.send(opened.b);
         try {
-            DWORD ready_timeout = 5000, send_timeout = 200;
+            // A slow network no longer ends the stream: capture drops stale audio and resumes live
+            // (audio.cpp). Only ten seconds without any progress counts as a lost connection.
+            DWORD ready_timeout = 5000, send_timeout = 10000;
             int buffer = 32 * 1024;
             setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ready_timeout, sizeof(ready_timeout));
             setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&send_timeout, sizeof(send_timeout));
@@ -923,10 +926,7 @@ struct Host::Impl {
                     packet.blob(encoder->encode(frame.pcm));
                 else
                     packet.blob(frame.pcm);
-                auto sending = std::chrono::steady_clock::now();
                 tls.send(packet.b);
-                if (std::chrono::steady_clock::now() - sending > std::chrono::milliseconds(200))
-                    throw Error(Code::busy, "Audio send stalled");
             }
         } catch (const Error& error) {
             try {

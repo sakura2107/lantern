@@ -22,7 +22,7 @@ final class SystemAudio {
     volatile boolean closed;
     volatile String failure="";
     volatile String encoding="PCM16LE";
-    final AtomicLong wireBytes=new AtomicLong();
+    final AtomicLong wireBytes=new AtomicLong(), droppedLate=new AtomicLong(); // packets skipped to catch up with live
     final AtomicLong reconnects=new AtomicLong();
     volatile boolean measureSamples; // Explicit debug validation only; production does not scan sample contents.
     volatile int sampleRate, underruns, performanceMode;
@@ -99,7 +99,7 @@ final class SystemAudio {
             boolean playing=false;long playStartedNs=0; AudioTimestamp timestamp=new AudioTimestamp();
             main.post(() -> { if(current(request)) events.started(rate); });
             remote.sendOnly(43,Remote.body(o -> o.writeInt(1)));
-            long sequence=-1,lastPts=-1,basePts=0,baseClock=0;
+            long sequence=-1,lastPts=-1,basePts=0,baseClock=0,behindSince=0; boolean resync=false;
             while(current(request)) {
                 DataInputStream packet=Remote.reader(remote.receive(42));
                 long next=packet.readLong(), pts=packet.readLong(); int flags=packet.readInt(); byte[] pcm=Remote.blob(packet,codec==1?1275:rate*4/100);
@@ -116,17 +116,26 @@ final class SystemAudio {
                 }
                 wireBytes.addAndGet(pcm.length);
                 if(decoder!=null){if((flags&1)!=0){decoder.hostOrigin=pts;decoder.decodedFrames=0;}pcm=decoder.decode(pcm,pts);if(pcm.length==0)continue;pts=decoder.outputHostPts;}
-                if(!anchored){firstHost=pts;firstFrame=writtenFrames;anchored=true;}
-                if((flags&1)!=0&&playing){track.stop();track.flush();playing=false;writtenFrames=0;firstHost=pts;firstFrame=0;lastPosition=0;positionEpoch=0;request.timeline.endAudio(owner);owner=request.timeline.beginAudio();}
                 long now=System.nanoTime(); if(firstPacketNs==0) firstPacketNs=now;
-                if(baseClock==0 || (flags&1)!=0) {baseClock=now; basePts=pts;}
-                if(now-baseClock-(pts-basePts)*1000>250_000_000L) throw new IOException("音频网络积压超过250ms，请重连");
+                // More than 250 ms behind live (the network held packets back): skip them so playback
+                // catches up instead of ending the stream. Behind for a whole second means the link is
+                // simply slower: accept the new delay. Either way the timeline restarts like a gap.
+                if(baseClock!=0 && (flags&1)==0 && now-baseClock-(pts-basePts)*1000>250_000_000L) {
+                    if(behindSince==0) behindSince=now;
+                    if(now-behindSince<1_000_000_000L) {droppedLate.incrementAndGet(); resync=true; continue;}
+                    resync=true;
+                }
+                behindSince=0;
+                boolean gap=(flags&1)!=0||resync; resync=false;
+                if(!anchored){firstHost=pts;firstFrame=writtenFrames;anchored=true;}
+                if(gap&&playing){track.stop();track.flush();playing=false;writtenFrames=0;firstHost=pts;firstFrame=0;lastPosition=0;positionEpoch=0;request.timeline.endAudio(owner);owner=request.timeline.beginAudio();}
+                if(baseClock==0 || gap) {baseClock=now; basePts=pts;}
                 long deadline=now+250_000_000L; int offset=0;
                 while(offset<pcm.length && current(request)) {
                     int count=track.write(pcm,offset,pcm.length-offset,AudioTrack.WRITE_NON_BLOCKING);
                     if(count<0) throw new IOException("手机音频输出失败："+count);
                     offset+=count;
-                    if(count==0) {if(System.nanoTime()>deadline) throw new IOException("手机音频输出阻塞"); Thread.sleep(2);}
+                    if(count==0) {if(System.nanoTime()>deadline) break; Thread.sleep(2);} // output stalled: drop the rest of this packet
                 }
                 pcmBytes.addAndGet(offset); writtenFrames+=offset/4;
                 if(!playing && writtenFrames>=rate*60/1000) {playStartedNs=System.nanoTime();track.play(); playing=true;}

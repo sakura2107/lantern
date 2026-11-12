@@ -1,5 +1,7 @@
 #include "lantern/endpoint_client.hpp"
+#include <algorithm>
 #include <condition_variable>
+#include <map>
 #include <set>
 #include <thread>
 #include <ws2tcpip.h>
@@ -225,6 +227,25 @@ std::unique_ptr<Tls> dial(const ConnectionEndpoint& e, const std::string& pin, C
         return {};
     }
 }
+// Per host (certificate pin), the entry that won the last race in this process. Away from home the
+// LAN entries would otherwise go first and cost a stagger step each before the public one starts.
+std::mutex winners_mutex;
+std::map<std::string, std::pair<std::string, uint16_t>> winners;
+void remember_winner(const std::string& pin, const ConnectionEndpoint& e) {
+    std::lock_guard lock(winners_mutex);
+    winners[pin] = {e.host, e.port};
+}
+void last_winner_first(const std::string& pin, std::vector<ConnectionEndpoint>& ordered) {
+    std::lock_guard lock(winners_mutex);
+    auto found = winners.find(pin);
+    if (found == winners.end())
+        return;
+    auto it = std::find_if(ordered.begin(), ordered.end(), [&](const ConnectionEndpoint& e) {
+        return e.host == found->second.first && e.port == found->second.second;
+    });
+    if (it != ordered.end())
+        std::rotate(ordered.begin(), it, it + 1);
+}
 } // namespace
 EndpointConnection connect_endpoints(const std::vector<ConnectionEndpoint>& list, const std::string& pin,
                                      std::chrono::milliseconds timeout) {
@@ -234,6 +255,7 @@ EndpointConnection connect_endpoints(const std::vector<ConnectionEndpoint>& list
     auto ordered = merge_endpoints({}, list, pairing_unix_time());
     if (ordered.empty())
         throw EndpointConnectError(EndpointFailure::timeout, {});
+    last_winner_first(pin, ordered); // the others keep their order and 250 ms stagger
     Race race;
     auto begin = Clock::now(), deadline = begin + timeout;
     std::vector<std::jthread> threads;
@@ -294,6 +316,8 @@ EndpointConnection connect_endpoints(const std::vector<ConnectionEndpoint>& list
         throw EndpointConnectError(EndpointFailure::pin_mismatch, std::move(race.result.attempts));
     if (!race.result.tls)
         throw EndpointConnectError(EndpointFailure::timeout, std::move(race.result.attempts));
+    if (ordered.size() > 1) // single-entry probes and diagnostics do not reorder real connections
+        remember_winner(pin, race.result.selected);
     return std::move(race.result);
 }
 std::vector<EndpointProbe> probe_endpoints(const std::vector<ConnectionEndpoint>& list,

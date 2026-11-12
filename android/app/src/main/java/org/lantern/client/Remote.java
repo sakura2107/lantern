@@ -192,6 +192,9 @@ final class Remote implements AutoCloseable {
         }
     }
     static final int CHUNK = 262144, MAX = 4194304;
+    /** Transfers keep this many block requests on the wire; partial files are synced in batches. */
+    static final int PIPELINE = 4, SYNC_BYTES = 8 << 20;
+    static final long SYNC_NANOS = 2_000_000_000L;
     final java.net.Socket transport;
     final Credentials credentials;
     final int grantedScopes;
@@ -300,6 +303,28 @@ synchronized byte[] call(int op, byte[] payload) throws IOException {
     byte[] b = Native.packet(op, payload);
     try{output.writeInt(b.length);output.write(b);output.flush();}catch(IOException error){throw new TransportError(error);}
     return receive(op);
+}
+/**
+ * After a pipelined transfer stopped early: a broken connection is closed; otherwise (cancelled, local
+ * write failed, source changed…) the answers still on the wire are read so the connection stays usable,
+ * exactly as with one request at a time.
+ */
+void drainAfter(Exception error, int op, int answers) {
+    if (answers == 0)
+        return;
+    try {
+        if (error instanceof TransportError)
+            throw error;
+        for (int i = 0; i < answers; i++)
+            try { receive(op); } catch (RemoteError complete) {} // an error answer is still an answer
+    } catch (Exception broken) {
+        try { abort(); } catch (IOException ignored) {}
+    }
+}
+/** A request whose answer is read later with receive(op); for pipelined transfers. */
+synchronized void send(int op, byte[] payload) throws IOException {
+    byte[] b = Native.packet(op, payload);
+    try{output.writeInt(b.length);output.write(b);output.flush();}catch(IOException error){throw new TransportError(error);}
 }
 synchronized void sendOnly(int op, byte[] payload) throws IOException {
     byte[] b = Native.packet(op, payload);
@@ -455,18 +480,49 @@ void download(String path, File dest, AtomicBoolean cancel, Progress progress) t
             throw new IOException("暂存文件大小错误");
         out.seek(offset);
         progress.update(offset, f.size);
-        while (offset < f.size) {
-            if (cancel.get())
-                throw new IOException("已取消，进度已保留");
-            TransferPacer.SHARED.acquire((int)Math.min(CHUNK, f.size-offset),cancel);
-            byte[] b = read(path, f.version, offset, (int)Math.min(CHUNK, f.size - offset));
-            if (b.length == 0)
-                throw new IOException("源文件意外结束");
-            out.write(b);
-            out.getFD().sync();
-            TransferPacer.SHARED.down.add(b.length);
-            offset += b.length;
-            progress.update(offset, f.size);
+        // Up to PIPELINE reads are on the wire at once, so one round trip no longer caps the speed.
+        // The answers come back in order on this connection.
+        ArrayDeque<Integer> pending = new ArrayDeque<>();
+        long next = offset, synced = offset, syncedAt = System.nanoTime();
+        synchronized (this) {
+            try {
+                while (offset < f.size) {
+                    if (cancel.get())
+                        throw new IOException("已取消，进度已保留");
+                    while (pending.size() < PIPELINE && next < f.size) {
+                        int length = (int)Math.min(CHUNK, f.size - next);
+                        TransferPacer.SHARED.acquire(length, cancel);
+                        long at = next;
+                        send(4, body(o -> {
+                            str(o, path);
+                            str(o, f.version);
+                            o.writeLong(at);
+                            o.writeInt(length);
+                        }));
+                        pending.add(length);
+                        next += length;
+                    }
+                    int expected = pending.poll();
+                    byte[] b = blob(reader(receive(4)), CHUNK);
+                    if (b.length != expected)
+                        throw new IOException("源文件意外结束");
+                    out.write(b);
+                    TransferPacer.SHARED.down.add(b.length);
+                    offset += b.length;
+                    // Resume uses the part length; sync in batches instead of after every block.
+                    if (offset - synced >= SYNC_BYTES || System.nanoTime() - syncedAt >= SYNC_NANOS) {
+                        out.getFD().sync();
+                        synced = offset;
+                        syncedAt = System.nanoTime();
+                    }
+                    progress.update(offset, f.size);
+                }
+            } catch (Exception error) {
+                drainAfter(error, 4, pending.size());
+                throw error;
+            } finally {
+                out.getFD().sync();
+            }
         }
     }
     if (cancel.get())
@@ -499,8 +555,23 @@ void upload(UploadSource source,String path,AtomicBoolean cancel,Progress progre
     try{Info existing=hashSnapshot(path,cancel,(n,t)->{});if(existing.size==size&&existing.hash.equals(hash)){source.validate();progress.update(size,size);return;}throw new RemoteError(4,"同名文件内容不同，保留电脑原件，请选择新的名称");}catch(RemoteError error){if(error.code!=3)throw error;}
     DataInputStream ack=reader(call(5,body(o->{str(o,path);o.writeLong(size);str(o,hash);})));String id=str(ack);long offset=ack.readLong();if(offset<0||offset>size||!id.matches("[0-9a-f]{64}")||ack.available()!=0)throw new IOException("上传恢复信息无效");
     source.seek(offset);byte[] buffer=new byte[CHUNK];progress.update(offset,size);
-    while(offset<size){if(cancel.get())throw new IOException("已取消；远端暂存保留");int count=source.read(buffer,(int)Math.min(CHUNK,size-offset));if(count<=0)throw new IOException("源文件长度变化");TransferPacer.SHARED.acquire(count,cancel);long current=offset;
-        DataInputStream answer=reader(call(6,body(o->{str(o,id);o.writeLong(current);o.writeInt(count);o.write(buffer,0,count);})));long next=answer.readLong();if(next!=offset+count||answer.available()!=0)throw new IOException("上传确认偏移错误");TransferPacer.SHARED.up.add(count);offset=next;progress.update(offset,size);
+    // Up to PIPELINE writes are on the wire at once; their acknowledgements come back in order.
+    ArrayDeque<long[]> pending=new ArrayDeque<>();long sent=offset;
+    synchronized(this){
+        try{
+            while(offset<size){
+                if(cancel.get())throw new IOException("已取消；远端暂存保留");
+                while(pending.size()<PIPELINE&&sent<size){
+                    int count=source.read(buffer,(int)Math.min(CHUNK,size-sent));if(count<=0)throw new IOException("源文件长度变化");
+                    TransferPacer.SHARED.acquire(count,cancel);long at=sent;
+                    send(6,body(o->{str(o,id);o.writeLong(at);o.writeInt(count);o.write(buffer,0,count);}));
+                    pending.add(new long[]{at+count,count});sent+=count;
+                }
+                long[] expected=pending.poll();DataInputStream answer=reader(receive(6));long next=answer.readLong();
+                if(next!=expected[0]||answer.available()!=0)throw new IOException("上传确认偏移错误");
+                TransferPacer.SHARED.up.add(expected[1]);offset=next;progress.update(offset,size);
+            }
+        }catch(Exception error){drainAfter(error,6,pending.size());throw error;}
     }
     source.validate();if(cancel.get())throw new IOException("已取消，远端暂存已保留");call(7,body(o->str(o,id)));
 }

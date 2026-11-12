@@ -184,7 +184,8 @@ public final class MainActivity extends Activity {
                 updateDesktopPresentation();
                 status("硬件桌面不可用，已降级为 JPEG：" + reason);
             }
-            public void reconnecting(String reason){screen.cancelDrag();controlRequested=false;control.set(false);inputEpoch.incrementAndGet();abortInput();controlLabels();if(keyboard!=null)keyboard.close();status("H264桌面正在自动重连；控制已关闭："+reason);}
+            // Only the picture reconnects; control, keyboard and sound keep their own connections.
+            public void reconnecting(String reason){screen.cancelDrag();status("网络波动，正在恢复画面…");}
         });
         screen.tap = this::desktopTap;
         screen.doubleTap = (x, y) -> desktopClick(x, y, true);
@@ -836,18 +837,36 @@ public final class MainActivity extends Activity {
         Remote remote = inputConnection;
         if (remote != null) try { remote.abort(); } catch (IOException ignored) {}
     }
+    /** First failure of the current control outage (input thread); 0 while control works. */
+    volatile long inputFailingSince;
     void inputJob(long epoch, Job task) {
         try { inputs.execute(() -> {
             if (inputEpoch.get() != epoch) return;
-            try { task.run(); }
+            try {
+                task.run();
+                if (inputFailingSince != 0) { inputFailingSince = 0; runOnUiThread(() -> { if (inputEpoch.get() == epoch) status("控制已恢复"); }); }
+            }
             catch (Exception error) {
                 Remote failed = inputConnection; inputConnection = null; inputOpening = null;
                 if (failed != null) try { failed.close(); } catch (IOException ignored) {}
-                runOnUiThread(() -> { if (inputEpoch.get() != epoch) return; control.set(false); controlRequested = false; inputEpoch.incrementAndGet(); controlLabels(); status("控制失败：" + error.getMessage()); });
+                // The computer refused this one event (e.g. a drag whose lease ran out): drop only it.
+                if (error instanceof Remote.RemoteError && ((Remote.RemoteError)error).code != 2) return;
+                // A lost connection never turns control off by itself: the next event reconnects.
+                // Revoked trust, a changed certificate or thirty seconds without a connection do.
+                boolean network = !(error instanceof Remote.RemoteError) && !(error instanceof javax.net.ssl.SSLException) &&
+                    !(error instanceof NetworkDialer.ConnectException && ((NetworkDialer.ConnectException)error).reason == NetworkDialer.Failure.PIN_MISMATCH);
+                long now = SystemClock.uptimeMillis();
+                if (network) {
+                    if (inputFailingSince == 0) inputFailingSince = now;
+                    if (now - inputFailingSince < 30_000) { runOnUiThread(() -> { if (inputEpoch.get() == epoch) status("网络波动，正在恢复控制…"); }); return; }
+                }
+                inputFailingSince = 0;
+                String why = network ? "控制连接中断超过 30 秒，已关闭控制" : "控制失败：" + error.getMessage();
+                runOnUiThread(() -> { if (inputEpoch.get() != epoch) return; control.set(false); controlRequested = false; inputEpoch.incrementAndGet(); controlLabels(); status(why); });
             }
         }); } catch (RejectedExecutionException error) {
-            controlRequested = false; control.set(false); inputEpoch.incrementAndGet(); abortInput(); controlLabels();
-            status("输入队列已满，已解除控制，请重新开启");
+            // Backed up behind a slow network: drop this one event, keep control on.
+            status("网络太慢，部分输入已丢弃；控制仍然开启");
         }
     }
     Remote inputRemote(Remote.Credentials c, long epoch) throws Exception {

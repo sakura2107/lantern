@@ -1,9 +1,32 @@
 #include "lantern/win.hpp"
+#include <chrono>
+#include <deque>
 #include <fstream>
 #include <shellapi.h>
 #include <sstream>
 #include <thread>
 namespace lantern {
+namespace {
+// Transfers keep this many block requests on the wire; partial downloads are flushed in batches.
+constexpr size_t transfer_pipeline = 4;
+constexpr uint64_t transfer_flush_bytes = 8ull << 20;
+constexpr auto transfer_flush_interval = std::chrono::seconds(2);
+} // namespace
+/** Reads and discards answers to requests already sent; a connection that cannot is interrupted. */
+void Client::drain(Op op, size_t answers) noexcept {
+    try {
+        while (answers--) {
+            try {
+                receive(op);
+            } catch (const TransportError&) {
+                throw;
+            } catch (...) { // an error answer is still a complete answer
+            }
+        }
+    } catch (...) {
+        interrupt();
+    }
+}
 Client::Client(const std::string& a, uint16_t port, const std::string& pin, const std::string& token,
                uint32_t scopes, uint32_t channel, uint32_t hello_flags)
     : scopes_(scopes) {
@@ -160,19 +183,61 @@ void Client::download(const std::string& remote, const fs::path& local, Cancel& 
         win_error("Resume seek");
     if (progress)
         progress(offset, f.size);
-    while (offset < f.size) {
-        cancel.check();
-        auto b = read(remote, f.version, offset, uint32_t(std::min<uint64_t>(chunk_size, f.size - offset)));
-        if (b.empty())
-            throw Error(Code::source_changed, "Unexpected remote EOF");
-        DWORD wrote = 0;
-        if (!WriteFile(output, b.data(), DWORD(b.size()), &wrote, nullptr) || wrote != b.size() ||
-            !FlushFileBuffers(output))
-            win_error("Write local partial");
-        offset += wrote;
-        if (progress)
-            progress(offset, f.size);
+    // Up to transfer_pipeline reads are on the wire at once, so one round trip no longer caps the speed;
+    // the answers come back in order. Resume uses the partial's length, so it is flushed in batches.
+    std::deque<uint32_t> pending;
+    uint64_t next = offset, flushed = offset;
+    auto flushed_at = std::chrono::steady_clock::now();
+    try {
+        while (offset < f.size) {
+            cancel.check();
+            while (pending.size() < transfer_pipeline && next < f.size) {
+                auto length = uint32_t(std::min<uint64_t>(chunk_size, f.size - next));
+                Writer w;
+                w.str(remote);
+                w.str(f.version);
+                w.u64(next);
+                w.u32(length);
+                send(Op::read, std::move(w));
+                pending.push_back(length);
+                next += length;
+            }
+            auto wanted = pending.front();
+            pending.pop_front();
+            auto answer = receive(Op::read);
+            Reader r{answer};
+            auto b = r.blob(chunk_size);
+            r.end();
+            if (b.size() != wanted)
+                throw Error(Code::source_changed, "Unexpected remote EOF");
+            transfer_bytes_ += b.size();
+            DWORD wrote = 0;
+            if (!WriteFile(output, b.data(), DWORD(b.size()), &wrote, nullptr) || wrote != b.size())
+                win_error("Write local partial");
+            offset += wrote;
+            if (offset - flushed >= transfer_flush_bytes ||
+                std::chrono::steady_clock::now() - flushed_at >= transfer_flush_interval) {
+                if (!FlushFileBuffers(output))
+                    win_error("Flush local partial");
+                flushed = offset;
+                flushed_at = std::chrono::steady_clock::now();
+            }
+            if (progress)
+                progress(offset, f.size);
+        }
+    } catch (const TransportError&) {
+        FlushFileBuffers(output);
+        interrupt(); // the connection is broken
+        throw;
+    } catch (...) {
+        // Cancelled, local write failed, source changed…: read the answers still on the wire so this
+        // connection stays usable, exactly as with one request at a time.
+        FlushFileBuffers(output);
+        drain(Op::read, pending.size());
+        throw;
     }
+    if (!FlushFileBuffers(output))
+        win_error("Flush local partial");
     cancel.check();
     if (hash_file(output) != f.hash)
         throw Error(Code::integrity, "Download SHA256 mismatch; partial retained");
@@ -227,27 +292,45 @@ void Client::upload(const fs::path& local, const std::string& remote, Cancel& ca
     Bytes buffer(chunk_size);
     if (progress)
         progress(offset, size);
-    while (offset < size) {
-        cancel.check();
-        DWORD got = 0;
-        if (!ReadFile(source, buffer.data(), DWORD(std::min<uint64_t>(buffer.size(), size - offset)), &got,
-                      nullptr) ||
-            !got)
-            win_error("Upload source read");
-        Writer w;
-        w.str(id);
-        w.u64(offset);
-        w.blob({buffer.data(), got});
-        auto answer = call(Op::upload_chunk, std::move(w));
-        Reader ack{answer};
-        auto next = ack.u64();
-        ack.end();
-        if (next != offset + got)
-            throw Error(Code::invalid, "Upload offset acknowledgement");
-        offset = next;
-        transfer_bytes_+=got;
-        if (progress)
-            progress(offset, size);
+    // Up to transfer_pipeline chunks are on the wire at once; acknowledgements come back in order.
+    std::deque<std::pair<uint64_t, DWORD>> pending; // expected next offset, bytes
+    uint64_t sent = offset;
+    try {
+        while (offset < size) {
+            cancel.check();
+            while (pending.size() < transfer_pipeline && sent < size) {
+                DWORD got = 0;
+                if (!ReadFile(source, buffer.data(), DWORD(std::min<uint64_t>(buffer.size(), size - sent)), &got,
+                              nullptr) ||
+                    !got)
+                    win_error("Upload source read");
+                Writer w;
+                w.str(id);
+                w.u64(sent);
+                w.blob({buffer.data(), got});
+                send(Op::upload_chunk, std::move(w));
+                sent += got;
+                pending.push_back({sent, got});
+            }
+            auto [expected, got] = pending.front();
+            pending.pop_front();
+            auto answer = receive(Op::upload_chunk);
+            Reader ack{answer};
+            auto next = ack.u64();
+            ack.end();
+            if (next != expected)
+                throw Error(Code::invalid, "Upload offset acknowledgement");
+            offset = next;
+            transfer_bytes_ += got;
+            if (progress)
+                progress(offset, size);
+        }
+    } catch (const TransportError&) {
+        interrupt(); // the connection is broken
+        throw;
+    } catch (...) {
+        drain(Op::upload_chunk, pending.size()); // keep the connection usable after a cancel
+        throw;
     }
     cancel.check();
     Writer commit;

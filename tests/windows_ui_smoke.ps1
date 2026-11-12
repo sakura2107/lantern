@@ -69,7 +69,8 @@ try {
   $w = [IntPtr]::Zero; Wait { $script:w = [U]::FindWindow('LanternClient', [NullString]::Value); $script:w -ne [IntPtr]::Zero } 'client window'
   [U]::SetForegroundWindow($w) | Out-Null
   $ctl = { param($id) [U]::GetDlgItem($w, $id) }
-  Check ([U]::IsWindowVisible((& $ctl 1)) -and -not [U]::IsWindowVisible((& $ctl 5))) 'device page shown alone'
+  # The window handle exists before WM_CREATE finishes; wait for the first page rather than racing it.
+  Wait { [U]::IsWindowVisible((& $ctl 1)) -and -not [U]::IsWindowVisible((& $ctl 5)) } 'device page shown alone'
   Check ([U]::SendMessage((& $ctl 3), 0xD2, [IntPtr]::Zero, [IntPtr]::Zero) -ne [IntPtr]::Zero) 'pairing secret masked'
   [U]::SendMessage((& $ctl 1), 0x0C, [IntPtr]::Zero, "127.0.0.1:$port") | Out-Null
   [U]::SendMessage((& $ctl 2), 0x0C, [IntPtr]::Zero, $pin) | Out-Null

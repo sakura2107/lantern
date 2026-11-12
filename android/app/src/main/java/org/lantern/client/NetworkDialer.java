@@ -306,13 +306,31 @@ final class NetworkDialer {
         return connect(Collections.singletonList(ConnectionEndpoint.of(host, port)), pin, timeout, opening,
                        true);
     }
+    /**
+     * Per computer (certificate pin), the entry that won the last race. Away from home the LAN entries would
+     * otherwise go first and cost a stagger step each before the public one starts.
+     */
+    static final java.util.Map<String, String> WINNERS = new java.util.concurrent.ConcurrentHashMap<>();
+    static List<ConnectionEndpoint> lastWinnerFirst(String pin, List<ConnectionEndpoint> ordered) {
+        String last = WINNERS.get(pin);
+        if (last == null)
+            return ordered;
+        List<ConnectionEndpoint> out = new ArrayList<>(ordered);
+        for (int i = 0; i < out.size(); i++)
+            if (last.equals(out.get(i).host + "\n" + out.get(i).port)) {
+                out.add(0, out.remove(i)); // the others keep their order and 250 ms stagger
+                break;
+            }
+        return out;
+    }
     private static Result connect(List<ConnectionEndpoint> candidates, String pin, int timeout,
                                   Remote.SocketReady opening, boolean legacy) throws Exception {
         if (timeout < 1 || timeout > 60000 || candidates.isEmpty() || candidates.size() > 8)
             throw new IOException("连接参数无效");
         List<ConnectionEndpoint> list = legacy ? candidates
-                                               : ConnectionEndpoint.merge(Collections.emptyList(), candidates,
-                                                                          System.currentTimeMillis() / 1000);
+                                               : lastWinnerFirst(pin, ConnectionEndpoint.merge(
+                                                     Collections.emptyList(), candidates,
+                                                     System.currentTimeMillis() / 1000));
         Race race = new Race(list, context(pin), timeout);
         if (opening != null)
             opening.opened(race.group);
@@ -344,6 +362,8 @@ final class NetworkDialer {
                     throw new ConnectException(reason, reports);
                 }
                 race.group.keep(race.winningRaw);
+                if (list.size() > 1) // single-entry probes and diagnostics do not reorder real connections
+                    WINNERS.put(pin, race.selected.host + "\n" + race.selected.port);
                 return new Result(race.winner, race.group, race.selected, reports);
             }
         } catch (InterruptedException error) {

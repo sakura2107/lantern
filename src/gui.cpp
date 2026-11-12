@@ -276,11 +276,12 @@ void input(Op op, Writer w, bool move_event = false) {
         return;
     }
     if (input_queue.size() >= 64) {
-        control_on = false;
-        input_queue.clear();
-        input_connection.interrupt();
-        PostMessageW(window, WM_INPUT_FAILURE, 0, 0);
-        return;
+        // Backed up (slow network): stale pointer moves go first; clicks and keys stay queued.
+        std::erase_if(input_queue, [](const InputEvent& e) { return e.move; });
+        if (input_queue.size() >= 256) {
+            input_queue.clear();
+            status(L"网络太慢，已丢弃积压的输入；控制仍然开启。");
+        }
     }
     input_queue.push_back({op, std::move(w), move_event, input_epoch.load()});
     input_cv.notify_one();
@@ -827,10 +828,7 @@ void video_loop() {
                 }
                 break;
             } catch (const TransportError& error) {
-                control_on = false;
-                ++input_epoch;
-                input_connection.interrupt();
-                PostMessageW(window, WM_INPUT_FAILURE, 0, 0);
+                // The picture reconnects on its own; control and sound keep their own connections.
                 if (!subscribed || e != video_epoch || closing)
                     break;
                 if (retries >= 10) {
@@ -838,7 +836,7 @@ void video_loop() {
                     subscribed = false;
                     break;
                 }
-                status(L"桌面断线，正在重连；控制已关闭。");
+                status(L"网络波动，正在恢复画面…");
                 retry_wait(retries++, e, video_epoch, subscribed);
             } catch (const Error& error) {
                 if (!subscribed || e != video_epoch || closing)
@@ -933,6 +931,7 @@ void audio_loop() {
 void input_loop() {
     std::shared_ptr<Client> client;
     unsigned current = 0;
+    std::optional<std::chrono::steady_clock::time_point> failing_since; // first failure of this outage
     while (!closing) {
         InputEvent event;
         {
@@ -953,26 +952,64 @@ void input_loop() {
         }
         if (!control_on || event.epoch != input_epoch)
             continue;
+        // A lost connection never turns control off by itself: reconnect and carry on. An event that
+        // never left is sent again; one that was sent but not answered is not (it may have run).
+        bool sent = false, connected = false;
         try {
             if (!client || current != input_epoch) {
                 client = creds().connect(control, 0);
                 current = event.epoch;
                 input_connection.set(client);
             }
+            connected = true;
             if (!control_on || current != input_epoch)
                 continue;
-            client->call(event.op, std::move(event.body));
+            Writer body = event.body;
+            client->send(event.op, std::move(body));
+            sent = true;
+            client->receive(event.op);
+            if (failing_since) {
+                failing_since.reset();
+                status(L"控制已恢复。");
+            }
         } catch (const std::exception& error) {
+            auto endpoint = dynamic_cast<const EndpointConnectError*>(&error);
+            if (endpoint && endpoint->reason == EndpointFailure::pin_mismatch) {
+                client.reset();
+                input_connection.set({});
+                failing_since.reset();
+                control_on = false;
+                ++input_epoch;
+                PostMessageW(window, WM_INPUT_FAILURE, 0, 0);
+                status(L"电脑身份（证书指纹）不一致，已关闭控制。");
+                continue;
+            }
+            if (connected && !dynamic_cast<const TransportError*>(&error))
+                continue; // the computer refused this one event (e.g. a drag whose lease ran out): drop it
+            // Network: reconnect on the next round; thirty seconds without a connection ends control.
             client.reset();
             input_connection.set({});
-            control_on = false;
-            ++input_epoch;
-            {
-                std::lock_guard lock(input_mutex);
-                input_queue.clear();
+            auto now = std::chrono::steady_clock::now();
+            if (!failing_since)
+                failing_since = now;
+            if (now - *failing_since > std::chrono::seconds(30)) {
+                failing_since.reset();
+                control_on = false;
+                ++input_epoch;
+                {
+                    std::lock_guard lock(input_mutex);
+                    input_queue.clear();
+                }
+                PostMessageW(window, WM_INPUT_FAILURE, 0, 0);
+                status(L"控制连接中断超过 30 秒，已关闭控制：" + wide(error.what()));
+                continue;
             }
-            PostMessageW(window, WM_INPUT_FAILURE, 0, 0);
-            status(L"控制已关闭，未重放输入：" + wide(error.what()));
+            status(L"网络波动，正在恢复控制…");
+            if (!sent && !event.move) {
+                std::lock_guard lock(input_mutex);
+                input_queue.push_front(std::move(event));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
         }
     }
     input_connection.set({});

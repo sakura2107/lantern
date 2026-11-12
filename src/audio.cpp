@@ -151,8 +151,15 @@ class WasapiSource final : public AudioSource {
             audio_hr(capture->GetBuffer(&data, &frames, &status, &position, &qpc));
             if (frames > cfg.sample_rate / 5 ||
                 pending.size() - offset + frames * 4 > cfg.sample_rate * 4 / 5) {
-                capture->ReleaseBuffer(frames);
-                throw Error(Code::busy, "Audio capture backlog exceeds 200ms");
+                // More than 200 ms behind (the sender waited on the network): drop the stale audio and
+                // carry on from live instead of ending the stream. The gap is flagged as a discontinuity.
+                pending.clear();
+                offset = 0;
+                flags |= 1;
+                if (frames > cfg.sample_rate / 5) {
+                    capture->ReleaseBuffer(frames);
+                    continue;
+                }
             }
             if (offset) {
                 pending.erase(pending.begin(), pending.begin() + offset);
