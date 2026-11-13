@@ -363,7 +363,7 @@ struct UpnpIgd::Impl {
         return replied ? UpnpStatus::unsupported : UpnpStatus::no_igd;
     }
     UpnpReport map(const UpnpRequest& r) {
-        if (!r.internal_port || !r.external_port || r.lease_seconds < 2 || r.lease_seconds > 86400 ||
+        if ((r.protocol!=6&&r.protocol!=17) || !r.internal_port || !r.external_port || r.lease_seconds < 2 || r.lease_seconds > 86400 ||
             (!r.ipv4.empty() && (classify_address(r.ipv4) != AddressKind::private_v4 &&
                                  classify_address(r.ipv4) != AddressKind::loopback)) ||
             (!r.ipv6.empty() && classify_address(r.ipv6) != AddressKind::global_v6))
@@ -397,7 +397,7 @@ struct UpnpIgd::Impl {
                                            {"RemotePort", "0"},
                                            {"InternalClient", r.ipv6},
                                            {"InternalPort", std::to_string(r.internal_port)},
-                                           {"Protocol", "6"},
+                                           {"Protocol", std::to_string(r.protocol)},
                                            {"LeaseTime", std::to_string(r.lease_seconds)}}));
                     pinhole = number(find(reply, "UniqueID"), 65535);
                     mapping.pinhole_id = pinhole;
@@ -418,7 +418,7 @@ struct UpnpIgd::Impl {
                     soap(*s, "AddPortMapping",
                          {{"NewRemoteHost", ""},
                           {"NewExternalPort", std::to_string(r.external_port)},
-                          {"NewProtocol", "TCP"},
+                          {"NewProtocol", request.protocol==17?"UDP":"TCP"},
                           {"NewInternalPort", std::to_string(r.internal_port)},
                           {"NewInternalClient", r.ipv4},
                           {"NewEnabled", "1"},
@@ -447,7 +447,7 @@ struct UpnpIgd::Impl {
                 soap(*s, "AddPortMapping",
                      {{"NewRemoteHost", ""},
                       {"NewExternalPort", std::to_string(request.external_port)},
-                      {"NewProtocol", "TCP"},
+                      {"NewProtocol", request.protocol==17?"UDP":"TCP"},
                       {"NewInternalPort", std::to_string(request.internal_port)},
                       {"NewInternalClient", request.ipv4},
                       {"NewEnabled", "1"},
@@ -478,7 +478,7 @@ struct UpnpIgd::Impl {
                 soap(*service(false), "DeletePortMapping",
                      {{"NewRemoteHost", ""},
                       {"NewExternalPort", std::to_string(report.ipv4.external_port)},
-                      {"NewProtocol", "TCP"}});
+                      {"NewProtocol", request.protocol==17?"UDP":"TCP"}});
                 report.ipv4 = {};
             } catch (const RouterError& e) {
                 report.ipv4.status = e.status;

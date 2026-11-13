@@ -66,7 +66,7 @@ void Client::send(Op op, Writer payload) {
     tls_->send(w.b);
 }
 Bytes Client::receive(Op op) {
-    auto b = tls_->receive();
+    auto b = tls_->receive(op == Op::desktop_packet ? max_video_frame : max_frame);
     Reader r{b};
     if (r.u16() != protocol_version || r.u16() != uint16_t(op))
         throw Error(Code::invalid, "Response version or operation mismatch");

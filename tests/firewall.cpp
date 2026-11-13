@@ -61,6 +61,11 @@ int wmain(int, wchar_t** argv) {
         check(internet == FirewallState::allowed || internet == FirewallState::not_allowed ||
               internet == FirewallState::unknown);
         check(public_firewall_state(fs::path(argv[0]), 0) == FirewallState::unknown);
+        detail::configure_public_firewall_rule(rule.Get(),exe,47443,NET_FW_IP_PROTOCOL_UDP);
+        check(SUCCEEDED(rule->get_Protocol(&protocol))&&protocol==NET_FW_IP_PROTOCOL_UDP);
+        check(SUCCEEDED(rule->get_RemoteAddresses(&remote))&&std::wstring(remote)==L"*");SysFreeString(remote);
+        auto udp=public_udp_firewall_state(fs::path(argv[0]),47443);
+        check(udp==FirewallState::allowed||udp==FirewallState::not_allowed||udp==FirewallState::unknown);
         std::cout << checks
                   << " firewall checks passed; unattached rule configuration + read-only OS policy query; no "
                      "rules added\n";

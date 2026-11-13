@@ -76,6 +76,12 @@ Handle FileService::open_read(Guard& g) {
         throw Error(Code::invalid, "Expected regular file");
     return h;
 }
+MediaSource FileService::media_source(const std::string& path) {
+    auto locked=guard(path);auto handle=open_read(locked);
+    // The first read-only handle denies writes/deletion while metadata is inspected and consumed.
+    auto metadata=stat(path,false);
+    return {std::move(locked),std::move(handle),std::move(metadata)};
+}
 std::vector<Entry> FileService::list(const std::string& p, uint32_t offset, uint32_t limit,
                                      const std::string& filter, std::string& gen) {
     if (limit == 0 || limit > 256 || offset > 200000 || filter.size() > 256)

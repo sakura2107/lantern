@@ -129,6 +129,7 @@ ReachabilityReport reachability_report(const Config& c, const fs::path& exe, con
     }
     r.cgnat = r.cgnat || upnp.ipv4.status == UpnpStatus::cgnat;
     r.public_firewall = public_firewall_state(exe, port);
+    r.public_udp_firewall = public_udp_firewall_state(exe, port);
     r.current_profiles = firewall_current_profiles();
     return r;
 }

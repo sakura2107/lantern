@@ -63,6 +63,8 @@ class MockIgd {
                 {
                     std::lock_guard lock(mutex);
                     ++actions[action];
+                    if(request.find("<NewProtocol>UDP</NewProtocol>")!=request.npos||request.find("<Protocol>17</Protocol>")!=request.npos)
+                        ++actions[action+":udp"];
                 }
                 if (deny) {
                     code = 500;
@@ -209,6 +211,13 @@ int main() {
             rejected = true;
         }
         check(rejected, "discovery targets restricted to LAN");
+        {
+            UpnpIgd media(mock.target());request.protocol=17;request.lease_seconds=4;
+            auto udp=media.map(request);check(udp.ipv4.status==UpnpStatus::success&&udp.ipv6.status==UpnpStatus::success,"same-port UDP mapping and IPv6 pinhole");
+            media.renew();media.unmap();
+            check(mock.count("AddPortMapping:udp")==2&&mock.count("DeletePortMapping:udp")==1&&mock.count("AddPinhole:udp")==1,
+                "UDP add/renew/delete protocol fields remain independent of TCP");
+        }
         std::cout << checks << " local mock UPnP checks passed; no real router changed\n";
         return 0;
     } catch (const std::exception& e) {

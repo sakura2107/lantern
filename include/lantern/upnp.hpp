@@ -12,11 +12,13 @@ struct UpnpMapping {
 };
 struct UpnpReport {
     UpnpMapping ipv4, ipv6;
+    UpnpMapping ipv4_udp,ipv6_udp;
 };
 struct UpnpRequest {
     std::string ipv4, ipv6; // Local connected IPv4 / stable global IPv6; empty skips that family.
     uint16_t internal_port = 47443, external_port = 47443;
     uint32_t lease_seconds = 1800;
+    uint32_t protocol=6; // IPPROTO_TCP=6 or IPPROTO_UDP=17; each lease owns exactly one protocol.
 };
 struct SsdpTarget {
     std::string address = "239.255.255.250";

@@ -400,7 +400,7 @@ void Tls::interrupt() noexcept {
     shutdown(p_->socket, SD_BOTH);
 }
 void Tls::send(std::span<const uint8_t> b) {
-    if (b.size() > max_frame)
+    if (b.size() > max_video_frame)
         throw Error(Code::invalid, "Frame too big");
     Writer w;
     w.b.reserve(p_->sizes.cbMaximumMessage);
@@ -416,7 +416,7 @@ Bytes Tls::receive(uint32_t limit) {
     uint32_t n = 0;
     for (int i = 0; i < 4; ++i)
         n = (n << 8) | p_->byte();
-    if (n > std::min(max_frame, limit) || n < 4)
+    if (n > std::min(max_video_frame, limit) || n < 4)
         throw Error(Code::invalid, "Invalid frame length");
     Bytes b(n);
     for (auto& c : b)

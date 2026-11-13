@@ -8,8 +8,9 @@ struct ClientCredentials {
     std::string host, pin, token;
     uint16_t port = 47443;
     std::vector<ConnectionEndpoint> endpoints;
-    std::shared_ptr<Client> connect(uint32_t scopes = files_read, uint32_t channel = UINT32_MAX) const;
+    std::shared_ptr<Client> connect(uint32_t scopes = files_read, uint32_t channel = UINT32_MAX,uint32_t hello_flags=0) const;
 };
+std::shared_ptr<Client> connect_subscription(const ClientCredentials&,uint32_t scopes,uint32_t channel,bool automatic);
 void merge_endpoints(ClientCredentials&, const std::vector<ConnectionEndpoint>&);
 std::vector<EndpointProbe> probe_endpoints(const ClientCredentials&,
                                            std::chrono::milliseconds timeout = std::chrono::seconds(10));

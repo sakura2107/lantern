@@ -22,6 +22,7 @@ class WindowsVideo {
     void frame(std::span<const uint8_t>, uint64_t pts_us, bool visible, double zoom = 1);
     DecodeStats stats() const;
     std::string provider() const;
+    static bool supports_hevc();
 };
 struct RenderStats {
     uint64_t frames = 0, overruns = 0, resets = 0;

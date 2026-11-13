@@ -45,17 +45,25 @@ std::vector<Entry> parse_entries(Reader& r, uint32_t bound) {
     return entries;
 }
 } // namespace
-std::shared_ptr<Client> ClientCredentials::connect(uint32_t scopes, uint32_t channel) const {
+std::shared_ptr<Client> ClientCredentials::connect(uint32_t scopes, uint32_t channel,uint32_t hello_flags) const {
     auto candidates = endpoints;
     if (candidates.empty()) {
-        auto c = std::make_shared<Client>(host, port, pin, token, scopes, channel);
+        auto c = std::make_shared<Client>(host, port, pin, token, scopes, channel,hello_flags);
         c->selected_endpoint = connection_endpoint(host, port);
         return c;
     }
     auto result = connect_endpoints(candidates, pin);
-    auto client = std::make_shared<Client>(std::move(result.tls), token, scopes, channel);
+    auto client = std::make_shared<Client>(std::move(result.tls), token, scopes, channel,hello_flags);
     client->selected_endpoint = result.selected;
     client->connection_attempts = std::move(result.attempts);
+    return client;
+}
+std::shared_ptr<Client> connect_subscription(const ClientCredentials& c,uint32_t scopes,uint32_t channel,bool automatic){
+    static std::mutex mutex;static std::set<std::string> compatible;
+    bool flags;{std::lock_guard l(mutex);flags=compatible.contains(c.pin);}
+    auto client=c.connect(scopes,channel,automatic&&flags?1:0);
+    auto bytes=client->call(Op::capabilities);Reader r{bytes};auto caps=r.str();r.end();
+    if(caps.find(";session=end-v1")!=caps.npos){std::lock_guard l(mutex);if(compatible.size()>=64)compatible.erase(compatible.begin());compatible.insert(c.pin);}
     return client;
 }
 void merge_endpoints(ClientCredentials& c, const std::vector<ConnectionEndpoint>& fresh) {

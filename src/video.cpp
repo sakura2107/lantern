@@ -38,6 +38,26 @@ class NvDesktop final : public DesktopStream {
     VideoConfig configuration{};
     uint64_t sequence = 0;
     Clock::time_point start = Clock::now();
+    uint32_t max_width=0,max_height=0,source_w=0,source_h=0,native_fps=60;
+    NV_ENC_CONFIG saved_config{};
+    NV_ENC_INITIALIZE_PARAMS saved_init{};
+    bool force_idr=false;
+    uint32_t output_height(uint32_t width) const {
+        return uint32_t(uint64_t(source_h)*width/source_w)&~1u;
+    }
+    void headers() {
+        Bytes bytes(65536);uint32_t size=0;
+        NV_ENC_SEQUENCE_PARAM_PAYLOAD seq{};seq.version=NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER;
+        seq.spsppsBuffer=bytes.data();seq.inBufferSize=uint32_t(bytes.size());seq.outSPSPPSPayloadSize=&size;
+        enc(api.nvEncGetSequenceParams(encoder,&seq),"NVENC codec headers");
+        if(!size||size>bytes.size())throw Error(Code::io,"Codec headers bound");
+        bytes.resize(size);configuration.headers=std::move(bytes);
+    }
+    void scale_rect(uint32_t width,uint32_t height) {
+        RECT dest{0,0,LONG(width),LONG(height)};
+        video_context->VideoProcessorSetStreamDestRect(processor.Get(),0,TRUE,&dest);
+        video_context->VideoProcessorSetOutputTargetRect(processor.Get(),TRUE,&dest);
+    }
 
   public:
     ~NvDesktop() override {
@@ -51,14 +71,16 @@ class NvDesktop final : public DesktopStream {
         if (library)
             FreeLibrary(library);
     }
-    void init(uint32_t index, uint32_t requested_width, uint32_t fps, uint32_t bitrate) {
-        if (requested_width < 640 || requested_width > 1920 || (fps != 30 && fps != 60) ||
-            bitrate < 2'000'000 || bitrate > 30'000'000)
-            throw Error(Code::invalid, "H264 v1 accepts width 640..1920, 30/60 fps, 2..30 Mbps");
+    void init(uint32_t index, uint32_t requested_width, uint32_t fps, uint32_t bitrate, bool hevc, bool upscale) {
+        if(requested_width<640||requested_width>3840||(fps!=30&&fps!=60&&fps!=120)||
+           bitrate<250'000||bitrate>160'000'000)
+            throw Error(Code::invalid,"Desktop accepts width 640..3840, 30/60/120 fps, 0.25..160 Mbps");
         auto displays = monitors();
         if (index >= displays.size())
             throw Error(Code::invalid, "Monitor index");
         auto wanted = displays[index];
+        native_fps=upscale?120:std::max(1u,wanted.refresh_hz);
+        fps=std::min(fps,native_fps);
         ComPtr<IDXGIFactory1> factory;
         gpu(CreateDXGIFactory1(IID_PPV_ARGS(&factory)), "DXGI factory");
         ComPtr<IDXGIAdapter1> chosen;
@@ -102,10 +124,13 @@ class NvDesktop final : public DesktopStream {
             throw Error(Code::unsupported,
                         "Rotated or non-BGRA desktop is unsupported by H264 v1; choose JPEG");
         uint32_t source_width = desktop_desc.ModeDesc.Width, source_height = desktop_desc.ModeDesc.Height;
-        configuration.width = std::min(source_width, requested_width) & ~1u;
-        configuration.height = (uint32_t(uint64_t(source_height) * configuration.width / source_width) & ~1u);
-        if (!configuration.height || uint64_t(configuration.width) * configuration.height > 4'000'000)
-            throw Error(Code::unsupported, "H264 desktop pixel bound");
+        source_w=source_width;source_h=source_height;
+        max_width=std::min(upscale?3840u:source_width,3840u)&~1u;
+        max_height=output_height(max_width);
+        if(max_height>2160) {max_width=(uint32_t(uint64_t(max_width)*2160/max_height)&~1u);max_height=output_height(max_width);}
+        configuration.width=std::min(max_width,requested_width)&~1u;
+        configuration.height=output_height(configuration.width);
+        if(!configuration.height)throw Error(Code::unsupported,"Desktop dimensions");
         configuration.fps = fps;
         configuration.bitrate = bitrate;
         configuration.capture_provider = "dxgi-d3d11";
@@ -120,8 +145,8 @@ class NvDesktop final : public DesktopStream {
         desc.Usage = D3D11_USAGE_DEFAULT;
         desc.BindFlags = D3D11_BIND_RENDER_TARGET;
         gpu(device->CreateTexture2D(&desc, nullptr, &cached), "GPU capture cache");
-        desc.Width = configuration.width;
-        desc.Height = configuration.height;
+        desc.Width = max_width;
+        desc.Height = max_height;
         gpu(device->CreateTexture2D(&desc, nullptr, &target), "GPU encoder input");
         gpu(device.As(&video_device), "D3D11 video device");
         gpu(context.As(&video_context), "D3D11 video context");
@@ -131,8 +156,8 @@ class NvDesktop final : public DesktopStream {
         content.OutputFrameRate = {fps, 1};
         content.InputWidth = source_width;
         content.InputHeight = source_height;
-        content.OutputWidth = configuration.width;
-        content.OutputHeight = configuration.height;
+        content.OutputWidth = max_width;
+        content.OutputHeight = max_height;
         content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
         gpu(video_device->CreateVideoProcessorEnumerator(&content, &enumerator), "GPU scaler enumerator");
         gpu(video_device->CreateVideoProcessor(enumerator.Get(), 0, &processor), "GPU scaler");
@@ -173,14 +198,21 @@ class NvDesktop final : public DesktopStream {
         open.deviceType = NV_ENC_DEVICE_TYPE_DIRECTX;
         open.apiVersion = NVENCAPI_VERSION;
         enc(api.nvEncOpenEncodeSessionEx(&open, &encoder), "NVENC hardware session");
+        uint32_t count=0;enc(api.nvEncGetEncodeGUIDCount(encoder,&count),"NVENC codec count");
+        std::vector<GUID> guids(count);uint32_t written=0;
+        enc(api.nvEncGetEncodeGUIDs(encoder,guids.data(),count,&written),"NVENC codec list");
+        hevc=hevc&&std::any_of(guids.begin(),guids.begin()+written,[](auto& id){return id==NV_ENC_CODEC_HEVC_GUID;});
+        auto codec=hevc?NV_ENC_CODEC_HEVC_GUID:NV_ENC_CODEC_H264_GUID;
+        configuration.codec=hevc?"hevc":"h264";
+        configuration.encoder_provider=hevc?"nvidia-nvenc-hevc":"nvidia-nvenc-h264";
         NV_ENC_PRESET_CONFIG preset{};
         preset.version = NV_ENC_PRESET_CONFIG_VER;
         preset.presetCfg.version = NV_ENC_CONFIG_VER;
-        enc(api.nvEncGetEncodePresetConfigEx(encoder, NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P1_GUID,
+        enc(api.nvEncGetEncodePresetConfigEx(encoder, codec, NV_ENC_PRESET_P1_GUID,
                                              NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY, &preset),
             "NVENC low latency preset");
         auto& cfg = preset.presetCfg;
-        cfg.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
+        cfg.profileGUID = hevc?NV_ENC_HEVC_PROFILE_MAIN_GUID:NV_ENC_H264_PROFILE_HIGH_GUID;
         cfg.gopLength = fps * 2;
         cfg.frameIntervalP = 1;
         cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
@@ -190,11 +222,12 @@ class NvDesktop final : public DesktopStream {
         cfg.rcParams.vbvInitialDelay = bitrate / fps;
         cfg.rcParams.enableLookahead = 0;
         cfg.rcParams.zeroReorderDelay = 1;
-        cfg.encodeCodecConfig.h264Config.idrPeriod = fps * 2;
-        cfg.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
+        cfg.rcParams.enableAQ=1;cfg.rcParams.aqStrength=4;
+        if(hevc) {cfg.encodeCodecConfig.hevcConfig.idrPeriod=fps*2;cfg.encodeCodecConfig.hevcConfig.repeatSPSPPS=1;}
+        else {cfg.encodeCodecConfig.h264Config.idrPeriod=fps*2;cfg.encodeCodecConfig.h264Config.repeatSPSPPS=1;}
         NV_ENC_INITIALIZE_PARAMS init{};
         init.version = NV_ENC_INITIALIZE_PARAMS_VER;
-        init.encodeGUID = NV_ENC_CODEC_H264_GUID;
+        init.encodeGUID = codec;
         init.presetGUID = NV_ENC_PRESET_P1_GUID;
         init.encodeWidth = configuration.width;
         init.encodeHeight = configuration.height;
@@ -202,17 +235,19 @@ class NvDesktop final : public DesktopStream {
         init.darHeight = configuration.height;
         init.frameRateNum = fps;
         init.frameRateDen = 1;
+        init.maxEncodeWidth=max_width;init.maxEncodeHeight=max_height;
         init.enablePTD = 1;
         init.enableEncodeAsync = 0;
         init.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
         init.encodeConfig = &cfg;
-        enc(api.nvEncInitializeEncoder(encoder, &init), "NVENC initialize H264");
+        enc(api.nvEncInitializeEncoder(encoder, &init), "NVENC initialize desktop");
+        saved_config=cfg;saved_init=init;saved_init.encodeConfig=&saved_config;
         NV_ENC_REGISTER_RESOURCE resource{};
         resource.version = NV_ENC_REGISTER_RESOURCE_VER;
         resource.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
         resource.resourceToRegister = target.Get();
-        resource.width = configuration.width;
-        resource.height = configuration.height;
+        resource.width = max_width;
+        resource.height = max_height;
         resource.bufferFormat = NV_ENC_BUFFER_FORMAT_ARGB;
         resource.bufferUsage = NV_ENC_INPUT_IMAGE;
         enc(api.nvEncRegisterResource(encoder, &resource), "NVENC register GPU surface");
@@ -221,23 +256,32 @@ class NvDesktop final : public DesktopStream {
         buffer.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
         enc(api.nvEncCreateBitstreamBuffer(encoder, &buffer), "NVENC output buffer");
         output = buffer.bitstreamBuffer;
-        Bytes headers(4096);
-        uint32_t header_size = 0;
-        NV_ENC_SEQUENCE_PARAM_PAYLOAD sequence_params{};
-        sequence_params.version = NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER;
-        sequence_params.spsppsBuffer = headers.data();
-        sequence_params.inBufferSize = uint32_t(headers.size());
-        sequence_params.outSPSPPSPayloadSize = &header_size;
-        enc(api.nvEncGetSequenceParams(encoder, &sequence_params), "H264 SPS/PPS");
-        if (!header_size || header_size > headers.size())
-            throw Error(Code::io, "H264 headers bound");
-        headers.resize(header_size);
-        configuration.headers = std::move(headers);
+        headers();
         start = Clock::now();
     }
     const VideoConfig& config() const override {
         return configuration;
     }
+    void reconfigure(uint32_t width,uint32_t fps,uint32_t bitrate) override {
+        if(width<640||width>3840||(fps!=30&&fps!=60&&fps!=120)||bitrate<250'000||bitrate>160'000'000)
+            throw Error(Code::invalid,"Desktop reconfigure bound");
+        width=std::min(width,max_width)&~1u;fps=std::min(fps,native_fps);
+        auto height=output_height(width);
+        if(width==configuration.width&&fps==configuration.fps&&bitrate==configuration.bitrate)return;
+        auto updated=saved_config;
+        updated.rcParams.averageBitRate=bitrate;updated.rcParams.maxBitRate=bitrate;
+        updated.rcParams.vbvBufferSize=bitrate/fps;updated.rcParams.vbvInitialDelay=bitrate/fps;
+        NV_ENC_RECONFIGURE_PARAMS change{};change.version=NV_ENC_RECONFIGURE_PARAMS_VER;
+        change.reInitEncodeParams=saved_init;change.reInitEncodeParams.encodeConfig=&updated;
+        change.reInitEncodeParams.encodeWidth=width;change.reInitEncodeParams.encodeHeight=height;
+        change.reInitEncodeParams.darWidth=width;change.reInitEncodeParams.darHeight=height;
+        change.reInitEncodeParams.frameRateNum=fps;change.resetEncoder=1;change.forceIDR=1;
+        enc(api.nvEncReconfigureEncoder(encoder,&change),"NVENC online reconfigure");
+        saved_config=updated;saved_init=change.reInitEncodeParams;saved_init.encodeConfig=&saved_config;
+        configuration.width=width;configuration.height=height;configuration.fps=fps;configuration.bitrate=bitrate;
+        scale_rect(width,height);headers();force_idr=true;
+    }
+    void request_keyframe() override {force_idr=true;}
     VideoFrame next() override {
         auto began = Clock::now();
         ComPtr<IDXGIResource> desktop;
@@ -292,8 +336,10 @@ class NvDesktop final : public DesktopStream {
         pic.outputBitstream = output;
         pic.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
         pic.inputTimeStamp = frame.pts_us;
-        if (sequence == 0)
+        if (sequence == 0 || force_idr) {
             pic.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+            force_idr=false;
+        }
         enc(api.nvEncEncodePicture(encoder, &pic), "NVENC encode");
         NV_ENC_LOCK_BITSTREAM locked{};
         locked.version = NV_ENC_LOCK_BITSTREAM_VER;
@@ -307,7 +353,7 @@ class NvDesktop final : public DesktopStream {
                 api.nvEncUnlockBitstream(e, output);
             }
         } unlock{api, encoder, output};
-        if (locked.bitstreamSizeInBytes > max_frame - 256)
+        if (locked.bitstreamSizeInBytes > max_video_frame - 256)
             throw Error(Code::busy, "Encoded desktop frame exceeds bound");
         auto bytes = static_cast<uint8_t*>(locked.bitstreamBufferPtr);
         frame.annex_b.assign(bytes, bytes + locked.bitstreamSizeInBytes);
@@ -319,9 +365,9 @@ class NvDesktop final : public DesktopStream {
 };
 } // namespace
 std::unique_ptr<DesktopStream> open_desktop_stream(uint32_t monitor, uint32_t width, uint32_t fps,
-                                                   uint32_t bitrate) {
+                                                   uint32_t bitrate,bool prefer_hevc,bool synthetic_upscale) {
     auto stream = std::make_unique<NvDesktop>();
-    stream->init(monitor, width, fps, bitrate);
+    stream->init(monitor, width, fps, bitrate,prefer_hevc,synthetic_upscale);
     return stream;
 }
 } // namespace lantern

@@ -8,8 +8,11 @@ static BOOL CALLBACK enumerate(HMONITOR h, HDC, LPRECT, LPARAM context) {
     i.cbSize = sizeof(i);
     if (GetMonitorInfoW(h, &i)) {
         auto& r = i.rcMonitor;
+        DEVMODEW mode{};mode.dmSize=sizeof(mode);
+        uint32_t hz=EnumDisplaySettingsW(i.szDevice,ENUM_CURRENT_SETTINGS,&mode)&&mode.dmDisplayFrequency>1?
+            mode.dmDisplayFrequency:60;
         ((std::vector<Monitor>*)context)
-            ->push_back({r.left, r.top, r.right - r.left, r.bottom - r.top, utf8(i.szDevice)});
+            ->push_back({r.left, r.top, r.right - r.left, r.bottom - r.top, utf8(i.szDevice),hz});
     }
     return TRUE;
 }

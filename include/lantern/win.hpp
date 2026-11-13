@@ -92,6 +92,7 @@ struct Guard {
     fs::path path;
     std::vector<Handle> locks;
 };
+struct MediaSource { Guard guard; Handle file; FileInfo info; };
 /** Hidden + system (e.g. "System Volume Information", "$RECYCLE.BIN"): Explorer hides these by default
  *  and ordinary accounts usually cannot open them, so listings and searches leave them out. */
 inline bool protected_os_entry(DWORD attributes) {
@@ -125,6 +126,7 @@ class FileService {
                        uint32_t sort, bool descending, const std::string& expected_generation);
     std::unique_ptr<DirectorySearch> search(const std::string&, const std::string&);
     Bytes preview_source(const std::string&);
+    MediaSource media_source(const std::string&); // Guarded, read-only stable handle; no ambient absolute-path access.
     void copy_tree(const std::string& from, const std::string& to, Cancel&, std::function<void(uint64_t,uint64_t)>);
     void remove_tree(const std::string&, Cancel&, std::function<void(uint64_t,uint64_t)>);
     FileInfo stat(const std::string&, bool hash = true);
@@ -154,6 +156,7 @@ class FileJobs {
 struct Monitor {
     int x, y, width, height;
     std::string name;
+    uint32_t refresh_hz = 60;
 };
 std::vector<Monitor> monitors();
 Bytes capture(uint32_t monitor, uint32_t width, uint32_t quality);
@@ -161,6 +164,7 @@ struct VideoConfig {
     uint32_t width, height, fps, bitrate;
     std::string capture_provider, encoder_provider;
     Bytes headers;
+    std::string codec = "h264";
 };
 struct VideoFrame {
     uint64_t sequence, pts_us;
@@ -175,9 +179,12 @@ class DesktopStream {
     virtual ~DesktopStream() = default;
     virtual const VideoConfig& config() const = 0;
     virtual VideoFrame next() = 0;
+    virtual void reconfigure(uint32_t width, uint32_t fps, uint32_t bitrate) = 0;
+    virtual void request_keyframe() = 0;
 };
 std::unique_ptr<DesktopStream> open_desktop_stream(uint32_t monitor, uint32_t width, uint32_t fps,
-                                                   uint32_t bitrate);
+                                                   uint32_t bitrate, bool prefer_hevc = false,
+                                                   bool synthetic_upscale = false);
 void remote_input(uint32_t kind, int32_t x, int32_t y, uint32_t value, uint32_t monitor);
 void set_input_validation_pid(uint32_t pid);
 void remote_click(int32_t x, int32_t y, uint32_t monitor);

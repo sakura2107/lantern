@@ -106,10 +106,10 @@ bool constrained(INetFwRule* r) {
 }
 } // namespace
 namespace detail {
-void configure_public_firewall_rule(INetFwRule* rule, const std::wstring& exe, uint16_t port) {
-    configure_firewall_rule(rule, exe, port, NET_FW_IP_PROTOCOL_TCP);
+void configure_public_firewall_rule(INetFwRule* rule, const std::wstring& exe, uint16_t port,long protocol) {
+    configure_firewall_rule(rule, exe, port, protocol);
     checked(rule->put_RemoteAddresses(Bstr(L"*")));
-    checked(rule->put_Description(Bstr(L"Lantern 公网 TCP 主机；仅受信任的专用网络，用户显式启用")));
+    checked(rule->put_Description(Bstr(L"Lantern 公网主机通道；仅受信任的专用网络，用户显式启用")));
 }
 void configure_firewall_rule(INetFwRule* rule, const std::wstring& exe, uint16_t port, long protocol) {
     checked(rule->put_Enabled(VARIANT_FALSE));
@@ -143,14 +143,14 @@ void configure_rule(INetFwRules* rules, const wchar_t* name, const std::wstring&
         checked(CoCreateInstance(__uuidof(NetFwRule), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&rule)));
     checked(rule->put_Name(key));
     if (internet)
-        detail::configure_public_firewall_rule(rule.Get(), exe, port);
+        detail::configure_public_firewall_rule(rule.Get(), exe, port,protocol);
     else
         detail::configure_firewall_rule(rule.Get(), exe, port, protocol);
     if (!existing)
         checked(rules->Add(rule.Get()));
 }
 } // namespace
-static FirewallState firewall_state_impl(const fs::path& exe, uint16_t port, bool internet) noexcept {
+static FirewallState firewall_state_impl(const fs::path& exe, uint16_t port, bool internet,long wanted=NET_FW_IP_PROTOCOL_TCP) noexcept {
     try {
         if (!port)
             return FirewallState::unknown;
@@ -201,12 +201,12 @@ static FirewallState firewall_state_impl(const fs::path& exe, uint16_t port, boo
             if (!active || direction != NET_FW_RULE_DIR_IN || !(profiles & NET_FW_PROFILE2_PRIVATE))
                 continue;
             checked(rule->get_Protocol(&protocol));
-            if (protocol != NET_FW_IP_PROTOCOL_TCP && protocol != NET_FW_IP_PROTOCOL_ANY)
+            if (protocol != wanted && protocol != NET_FW_IP_PROTOCOL_ANY)
                 continue;
             auto app = property([&](BSTR* s) { return rule->get_ApplicationName(s); });
             if (!app.empty() && !same_exe(app, target))
                 continue;
-            if (protocol == NET_FW_IP_PROTOCOL_TCP &&
+            if (protocol == wanted &&
                 !ports_match(property([&](BSTR* s) { return rule->get_LocalPorts(s); }), port))
                 continue;
             checked(rule->get_Action(&action));
@@ -244,6 +244,9 @@ FirewallState firewall_state(const fs::path& exe, uint16_t port) noexcept {
 FirewallState public_firewall_state(const fs::path& exe, uint16_t port) noexcept {
     return firewall_state_impl(exe, port, true);
 }
+FirewallState public_udp_firewall_state(const fs::path& exe,uint16_t port) noexcept {
+    return firewall_state_impl(exe,port,true,NET_FW_IP_PROTOCOL_UDP);
+}
 uint32_t firewall_current_profiles() noexcept {
     try {
         ComScope com;
@@ -272,21 +275,24 @@ void firewall_public_allow(const fs::path& exe, uint16_t port) {
     ComPtr<INetFwRules> rules;
     checked(policy()->get_Rules(&rules));
     configure_rule(rules.Get(), L"Lantern 主机（公网）", exe_path(exe), port, NET_FW_IP_PROTOCOL_TCP, true);
+    configure_rule(rules.Get(), L"Lantern 主机（公网 UDP）", exe_path(exe), port, NET_FW_IP_PROTOCOL_UDP, true);
 }
 void firewall_public_remove(const fs::path& exe) {
     require_elevation();
     ComScope com;
     ComPtr<INetFwRules> rules;
     checked(policy()->get_Rules(&rules));
-    ComPtr<INetFwRule> rule;
-    Bstr name(L"Lantern 主机（公网）");
-    auto hr = rules->Item(name, &rule);
-    if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND))
-        return;
-    checked(hr);
-    if (!same_exe(property([&](BSTR* s) { return rule->get_ApplicationName(s); }), exe_path(exe)))
-        throw Error(Code::conflict, "公网规则属于另一程序");
-    checked(rules->Remove(name));
+    std::vector<std::wstring> owned;
+    // Validate every matching rule before removing any, preserving another installation's policy.
+    for(auto text:{L"Lantern 主机（公网）",L"Lantern 主机（公网 UDP）"}) {
+        ComPtr<INetFwRule> rule;Bstr name(text);auto hr=rules->Item(name,&rule);
+        if(hr==HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND))continue;
+        checked(hr);
+        if(!same_exe(property([&](BSTR* value){return rule->get_ApplicationName(value);}),exe_path(exe)))
+            throw Error(Code::conflict,"公网规则属于另一程序");
+        owned.emplace_back(text);
+    }
+    for(auto& name:owned)checked(rules->Remove(Bstr(name)));
 }
 void firewall_allow(const fs::path& exe, uint16_t port) {
     if (!port || !fs::is_regular_file(exe))
@@ -307,6 +313,7 @@ void firewall_allow(const fs::path& exe, uint16_t port) {
     auto target = exe_path(exe);
     configure_rule(rules.Get(), L"Lantern 主机", target, port, NET_FW_IP_PROTOCOL_TCP);
     configure_rule(rules.Get(), L"Lantern 主机（发现）", target, 47442, NET_FW_IP_PROTOCOL_UDP);
+    configure_rule(rules.Get(), L"Lantern 主机（媒体 UDP）", target, port, NET_FW_IP_PROTOCOL_UDP);
 }
 static bool request_firewall_change(const fs::path& exe, uint16_t port, const wchar_t* command) noexcept {
     try {

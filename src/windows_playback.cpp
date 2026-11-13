@@ -255,8 +255,20 @@ WindowsVideo::WindowsVideo(HWND h, const VideoConfig& cfg, std::shared_ptr<AvTim
     UINT token = 0;
     check(MFCreateDXGIDeviceManager(&token, &p.manager), "DXGI manager");
     check(p.manager->ResetDevice(p.device.Get(), token), "DXGI manager device");
-    check(CoCreateInstance(CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&p.decoder)),
-          "Windows H.264 decoder");
+    if(cfg.codec=="hevc") {
+        MFT_REGISTER_TYPE_INFO type{MFMediaType_Video,MFVideoFormat_HEVC};
+        IMFActivate** providers=nullptr;UINT32 count=0;
+        check(MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER,MFT_ENUM_FLAG_SYNCMFT|MFT_ENUM_FLAG_LOCALMFT|MFT_ENUM_FLAG_SORTANDFILTER,
+            &type,nullptr,&providers,&count),"HEVC decoder discovery");
+        HRESULT result=E_FAIL;
+        for(UINT32 i=0;i<count;i++) {if(!p.decoder)result=providers[i]->ActivateObject(IID_PPV_ARGS(&p.decoder));providers[i]->Release();}
+        CoTaskMemFree(providers);
+        if(!p.decoder)throw Error(Code::unsupported,"Windows HEVC decoder unavailable; negotiate H.264");
+        (void)result;
+    } else {
+        check(CoCreateInstance(CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&p.decoder)),
+              "Windows H.264 decoder");
+    }
     ComPtr<IMFAttributes> attrs;
     check(p.decoder->GetAttributes(&attrs), "Decoder attributes");
     if (!MFGetAttributeUINT32(attrs.Get(), MF_SA_D3D11_AWARE, 0))
@@ -268,7 +280,7 @@ WindowsVideo::WindowsVideo(HWND h, const VideoConfig& cfg, std::shared_ptr<AvTim
     ComPtr<IMFMediaType> input;
     check(MFCreateMediaType(&input), "H.264 type");
     input->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    input->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+    input->SetGUID(MF_MT_SUBTYPE, cfg.codec=="hevc"?MFVideoFormat_HEVC:MFVideoFormat_H264);
     MFSetAttributeSize(input.Get(), MF_MT_FRAME_SIZE, cfg.width, cfg.height);
     MFSetAttributeRatio(input.Get(), MF_MT_FRAME_RATE, cfg.fps, 1);
     input->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
@@ -281,7 +293,7 @@ WindowsVideo::WindowsVideo(HWND h, const VideoConfig& cfg, std::shared_ptr<AvTim
 WindowsVideo::~WindowsVideo() = default;
 void WindowsVideo::frame(std::span<const uint8_t> b, uint64_t pts, bool visible, double zoom) {
     p_->zoom = zoom;
-    if (b.empty() || b.size() > max_frame)
+    if (b.empty() || b.size() > max_video_frame)
         throw Error(Code::invalid, "H.264 packet bound");
     ComPtr<IMFSample> sample;
     check(MFCreateSample(&sample), "Compressed sample");
@@ -307,7 +319,15 @@ DecodeStats WindowsVideo::stats() const {
     return p_->counters;
 }
 std::string WindowsVideo::provider() const {
-    return "Windows-MF-H264-D3D11/DXVA/GPU-video-processor";
+    return "Windows-MF-"+p_->cfg.codec+"-D3D11/DXVA/GPU-video-processor";
+}
+bool WindowsVideo::supports_hevc() {
+    if(FAILED(MFStartup(MF_VERSION)))return false;
+    MFT_REGISTER_TYPE_INFO type{MFMediaType_Video,MFVideoFormat_HEVC};IMFActivate** providers=nullptr;UINT32 count=0;
+    auto result=MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER,MFT_ENUM_FLAG_SYNCMFT|MFT_ENUM_FLAG_LOCALMFT|MFT_ENUM_FLAG_SORTANDFILTER,
+        &type,nullptr,&providers,&count);
+    for(UINT32 i=0;i<count;i++)providers[i]->Release();CoTaskMemFree(providers);MFShutdown();
+    return SUCCEEDED(result)&&count>0;
 }
 struct WindowsAudio::Impl {
     ComPtr<IAudioClient> client;

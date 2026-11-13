@@ -28,6 +28,7 @@ FirewallState firewall_state(const fs::path& exe, uint16_t port) noexcept;
 void firewall_allow(const fs::path& exe, uint16_t port); // Explicit elevated CLI operation only.
 bool request_firewall_allow(const fs::path& exe, uint16_t port) noexcept;
 FirewallState public_firewall_state(const fs::path& exe, uint16_t port) noexcept;
+FirewallState public_udp_firewall_state(const fs::path& exe, uint16_t port) noexcept;
 uint32_t firewall_current_profiles() noexcept; // NET_FW_PROFILE2 bitmask; 0 unknown.
 void firewall_public_allow(const fs::path& exe, uint16_t port);
 void firewall_public_remove(const fs::path& exe);
@@ -38,6 +39,8 @@ struct ReachabilityReport {
     bool listening = false, dual_stack = false, stable_global_ipv6 = false, cgnat = false;
     bool internet_access = false, legacy_enabled = true;
     FirewallState public_firewall = FirewallState::unknown;
+    FirewallState public_udp_firewall = FirewallState::unknown;
+    bool udp_listening=false,udp_external_tested=false;
     uint32_t current_profiles = 0;
     UpnpReport upnp;
     std::vector<HostAddress> addresses;

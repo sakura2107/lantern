@@ -3,6 +3,13 @@
 #include "lantern/host_admin.hpp"
 #include "lantern/lan.hpp"
 #include "lantern/link_scheduler.hpp"
+#include "lantern/input_channel.hpp"
+#include "lantern/quality.hpp"
+#include "lantern/decoder_limits.hpp"
+#include "lantern/udp_media.hpp"
+#ifdef LANTERN_WITH_ADAPT_MEDIA
+#include "lantern/media_transcode.hpp"
+#endif
 #include "lantern/win.hpp"
 
 #include <deque>
@@ -16,6 +23,7 @@ struct Host::Impl {
     FileService files;
     FileJobs file_jobs;
     std::unique_ptr<DiscoveryResponder> discovery;
+    std::unique_ptr<UdpMediaServer> udp;
     std::atomic<SOCKET> listener{INVALID_SOCKET};
     std::atomic_bool stopped = false;
     LinkScheduler link{40 * 1024 * 1024};
@@ -31,7 +39,7 @@ struct Host::Impl {
     AuthenticationGuard auth_guard;
     uint32_t public_sessions = 0;
     std::atomic_bool internet_enabled = false;
-    UpnpLease upnp;
+    UpnpLease upnp,upnp_udp;
     std::string actual_bind;
     uint16_t actual_port = 0;
     struct ConnectionThread {
@@ -64,12 +72,36 @@ struct Host::Impl {
         if (peer.ended)
             return;
         peer.ended = true;
+        {
+            std::lock_guard lock(replay_mutex);
+            for(auto& [key,replay]:replay_inputs) if(key.first==peer.token) replay->input.cancel();
+        }
         ended_holds[peer.token] = std::chrono::steady_clock::now() + ended_hold;
     }
     std::vector<std::thread> workers;
     std::atomic_uint video_sessions = 0;
     std::atomic_uint audio_sessions = 0;
     std::atomic_uint preview_sessions = 0;
+    std::atomic_bool media_busy=false;
+    struct ReplayState {
+        InputReplay replay;
+        InputSession input;
+        uint64_t epoch;
+        std::chrono::steady_clock::time_point touched;
+    };
+    std::mutex replay_mutex;
+    std::map<std::pair<std::string,std::string>,std::unique_ptr<ReplayState>> replay_inputs;
+    struct VideoControl {
+        std::string owner;
+        QualitySettings settings;
+        uint32_t max_width=3840,max_height=2160,max_fps=120;
+        std::vector<DecoderMode> decoder_modes;
+        uint64_t initial_bps=0,revision=0;
+        bool keyframe=false;
+        QualityStatus status;
+    };
+    std::mutex video_mutex;
+    std::map<std::string,std::shared_ptr<VideoControl>> video_controls;
     Impl(const fs::path& s, const std::string& bind, uint16_t port)
         : state(s), identity(s / L"identity.dpapi", false), config(load_config(s / L"config.dpapi")),
           files(config.root), file_jobs(files) {
@@ -87,10 +119,12 @@ struct Host::Impl {
         getsockname(listener.load(), reinterpret_cast<sockaddr*>(&bound), &size);
         actual_port = ntohs(bound.ss_family == AF_INET6 ? reinterpret_cast<sockaddr_in6*>(&bound)->sin6_port
                                                         : reinterpret_cast<sockaddr_in*>(&bound)->sin_port);
+        try{udp=std::make_unique<UdpMediaServer>(actual_bind,actual_port);}catch(const Error&){}
         internet_enabled = config.internet_access;
         connections.reserve(128);
         discovery = std::make_unique<DiscoveryResponder>(actual_bind, actual_port, identity.fingerprint());
     }
+    ~Impl(){stop();udp.reset();} // Join UDP callbacks before scheduler/authorization members are destroyed.
     std::vector<ConnectionEndpoint> recommended(const Config& c) {
         auto addresses = host_addresses();
         std::erase_if(addresses, [&](auto& a) {
@@ -111,13 +145,100 @@ struct Host::Impl {
     }
     Bytes dispatch(Op op, Reader& r, uint32_t granted, Lane lane, InputSession& input,
                    std::unique_ptr<DirectorySearch>& search, const std::string& owner,
-                   const std::string& session) {
+                   const std::string& session, std::function<bool()> media_cancel = {}) {
         auto require = [&](uint32_t flag) {
             if (!(granted & flag))
                 throw Error(Code::unauthorized, "Permission denied for this action");
         };
         Writer w;
         switch (op) {
+#ifdef LANTERN_WITH_ADAPT_MEDIA
+        case Op::media_tracks: {
+            require(files_read);if(r.u32()!=1)throw Error(Code::unsupported,"Media tracks version");auto path=r.str();r.end();
+            auto tracks=media_tracks(files.media_source(path),media_cancel?media_cancel:[this]{return stopped.load();});
+            w.u32(1);w.u64(tracks.source.size);w.str(tracks.source.version);w.u64(tracks.duration_ms);w.u64(tracks.bitrate);
+            w.u32(tracks.width);w.u32(tracks.height);w.u32(tracks.hdr);w.u32(uint32_t(tracks.tracks.size()));
+            for(auto& track:tracks.tracks){w.u32(track.index);w.u32(track.kind);w.str(track.codec);w.str(track.language);w.str(track.title);}break;
+        }
+        case Op::media_segment: {
+            require(files_read);if(r.u32()!=2)throw Error(Code::unsupported,"Media segment version (fMP4 requires v2)");
+            auto path=r.str(),version=r.str(256);MediaAdaptOptions options;options.width=r.u32();options.height=r.u32();
+            options.audio=int32_t(r.u32());options.subtitle=int32_t(r.u32());auto segment=r.u32();r.end();
+            if(media_busy.exchange(true))throw Error(Code::busy,"One adapted media segment is already encoding");
+            struct Release {std::atomic_bool& busy;~Release(){busy=false;}} release{media_busy};
+            auto bytes=media_segment(files.media_source(path),version,options,segment,media_cancel?media_cancel:[this]{return stopped.load();});
+            w.u32(2);w.blob(bytes);break;
+        }
+#endif
+        case Op::desktop_probe: {
+            require(view);if(r.u32()!=1)throw Error(Code::unsupported,"Desktop probe version");r.end();
+            w.blob(Bytes(256*1024));break;
+        }
+        case Op::desktop_limits: {
+            require(view);if(r.u32()!=1)throw Error(Code::unsupported,"Desktop limits version");r.end();
+            auto displays=monitors();w.u32(1);w.u32(uint32_t(displays.size()));
+            for(uint32_t i=0;i<displays.size();++i) {
+                auto& display=displays[i];w.u32(i);w.u32(display.width);w.u32(display.height);w.u32(display.refresh_hz);w.str(display.name);
+                bool avc=false,hevc=false;
+                try{auto probe=open_desktop_stream(i,640,30,1'000'000,true);avc=true;hevc=probe->config().codec=="hevc";}catch(const Error&){}
+                w.u32(avc?1:0);w.u32(hevc?1:0);
+            }break;
+        }
+        case Op::desktop_update: {
+            require(view);if(r.u32()!=1)throw Error(Code::unsupported,"Desktop update version");
+            auto id=r.str(64);QualitySettings quality;quality.width=r.u32();quality.fps=r.u32();
+            auto automatic=r.u32(),keyframe=r.u32();
+            auto initial_bps=r.at<r.b.size()?r.u64():0;r.end();
+            if(automatic>1||keyframe>1)throw Error(Code::invalid,"Desktop update flags");
+            quality.automatic=automatic!=0;AdaptiveQuality::validate(quality);
+            std::lock_guard lock(video_mutex);auto it=video_controls.find(id);
+            if(it==video_controls.end()||it->second->owner!=owner)throw Error(Code::not_found,"Desktop stream unavailable");
+            auto& c=*it->second;
+            if(initial_bps)c.initial_bps=initial_bps;
+            if(c.settings.width!=quality.width||c.settings.fps!=quality.fps||c.settings.automatic!=quality.automatic){c.settings=quality;++c.revision;}
+            c.keyframe|=keyframe!=0;
+            auto& status=c.status;w.u32(1);w.u32(status.width);w.u32(status.fps);w.u32(status.bitrate);
+            w.str(status.codec);w.str(status.path);w.u32(status.selected_width);w.u32(status.constrained);w.u32(status.dropping);
+            break;
+        }
+        case Op::input_reliable: {
+            require(control);
+            if (lane != Lane::input || r.u32()!=1)
+                throw Error(Code::invalid,"Reliable input channel/version");
+            auto id=r.str(64); auto seq=r.u64(); auto nested=Op(r.u16()); auto payload=r.blob(8192);r.end();
+            if(!valid_sha(id)) throw Error(Code::invalid,"Input channel identifier");
+            switch(nested) {
+            case Op::input: case Op::click: case Op::pointer_gesture: case Op::double_click:
+            case Op::text_input: case Op::key_press: case Op::shortcut: case Op::right_click:
+            case Op::input_focus: break;
+            default: throw Error(Code::invalid,"Reliable input operation");
+            }
+            auto c=load_config(state/L"config.dpapi"); auto e=authorization_epoch(c,owner);
+            if(!e) throw Error(Code::unauthorized,"Input trust revoked");
+            std::lock_guard lock(replay_mutex);
+            auto now=std::chrono::steady_clock::now();
+            std::erase_if(replay_inputs,[&](auto& item) {
+                return now-item.second->touched>std::chrono::minutes(10) ||
+                    authorization_epoch(c,item.first.first)!=item.second->epoch;
+            });
+            auto key=std::make_pair(owner,id); auto it=replay_inputs.find(key);
+            if(it==replay_inputs.end()) {
+                if(replay_inputs.size()>=64) throw Error(Code::busy,"Reliable input channel capacity");
+                auto p=std::make_unique<ReplayState>();p->epoch=*e;p->touched=now;
+                it=replay_inputs.emplace(key,std::move(p)).first;
+            }
+            it->second->touched=now;
+            return it->second->replay.execute(seq,nested,payload,[&] {
+                Writer answer;answer.u64(seq);
+                try {
+                    Reader body{payload};auto result=dispatch(nested,body,granted,lane,it->second->input,search,owner,session);
+                    answer.u32(0);answer.str("");answer.blob(result);
+                } catch(const Error& error) {
+                    it->second->input.cancel();answer.u32(uint32_t(error.code));answer.str(error.what());answer.blob({});
+                }
+                return answer.b;
+            });
+        }
         case Op::endpoints: {
             r.end();
             auto current = load_config(state / L"config.dpapi");
@@ -261,7 +382,7 @@ struct Host::Impl {
         }
         case Op::capabilities:
             r.end();
-            w.str("Lantern/"
+            w.str(std::string("Lantern/"
                   "1;tls=1.2;files=paged,read,write,resume,sha256,sorted-v1,search-v1,thumbnail-v1,host-jobs-"
                   "v1;desktop=gdi-jpeg,pull,input,multi-monitor;"
                   "input=atomic-click-v1,gesture-v1,unicode-ime-v1,native-focus-v1,atomic-shortcut-v1,right-"
@@ -270,7 +391,11 @@ struct Host::Impl {
                   "pcm16-v1,codec-negotiation-v2;privacy-screen="
                   "unsupported;virtual-"
                   "display=unsupported;hardware-codec=optional-nvenc-h264;desktop-stream=h264-v1,h264-clock-"
-                  "v2;av-clock=host-qpc-v1;session=end-v1;pair=qr-v1;endpoints=v1");
+                  "v2,adaptive-v3;av-clock=host-qpc-v1;session=end-v1;pair=qr-v1;endpoints=v1;input-replay=v1;desktop-quality=v3")+(udp?";datagram=av-v1;decoder-table=v1":";datagram=unavailable")
+#ifdef LANTERN_WITH_ADAPT_MEDIA
+                  +";media-adapt=hevc-hls-fmp4-v2"
+#endif
+            );
             break;
         case Op::list: {
             require(files_read);
@@ -683,7 +808,7 @@ struct Host::Impl {
                 auto op = Op(r.u16());
                 send_lane = op == Op::audio_stream                          ? Lane::audio
                             : (op == Op::desktop_stream || op == Op::frame) ? Lane::desktop
-                            : op == Op::read ? (lane == Lane::media ? Lane::media : Lane::bulk)
+                            : (op == Op::read || op == Op::media_segment) ? (lane == Lane::media ? Lane::media : Lane::bulk)
                             : (op == Op::thumbnail || op == Op::files_page || op == Op::list ||
                                op == Op::files_search || op == Op::upload_chunk)
                                 ? Lane::bulk
@@ -709,7 +834,7 @@ struct Host::Impl {
                             throw Error(Code::unauthorized, "Desktop viewing permission required");
                         if (lane != Lane::desktop)
                             throw Error(Code::invalid, "Desktop streaming requires its own channel");
-                        stream_desktop(*tls, socket, r, token, session_epoch);
+                        stream_desktop(*tls, socket, r, token, session_epoch,cancelled);
                         break; // This connection belongs to the stream until it closes.
                     }
                     if (op == Op::audio_stream) {
@@ -717,11 +842,12 @@ struct Host::Impl {
                             throw Error(Code::unauthorized, "System audio permission required");
                         if (lane != Lane::audio)
                             throw Error(Code::invalid, "System audio requires its own channel");
-                        stream_audio(*tls, socket, r, token, session_epoch);
+                        stream_audio(*tls, socket, r, token, session_epoch,cancelled);
                         break;
                     }
                     auto body =
-                        dispatch(op, r, requested & *current_allowed, lane, input, search, token, session);
+                        dispatch(op, r, requested & *current_allowed, lane, input, search, token, session,
+                            [&,cancelled]{return stopped||cancelled->load()||peer_closed(socket);});
                     response.u32(0);
                     response.b.insert(response.b.end(), body.begin(), body.end());
                 } catch (const Error& e) {
@@ -761,11 +887,41 @@ struct Host::Impl {
         link.forget(flow);
         // Tls construction owns and closes socket, including failed handshakes.
     }
-    void stream_desktop(Tls& tls, SOCKET socket, Reader& request, const std::string& token, uint64_t epoch) {
+    std::shared_ptr<UdpMediaSession> udp_stream(Lane lane,std::shared_ptr<std::atomic_bool> cancelled,uint64_t flow) {
+        if(!udp)throw Error(Code::unsupported,"UDP listener unavailable");
+        return udp->create([this,cancelled]{return stopped||cancelled->load();},[this,lane,cancelled,flow](size_t bytes){
+            link.acquire(flow,lane,bytes,[this,cancelled]{return stopped||cancelled->load();});
+        });
+    }
+    static void media_path(Tls& tls,bool udp) {
+        Writer path;path.u16(protocol_version);path.u16(uint16_t(Op::media_path));path.u32(0);path.str(udp?"udp":"tcp");tls.send(path.b);
+    }
+    static bool peer_closed(SOCKET socket) {
+        fd_set read;FD_ZERO(&read);FD_SET(socket,&read);timeval wait{};
+        if(select(0,&read,nullptr,nullptr,&wait)<=0)return false;
+        char byte;return recv(socket,&byte,1,MSG_PEEK)<=0;
+    }
+    void stream_desktop(Tls& tls, SOCKET socket, Reader& request, const std::string& token, uint64_t epoch,
+                        std::shared_ptr<std::atomic_bool> cancelled) {
         auto version = request.u32();
-        if (version != 1 && version != 2)
+        if (version < 1 || version > 5)
             throw Error(Code::unsupported, "Desktop stream version mismatch");
         auto monitor = request.u32(), width = request.u32(), fps = request.u32(), bitrate = request.u32();
+        bool hevc=false;
+        auto controller=std::make_shared<VideoControl>();controller->owner=token;
+        controller->settings={width,fps,false};
+        if(version>=3) {
+            auto codec=request.u32();controller->max_width=request.u32();controller->max_height=request.u32();controller->max_fps=request.u32();
+            auto automatic=request.u32();controller->initial_bps=request.u64();
+            if(codec>1||automatic>1||controller->max_width<640||controller->max_width>3840||
+                controller->max_height<360||controller->max_height>2160||!controller->max_fps||controller->max_fps>120)
+                throw Error(Code::invalid,"Desktop decoder capability bound");
+            hevc=codec!=0;controller->settings.automatic=automatic!=0;AdaptiveQuality::validate(controller->settings);
+        }
+        if(version==5){auto n=request.u32();if(!n||n>64)throw Error(Code::invalid,"Decoder mode count");
+            for(uint32_t i=0;i<n;++i)controller->decoder_modes.push_back({request.u32(),request.u32(),request.u32()});
+            decoder_limit(controller->decoder_modes,fps,1920,1080);
+        }
         request.end();
         if (video_sessions.fetch_add(1) >= 2) {
             video_sessions.fetch_sub(1);
@@ -777,8 +933,29 @@ struct Host::Impl {
                 count.fetch_sub(1);
             }
         } release{video_sessions};
-        auto source = open_desktop_stream(monitor, width, fps, bitrate);
+        AdaptiveQuality adaptive;
+        uint32_t ceiling=3840;
+        uint32_t display_width=3840,display_height=2160;
+        auto decoder_ceiling=[&]{
+            if(!controller->decoder_modes.empty()){
+                auto mode=decoder_limit(controller->decoder_modes,controller->settings.fps,display_width,display_height);
+                controller->max_width=mode.width;controller->max_height=mode.height;controller->max_fps=mode.fps;
+            }
+            return std::min({3840u,display_width,controller->max_width,
+                uint32_t(uint64_t(controller->max_height)*display_width/display_height)});
+        };
+        if(version>=3) {
+            auto displays=monitors();if(monitor>=displays.size())throw Error(Code::invalid,"Monitor index");
+            auto& display=displays[monitor];
+            display_width=display.width;display_height=display.height;ceiling=decoder_ceiling();
+            adaptive.configure(controller->settings,ceiling,controller->initial_bps);
+            width=std::min(adaptive.state().width,ceiling);fps=std::min(fps,controller->max_fps);bitrate=adaptive.state().bitrate;
+        }
+        auto source = open_desktop_stream(monitor, width, fps, bitrate,hevc);
         const auto& cfg = source->config();
+        const auto stream_id=version>=3?random_token():std::string{};
+        struct EraseControl {Impl& host;const std::string& id;~EraseControl(){std::lock_guard lock(host.video_mutex);host.video_controls.erase(id);}} erase{*this,stream_id};
+        if(version>=3){std::lock_guard lock(video_mutex);video_controls[stream_id]=controller;}
         Writer opened;
         opened.u16(protocol_version);
         opened.u16(uint16_t(Op::desktop_stream));
@@ -791,8 +968,13 @@ struct Host::Impl {
         opened.str(cfg.capture_provider);
         opened.str(cfg.encoder_provider);
         opened.blob(cfg.headers);
-        if (version == 2)
+        if (version >= 2)
             opened.str("host-qpc-us");
+        if(version>=3){opened.str(stream_id);opened.str(cfg.codec);}
+        auto udp_flow=next_flow.fetch_add(1);
+        struct Forget {LinkScheduler& link;uint64_t id;~Forget(){link.forget(id);}} forget{link,udp_flow};
+        auto datagrams=version>=4?udp_stream(Lane::desktop,cancelled,udp_flow):nullptr;
+        if(datagrams)write_udp_offer(opened,datagrams->offer());
         tls.send(opened.b);
         try {
             // One frame in flight: while a send is slow no new frame is captured, so the next one is
@@ -808,11 +990,18 @@ struct Host::Impl {
             if (ready.u16() != protocol_version || ready.u16() != uint16_t(Op::desktop_ready) ||
                 ready.u32() != 1)
                 throw Error(Code::invalid, "Decoder readiness packet required");
+            auto want_udp=version>=4?ready.u32():0;
+            if(want_udp>1)throw Error(Code::invalid,"UDP readiness flag");
             ready.end();
+            bool using_udp=datagrams&&want_udp&&datagrams->ready();
+            if(version>=4)media_path(tls,using_udp);
             auto next_auth = std::chrono::steady_clock::now();
             auto next_frame = next_auth;
             auto frame_period = std::chrono::microseconds(1'000'000 / cfg.fps);
+            uint64_t revision=0,last_sample=0;bool slow=false;bool first_metadata=true;
             while (!stopped) {
+                if(cancelled->load()||peer_closed(socket))throw Error(Code::cancelled,"Desktop connection ended");
+                if(using_udp&&!datagrams->live()){using_udp=false;media_path(tls,false);source->request_keyframe();}
                 auto began = std::chrono::steady_clock::now();
                 if (began >= next_auth) {
                     auto current = load_config(state / L"config.dpapi");
@@ -823,16 +1012,42 @@ struct Host::Impl {
                         throw Error(Code::conflict, "Root changed; restart host");
                     next_auth = began + std::chrono::milliseconds(250);
                 }
+                bool changed=false;
+                if(version>=3) {
+                    std::lock_guard lock(video_mutex);
+                    auto now_ms=uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(began.time_since_epoch()).count());
+                    if(revision!=controller->revision) {
+                        ceiling=decoder_ceiling();
+                        adaptive.configure(controller->settings,ceiling,controller->initial_bps);revision=controller->revision;changed=true;
+                    }
+                    if(now_ms-last_sample>=1000) {
+                        bool shortage=slow||(using_udp&&datagrams->congested(cfg.fps));
+                        adaptive.sample(now_ms,shortage,!shortage&&controller->initial_bps>uint64_t(adaptive.state().bitrate)*14/10);
+                        last_sample=now_ms;changed=true;
+                    }
+                    if(changed)source->reconfigure(std::min(adaptive.state().width,ceiling),std::min(controller->settings.fps,controller->max_fps),adaptive.state().bitrate);
+                    if(controller->keyframe){source->request_keyframe();controller->keyframe=false;}
+                    controller->status=adaptive.state();controller->status.width=cfg.width;controller->status.fps=cfg.fps;controller->status.codec=cfg.codec;controller->status.path=using_udp?"udp":"tcp";
+                    frame_period=std::chrono::microseconds(1'000'000/cfg.fps);
+                }
                 auto frame = source->next();
                 Writer packet;
                 packet.u16(protocol_version);
                 packet.u16(uint16_t(Op::desktop_packet));
                 packet.u32(0);
                 packet.u64(frame.sequence);
-                packet.u64(version == 2 ? frame.clock_us : frame.pts_us);
+                packet.u64(version >= 2 ? frame.clock_us : frame.pts_us);
                 packet.u32(frame.flags);
-                packet.blob(frame.annex_b);
-                tls.send(packet.b); // One encoded frame, bounded socket buffer; no unbounded sender queue.
+                if(version>=3) {
+                    packet.u32(cfg.width);packet.u32(cfg.height);packet.u32(cfg.fps);packet.u32(cfg.bitrate);packet.str(cfg.codec);
+                    packet.blob(first_metadata||changed?cfg.headers:Bytes{});first_metadata=false;
+                    packet.u32(adaptive.state().selected_width);packet.u32(adaptive.state().constrained);packet.u32(adaptive.state().dropping);
+                }
+                packet.blob(frame.annex_b,version>=3?max_video_frame-512:max_frame-256);
+                auto sending=std::chrono::steady_clock::now();
+                if(using_udp)datagrams->send_frame(frame.sequence,packet.b);
+                else tls.send(packet.b); // TCP remains one fresh frame in flight.
+                slow=std::chrono::steady_clock::now()-sending>frame_period*2;
                 next_frame += frame_period;
                 auto now = std::chrono::steady_clock::now();
                 if (next_frame + frame_period < now)
@@ -851,11 +1066,12 @@ struct Host::Impl {
             }
         }
     }
-    void stream_audio(Tls& tls, SOCKET socket, Reader& request, const std::string& token, uint64_t epoch) {
+    void stream_audio(Tls& tls, SOCKET socket, Reader& request, const std::string& token, uint64_t epoch,
+                      std::shared_ptr<std::atomic_bool> cancelled) {
         auto version = request.u32();
-        if (version != 1 && version != 2)
+        if (version != 1 && version != 2 && version != 3)
             throw Error(Code::unsupported, "Audio stream version mismatch");
-        uint32_t preferred = version == 2 ? request.u32() : 0;
+        uint32_t preferred = version >= 2 ? request.u32() : 0;
         if (preferred > 1)
             throw Error(Code::unsupported, "Audio codec unsupported");
         request.end();
@@ -882,10 +1098,14 @@ struct Host::Impl {
         opened.u32(cfg.channels);
         opened.u32(cfg.bits);
         opened.str(cfg.provider);
-        if (version == 2) {
+        if (version >= 2) {
             opened.u32(codec);
             opened.u32(lookahead);
         }
+        auto udp_flow=next_flow.fetch_add(1);
+        struct Forget {LinkScheduler& link;uint64_t id;~Forget(){link.forget(id);}} forget{link,udp_flow};
+        auto datagrams=version==3?udp_stream(Lane::audio,cancelled,udp_flow):nullptr;
+        if(datagrams)write_udp_offer(opened,datagrams->offer());
         tls.send(opened.b);
         try {
             // A slow network no longer ends the stream: capture drops stale audio and resumes live
@@ -900,10 +1120,16 @@ struct Host::Impl {
             if (ready.u16() != protocol_version || ready.u16() != uint16_t(Op::audio_ready) ||
                 ready.u32() != 1)
                 throw Error(Code::invalid, "Audio readiness required");
+            auto want_udp=version==3?ready.u32():0;
+            if(want_udp>1)throw Error(Code::invalid,"UDP readiness flag");
             ready.end();
+            bool using_udp=datagrams&&want_udp&&datagrams->ready();
+            if(version==3)media_path(tls,using_udp);
             auto next_auth = std::chrono::steady_clock::now();
             uint64_t sequence = 0;
             while (!stopped) {
+                if(cancelled->load()||peer_closed(socket))throw Error(Code::cancelled,"Audio connection ended");
+                if(using_udp&&!datagrams->live()){using_udp=false;media_path(tls,false);}
                 auto began = std::chrono::steady_clock::now();
                 if (began >= next_auth) {
                     auto current = load_config(state / L"config.dpapi");
@@ -926,7 +1152,7 @@ struct Host::Impl {
                     packet.blob(encoder->encode(frame.pcm));
                 else
                     packet.blob(frame.pcm);
-                tls.send(packet.b);
+                if(using_udp)datagrams->send_frame(sequence-1,packet.b);else tls.send(packet.b);
             }
         } catch (const Error& error) {
             try {
@@ -947,6 +1173,7 @@ struct Host::Impl {
                     auto r = upnp.status();
                     if (r.ipv4.status != UpnpStatus::idle || r.ipv6.status != UpnpStatus::idle)
                         upnp.unmap();
+                    auto u=upnp_udp.status();if(u.ipv4.status!=UpnpStatus::idle||u.ipv6.status!=UpnpStatus::idle)upnp_udp.unmap();
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(250));
             }
@@ -969,6 +1196,15 @@ struct Host::Impl {
                     try {
                         auto current = load_config(state / L"config.dpapi");
                         internet_enabled = current.internet_access;
+                        {
+                            std::lock_guard lock(replay_mutex);
+                            std::erase_if(replay_inputs,[&](auto& entry) {
+                                auto scopes=authorized_scopes(current,entry.first.first);
+                                return current.root!=config.root || !scopes || !(*scopes & control) ||
+                                    authorization_epoch(current,entry.first.first)!=entry.second->epoch ||
+                                    std::chrono::steady_clock::now()-entry.second->touched>std::chrono::minutes(10);
+                            });
+                        }
                         file_jobs.authorize_all([&](const std::string& token) {
                             return current.root == config.root ? authorized_scopes(current, token).value_or(0)
                                                                : 0u;
@@ -1083,7 +1319,7 @@ struct Host::Impl {
             for (auto sock : active)
                 shutdown(sock, SD_BOTH);
         }
-        upnp.stop();
+        upnp.stop();upnp_udp.stop();
     }
 };
 Host::Host(const fs::path& s, const std::string& b, uint16_t p) : p_(std::make_unique<Impl>(s, b, p)) {}
@@ -1124,18 +1360,20 @@ UpnpReport Host::upnp_map(bool ipv4, bool ipv6) {
     }
     if (request.ipv4.empty() && request.ipv6.empty())
         throw Error(Code::not_found, "没有可用于路由器映射的稳定地址");
-    return p_->upnp.map(request);
+    auto report=p_->upnp.map(request);request.protocol=17;auto udp=p_->upnp_udp.map(request);
+    report.ipv4_udp=udp.ipv4;report.ipv6_udp=udp.ipv6;return report;
 }
 UpnpReport Host::upnp_unmap() {
-    return p_->upnp.unmap();
+    auto report=p_->upnp.unmap();auto udp=p_->upnp_udp.unmap();report.ipv4_udp=udp.ipv4;report.ipv6_udp=udp.ipv6;return report;
 }
 UpnpReport Host::upnp_status() const {
-    return p_->upnp.status();
+    auto report=p_->upnp.status();auto udp=p_->upnp_udp.status();report.ipv4_udp=udp.ipv4;report.ipv6_udp=udp.ipv6;return report;
 }
 ReachabilityReport Host::reachability_report(const fs::path& exe) const {
-    return lantern::reachability_report(load_config(p_->state / L"config.dpapi"), exe, p_->actual_bind,
+    auto report=lantern::reachability_report(load_config(p_->state / L"config.dpapi"), exe, p_->actual_bind,
                                         p_->actual_port, p_->listener.load() != INVALID_SOCKET,
-                                        p_->upnp.status());
+                                        upnp_status());
+    report.udp_listening=bool(p_->udp);report.public_udp_firewall=public_udp_firewall_state(exe,p_->actual_port);return report;
 }
 std::string Host::discovery_status() const {
     return p_->discovery->status();
