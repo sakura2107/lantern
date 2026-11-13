@@ -74,31 +74,42 @@ static void mkv(const fs::path& mp4,const fs::path& destination){
 static Bytes decoded_luma(const fs::path& path){AVFormatContext* format=nullptr;AVCodecContext* decoder=nullptr;AVPacket* packet=av_packet_alloc();AVFrame* frame=av_frame_alloc();Bytes pixels;
     auto cleanup=[&]{av_frame_free(&frame);av_packet_free(&packet);avcodec_free_context(&decoder);avformat_close_input(&format);};
     try{ok(avformat_open_input(&format,utf8(path.wstring()).c_str(),nullptr,nullptr),"segment demux");ok(avformat_find_stream_info(format,nullptr),"segment tracks");auto index=av_find_best_stream(format,AVMEDIA_TYPE_VIDEO,-1,-1,nullptr,0);ok(index,"segment video");
-        auto* codec=avcodec_find_decoder(AV_CODEC_ID_HEVC);decoder=avcodec_alloc_context3(codec);ok(avcodec_parameters_to_context(decoder,format->streams[index]->codecpar),"segment decode params");ok(avcodec_open2(decoder,codec,nullptr),"segment decode");
-        while(pixels.empty()&&av_read_frame(format,packet)>=0){if(packet->stream_index==index){check(packet->duration>0,"fMP4 video sample has nonzero duration including one-frame tail");ok(avcodec_send_packet(decoder,packet),"segment decode packet");if(avcodec_receive_frame(decoder,frame)>=0){check(frame->width==1280&&frame->height==720,"GPU adaptation resizes to client target");check(frame->format==AV_PIX_FMT_YUV420P,"10-bit source adapted to 8-bit compatible HEVC");for(int y=0;y<frame->height;y++)pixels.insert(pixels.end(),frame->data[0]+y*frame->linesize[0],frame->data[0]+y*frame->linesize[0]+frame->width);}}
+        auto* codec=avcodec_find_decoder(AV_CODEC_ID_H264);decoder=avcodec_alloc_context3(codec);ok(avcodec_parameters_to_context(decoder,format->streams[index]->codecpar),"segment decode params");ok(avcodec_open2(decoder,codec,nullptr),"segment decode");
+        while(pixels.empty()&&av_read_frame(format,packet)>=0){if(packet->stream_index==index){ok(avcodec_send_packet(decoder,packet),"segment decode packet");if(avcodec_receive_frame(decoder,frame)>=0){check(frame->width==1280&&frame->height==720,"GPU adaptation resizes to client target");check(frame->format==AV_PIX_FMT_YUV420P,"10-bit source adapted to 8-bit H.264");for(int y=0;y<frame->height;y++)pixels.insert(pixels.end(),frame->data[0]+y*frame->linesize[0],frame->data[0]+y*frame->linesize[0]+frame->width);}}
             av_packet_unref(packet);}
         check(!pixels.empty(),"adapted segment independently decodes");cleanup();return pixels;
     }catch(...){cleanup();throw;}
 }
-static std::vector<uint64_t> decode_times(const Bytes& bytes){std::vector<uint64_t> result;
-    for(size_t i=4;i+16<=bytes.size();++i)if(std::memcmp(bytes.data()+i,"tfdt",4)==0){
-        auto count=bytes[i+4]==1?8u:4u;if(i+8+count>bytes.size())throw std::runtime_error("tfdt bound");
-        uint64_t time=0;for(size_t j=0;j<count;++j)time=(time<<8)|bytes[i+8+j];result.push_back(time);}
-    check(result.size()==2,"fMP4 has audio/video decode timelines");return result;}
+struct Timeline {int64_t video_first=-1,audio_first=-1,audio_end=-1;int audio_packets=0;};
+// Raw MPEG-TS timestamps (90 kHz) of one segment: the first video picture and the audio span it carries.
+static Timeline timeline(const fs::path& path){AVFormatContext* format=nullptr;AVPacket* packet=av_packet_alloc();Timeline t;
+    auto cleanup=[&]{av_packet_free(&packet);avformat_close_input(&format);};
+    try{ok(avformat_open_input(&format,utf8(path.wstring()).c_str(),nullptr,nullptr),"segment demux");check(std::string(format->iformat->name)=="mpegts","segment is MPEG-TS");ok(avformat_find_stream_info(format,nullptr),"segment tracks");
+        while(av_read_frame(format,packet)>=0){auto* stream=format->streams[packet->stream_index];auto pts=av_rescale_q(packet->pts,stream->time_base,{1,90000});
+            if(stream->codecpar->codec_type==AVMEDIA_TYPE_VIDEO){check(stream->codecpar->codec_id==AV_CODEC_ID_H264,"adapted video is H.264");if(t.video_first<0||pts<t.video_first)t.video_first=pts;}
+            else if(stream->codecpar->codec_type==AVMEDIA_TYPE_AUDIO){check(stream->codecpar->codec_id==AV_CODEC_ID_AAC,"adapted audio is AAC");if(t.audio_first<0)t.audio_first=pts;t.audio_end=pts+av_rescale_q(1024,{1,48000},{1,90000});++t.audio_packets;}
+            av_packet_unref(packet);}
+        cleanup();return t;
+    }catch(...){cleanup();throw;}
+}
 int wmain(int argc,wchar_t** argv){try{
     if(argc==3){int seconds=std::stoi(argv[2]);if(seconds<4||seconds>30)throw std::runtime_error("Generated fixture duration bound");
         fs::path root(argv[1]);fs::create_directories(root);fixture(root/L"source.mp4",seconds);mkv(root/L"source.mp4",root/L"source.mkv");std::cout<<"Generated fixture seconds: "<<seconds<<'\n';return 0;}
-    if(argc<2)return 2;auto root=fs::absolute(argv[1])/wide(random_token().substr(0,12));fs::create_directories(root);auto start=std::chrono::steady_clock::now();fixture(root/L"source.mp4");mkv(root/L"source.mp4",root/L"source.mkv");
+    if(argc<2)return 2;auto root=fs::absolute(argv[1])/wide(random_token().substr(0,12));fs::create_directories(root);auto start=std::chrono::steady_clock::now();fixture(root/L"source.mp4",5);mkv(root/L"source.mp4",root/L"source.mkv");
     FileService files(root);auto tracks=media_tracks(files.media_source("source.mkv"),[]{return false;});check(tracks.width==3840&&tracks.height==2160&&!tracks.hdr,"4K HEVC SDR source inspected");
     check(tracks.tracks.size()==2&&tracks.tracks[0].codec=="aac"&&tracks.tracks[1].codec=="ass","audio/ASS track list queried");
-    auto encode_start=std::chrono::steady_clock::now();auto plain=media_segment(files.media_source("source.mkv"),tracks.source.version,{1280,720,1,-1},0,[]{return false;});double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-encode_start).count();write_file(root/L"plain.mp4",plain);
-    auto burned=media_segment(files.media_source("source.mkv"),tracks.source.version,{1280,720,1,2},0,[]{return false;});write_file(root/L"burned.mp4",burned);
-    auto first=decoded_luma(root/L"plain.mp4"),second=decoded_luma(root/L"burned.mp4");uint64_t changed=0;for(size_t i=first.size()*3/4;i<first.size();i++)changed+=uint64_t(std::abs(int(first[i])-int(second[i])));check(changed>10000,"libass subtitle pixels burned into adapted video");
-    auto seek=media_segment(files.media_source("source.mkv"),tracks.source.version,{1280,720,1,2},1,[]{return false;});write_file(root/L"seek.mp4",seek);decoded_luma(root/L"seek.mp4");
-    auto tail=media_segment(files.media_source("source.mkv"),tracks.source.version,{1280,720,1,2},2,[]{return false;});write_file(root/L"tail.mp4",tail);decoded_luma(root/L"tail.mp4");
-    auto a=decode_times(plain),b=decode_times(seek),c=decode_times(tail);
-    check(a[0]<b[0]&&b[0]<c[0]&&a[1]<b[1]&&b[1]<c[1],"independent fMP4 segments retain increasing global decode times");
-    auto audio=media_tracks(files.media_source("burned.mp4"),[]{return false;});check(audio.tracks.size()==1&&audio.tracks[0].codec=="aac","adapted segment contains AAC track");
+    auto encode_start=std::chrono::steady_clock::now();auto plain=media_segment(files.media_source("source.mkv"),tracks.source.version,{1280,720,1,-1},0,[]{return false;});double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-encode_start).count();write_file(root/L"plain.ts",plain);
+    auto burned=media_segment(files.media_source("source.mkv"),tracks.source.version,{1280,720,1,2},0,[]{return false;});write_file(root/L"burned.ts",burned);
+    auto first=decoded_luma(root/L"plain.ts"),second=decoded_luma(root/L"burned.ts");uint64_t changed=0;for(size_t i=first.size()*3/4;i<first.size();i++)changed+=uint64_t(std::abs(int(first[i])-int(second[i])));check(changed>10000,"libass subtitle pixels burned into adapted video");
+    auto seek=media_segment(files.media_source("source.mkv"),tracks.source.version,{1280,720,1,2},1,[]{return false;});write_file(root/L"seek.ts",seek);decoded_luma(root/L"seek.ts");
+    auto tail=media_segment(files.media_source("source.mkv"),tracks.source.version,{1280,720,1,2},2,[]{return false;});write_file(root/L"tail.ts",tail);decoded_luma(root/L"tail.ts");
+    auto a=timeline(root/L"burned.ts"),b=timeline(root/L"seek.ts"),c=timeline(root/L"tail.ts");
+    check(a.video_first<b.video_first&&b.video_first<c.video_first,"independent segments keep one global video timeline");
+    check(b.video_first-a.video_first>=2*90000-3000&&b.video_first-a.video_first<=2*90000+3000,"second segment starts two seconds later");
+    // AAC frames tile across independently encoded segments: no repeated priming, no gap.
+    check(a.audio_end==b.audio_first&&b.audio_end==c.audio_first,"segment audio continues exactly where the previous ended");
+    check(a.audio_packets>=93&&a.audio_packets<=94&&b.audio_packets>=93&&b.audio_packets<=94,"two seconds of AAC per full segment");
+    auto audio=media_tracks(files.media_source("burned.ts"),[]{return false;});check(audio.tracks.size()==1&&audio.tracks[0].codec=="aac","adapted segment contains AAC track");
     bool changed_source=false;try{media_segment(files.media_source("source.mkv"),"invalid",{1280,720,1,-1},0,[]{return false;});}catch(const Error& e){changed_source=e.code==Code::source_changed;}check(changed_source,"source version conflict preserves original");
     bool cancelled=false;try{media_segment(files.media_source("source.mkv"),tracks.source.version,{1280,720,1,-1},0,[]{return true;});}catch(const Error& e){cancelled=e.code==Code::cancelled;}check(cancelled,"segment cancellation");
     std::ofstream report(root/L"media-transcode.json");report<<"{\"kind\":\"measured\",\"checks\":"<<checks<<",\"source_4k_hevc10_sdr\":true,\"nvdec_cuda_nvenc\":true,\"ass_burn_pixel_difference\":"<<changed<<",\"first_2s_segment_encode_seconds\":"<<seconds<<",\"first_segment_bytes\":"<<plain.size()<<",\"original_bytes\":"<<fs::file_size(root/L"source.mkv")<<",\"optical_playback_tested\":false}";

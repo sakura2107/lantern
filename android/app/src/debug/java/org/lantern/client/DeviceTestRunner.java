@@ -912,7 +912,7 @@ public final class DeviceTestRunner extends Instrumentation {
             check(listed[0], "actual UI pairing and file list");
             if (!v03MediaOnly && !v03Only && !audioOnly && !filesMediaOnly && !reliabilityOnly && !deviceTrustOnly && !toolsOnly && !safOnly) click(activity, "订阅桌面");
             if(v03TransportOnly){V03TransportValidation.run(this,credentials);
-            }else if(v03MediaOnly){V03HlsDecoderValidation.run(this,activity,credentials);
+            }else if(v03MediaOnly){V03MediaValidation.run(this,activity,credentials);V03HlsDecoderValidation.run(this,activity,credentials);
             }else if(v03Only){V03Validation.run(this,activity,credentials);
             }else if(safOnly){SafValidation.run(this,activity,credentials);
             }else if(toolsOnly){desktopToolsChecks(activity,credentials);

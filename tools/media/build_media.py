@@ -64,7 +64,7 @@ def main():
         '--enable-avcodec','--enable-avformat','--enable-avfilter','--enable-swresample','--enable-swscale',
         '--enable-demuxer=matroska,mov,mpegts',
         '--enable-decoder=h264,hevc,h264_cuvid,hevc_cuvid,aac,ac3,eac3,flac,mp3,opus,vorbis,pcm_s16le,ass,ssa,subrip',
-        '--enable-encoder=hevc_nvenc,aac','--enable-parser=h264,hevc,aac,ac3,flac,mpegaudio,opus,vorbis',
+        '--enable-encoder=h264_nvenc,hevc_nvenc,aac','--enable-parser=h264,hevc,aac,ac3,flac,mpegaudio,opus,vorbis',
         '--enable-muxer=hls,mpegts,mov,mp4,adts','--enable-protocol=file',
         '--enable-filter=buffer,buffersink,scale_cuda,hwdownload,hwupload_cuda,format,subtitles,ass,aresample,aformat,abuffer,abuffersink',
         '--enable-nvenc','--enable-nvdec','--enable-cuvid','--enable-ffnvcodec','--enable-cuda','--enable-cuda-llvm',

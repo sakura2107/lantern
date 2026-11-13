@@ -161,13 +161,13 @@ struct Host::Impl {
             for(auto& track:tracks.tracks){w.u32(track.index);w.u32(track.kind);w.str(track.codec);w.str(track.language);w.str(track.title);}break;
         }
         case Op::media_segment: {
-            require(files_read);if(r.u32()!=2)throw Error(Code::unsupported,"Media segment version (fMP4 requires v2)");
+            require(files_read);if(r.u32()!=3)throw Error(Code::unsupported,"Media segment version (MPEG-TS requires v3)");
             auto path=r.str(),version=r.str(256);MediaAdaptOptions options;options.width=r.u32();options.height=r.u32();
             options.audio=int32_t(r.u32());options.subtitle=int32_t(r.u32());auto segment=r.u32();r.end();
             if(media_busy.exchange(true))throw Error(Code::busy,"One adapted media segment is already encoding");
             struct Release {std::atomic_bool& busy;~Release(){busy=false;}} release{media_busy};
             auto bytes=media_segment(files.media_source(path),version,options,segment,media_cancel?media_cancel:[this]{return stopped.load();});
-            w.u32(2);w.blob(bytes);break;
+            w.u32(3);w.blob(bytes);break;
         }
 #endif
         case Op::desktop_probe: {
@@ -393,7 +393,7 @@ struct Host::Impl {
                   "display=unsupported;hardware-codec=optional-nvenc-h264;desktop-stream=h264-v1,h264-clock-"
                   "v2,adaptive-v3;av-clock=host-qpc-v1;session=end-v1;pair=qr-v1;endpoints=v1;input-replay=v1;desktop-quality=v3")+(udp?";datagram=av-v1;decoder-table=v1":";datagram=unavailable")
 #ifdef LANTERN_WITH_ADAPT_MEDIA
-                  +";media-adapt=hevc-hls-fmp4-v2"
+                  +";media-adapt=h264-hls-ts-v3"
 #endif
             );
             break;

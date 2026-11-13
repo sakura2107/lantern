@@ -195,9 +195,9 @@ handle across Activity recreation while the external player is still using it.
 Choose original on LAN and adaptation on mobile data in the UI; the backend
 does not silently choose a route or launch another app.
 
-HLS v2 uses HEVC/hvc1 and AAC in fragmented MP4 with EXT-X-MAP. The platform
-MediaPlayer failure is retained as a compatibility limit; do not promise all
-third-party players accept the URL. The debug HLS HTTP/extractor/codec consumer
+HLS v3 uses H.264 High and AAC stereo in MPEG-TS with a version-3 VOD playlist
+(seg/N.ts). Android's system MediaPlayer plays it; third-party apps are not yet
+verified and must allow cleartext loopback HTTP. The debug HLS HTTP/extractor/codec consumer
 is validation only, not a restored production movie UI. Windows adaptation
 playback is intentionally not exposed in this round.
 

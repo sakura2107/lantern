@@ -9,7 +9,7 @@ explicitly. No state-file format is changed by these additions.
 
 Op30 adds `input-replay=v1`, `desktop-quality=v3`, and, when the UDP listener exists,
 `datagram=av-v1;decoder-table=v1`. A host built with actual static media libraries
-adds `media-adapt=hevc-hls-fmp4-v2`; a build without them advertises no adaptation.
+adds `media-adapt=h264-hls-ts-v3`; a build without them advertises no adaptation.
 Existing desktop/audio capability strings and Op21 remain available. The new
 client selects desktop v1/v2 and H.264/TCP on old hosts; a v3 host permits online
 quality, v4 adds UDP, and v5 adds paired decoder limits. Old clients may request
@@ -137,22 +137,24 @@ Op70 requires files_read. Request `u32 1; str path`; response
 u32 width,height,hdr,count; count*(u32 index,kind; str codec,language,title)`.
 Kinds: audio=1, subtitle=2. Indexes are source stream indexes.
 
-Op71 requires files_read. Request `u32 2; str path,source_version;
+Op71 requires files_read. Request `u32 3; str path,source_version;
 u32 width,height; i32 audio_index,subtitle_index; u32 segment_index`.
-Audio -1 selects the default, subtitle -1 disables burning. Response
-`u32 2; blob self_contained_fragmented_mp4`, bounded below 4 MiB. Segments cover
-two seconds except the tail. AAC padding beyond the last video sample holds
-its last image. Each result includes ftyp/moov plus moof/mdat; tfdt retains one
-global timeline across independent encoder instances. The client exposes one
-init.mp4 and strips repeated initialization from seg/N.m4s. HLS version 7 uses
-EXT-X-MAP, VOD/ENDLIST, and independently decodable HEVC hvc1/AAC stereo media.
-HEVC MPEG-TS is deliberately not the v2 contract: Android's system container
-support is narrower than its MediaCodec capabilities. See
-[Android formats](https://developer.android.com/media/platform/supported-formats)
-and [HLS authoring](https://developer.apple.com/streaming/hls-authoring-specification-for-apple-devices.html).
+Audio -1 selects the default, -2 none; subtitle -1 disables burning. Response
+`u32 3; blob mpeg_ts`, bounded below 4 MiB. Segment count is
+max(1,(duration_ms+1499)/2000): two-second segments, a remainder under 0.5 s
+joining the last (<= 2.5 s). Each segment is an independent H.264 High (in-band
+SPS/PPS, AUD, IDR first, no B-frames) + AAC-LC 48 kHz stereo MPEG-TS on one
+global timeline (media origin + 1 s). Audio frames sit on a global 1024-sample
+grid; a segment carries exactly the frames starting inside it, encoded with two
+frames of pre/post-roll, so consecutive segments tile without repeats or gaps.
+Audio padding beyond the last video sample holds the last image. The client
+serves a version-3 VOD playlist of seg/N.ts. Older v2 (HEVC fMP4) requests are
+refused: Android's system HLS player demuxes only MPEG-TS, and its TS demuxer has
+no HEVC. See
+[Android formats](https://developer.android.com/media/platform/supported-formats).
 
 Adaptation uses NVDEC -> CUDA scaling -> NVENC, with optional bounded libass
-ASS composition, bitrate approximately one third of the source (750 kbps–10 Mbps).
+ASS composition, bitrate about 0.1 bit per output pixel, at most 1.2x the source (1–8 Mbps).
 HDR tone mapping and non-H264/HEVC GPU sources fail explicitly with unsupported;
 the UI should offer original playback. Source-version changes fail with code 10.
 One segment encodes per host; contention returns busy. Disconnect, cancellation,

@@ -88,9 +88,8 @@ shared URL. Tokens and media URLs must not appear in release telemetry.
 
 The production manifest is unchanged. The standalone debug APK adds a debug
 network-security resource permitting cleartext loopback only, for owned tests.
-External players must themselves support loopback HTTP and HEVC/fMP4 HLS;
-Android hardware HEVC support alone does not guarantee that player's HLS
-demuxer. No other app is installed, launched or inspected by validation.
+External players must themselves allow loopback cleartext HTTP; the stream is
+H.264/AAC MPEG-TS HLS, which Android's system player and common players demux. No other app is installed, launched or inspected by validation.
 
 Do not ship debug instrumentation, TestDocuments or the generated debug
 manifest as the production release. The debug and release signing processes

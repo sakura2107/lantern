@@ -212,4 +212,4 @@ lantern://pair?v=1&n=<percent-encoded UTF-8 hostname>&a=<IPv4,IPv4>&p=<port>&f=<
 
 ## v0.3 additions
 
-See [V03-PROTOCOL.md](V03-PROTOCOL.md) for desktop v3-v5, paired decoder capabilities, Op57-61/70-71, reliable input, AES-GCM UDP and fMP4 HLS.
+See [V03-PROTOCOL.md](V03-PROTOCOL.md) for desktop v3-v5, paired decoder capabilities, Op57-61/70-71, reliable input, AES-GCM UDP and MPEG-TS HLS.

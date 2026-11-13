@@ -67,28 +67,28 @@ struct Mux {
         if(size<0||out.bytes.size()+size>max_frame-512)return AVERROR(ENOSPC);
         out.bytes.insert(out.bytes.end(),data,data+size);return size;}
     Mux(){
-        try{ff(avformat_alloc_output_context2(&format,nullptr,"mp4",nullptr),"Fragmented MP4 output");auto* buffer=static_cast<uint8_t*>(av_malloc(65536));if(!buffer)throw std::bad_alloc();
+        try{ff(avformat_alloc_output_context2(&format,nullptr,"mpegts",nullptr),"MPEG-TS output");auto* buffer=static_cast<uint8_t*>(av_malloc(65536));if(!buffer)throw std::bad_alloc();
             io=avio_alloc_context(buffer,65536,1,this,nullptr,write,nullptr);if(!io){av_free(buffer);throw std::bad_alloc();}format->pb=io;format->flags|=AVFMT_FLAG_CUSTOM_IO;
             format->avoid_negative_ts=AVFMT_AVOID_NEG_TS_DISABLED;
         }catch(...){cleanup();throw;}
     }
     void cleanup(){if(format)avformat_free_context(format);if(io){av_freep(&io->buffer);avio_context_free(&io);}}
     ~Mux(){cleanup();}
-    AVStream* add(AVCodecContext* context){auto* stream=avformat_new_stream(format,nullptr);if(!stream)throw std::bad_alloc();ff(avcodec_parameters_from_context(stream->codecpar,context),"Output stream parameters");stream->time_base=context->time_base;
-        if(context->codec_id==AV_CODEC_ID_HEVC)stream->codecpar->codec_tag=MKTAG('h','v','c','1');return stream;}
-    void header(){AVDictionary* options=nullptr;av_dict_set(&options,"movflags","frag_keyframe+empty_moov+default_base_moof+omit_tfhd_offset+frag_discont",0);
-        av_dict_set(&options,"use_editlist","0",0);
+    AVStream* add(AVCodecContext* context){auto* stream=avformat_new_stream(format,nullptr);if(!stream)throw std::bad_alloc();ff(avcodec_parameters_from_context(stream->codecpar,context),"Output stream parameters");stream->time_base=context->time_base;return stream;}
+    // Timestamps are already global; the muxer must not rebase them per segment.
+    void header(){AVDictionary* options=nullptr;av_dict_set(&options,"mpegts_copyts","1",0);
         auto result=avformat_write_header(format,&options);av_dict_free(&options);ff(result,"Segment header");}
-    void packets(AVCodecContext* context,AVStream* stream){Packet packet;
+    // keep_from/keep_until (encoder time base, before the global offset) drop audio pre/post-roll packets.
+    void packets(AVCodecContext* context,AVStream* stream,int64_t keep_from=INT64_MIN,int64_t keep_until=INT64_MAX){Packet packet;
         while(true){int result=avcodec_receive_packet(context,packet.p);if(result==AVERROR(EAGAIN)||result==AVERROR_EOF)break;ff(result,"Encoded media packet");
-            // A one-picture tail has no following DTS from which MP4 can infer a duration.
-            // Zero-duration video tracks are rejected as empty by Android's extractor.
+            if(packet.p->pts!=AV_NOPTS_VALUE&&(packet.p->pts<keep_from||packet.p->pts>=keep_until)){av_packet_unref(packet.p);continue;}
+            // A one-picture tail still needs a duration so the segment's video length is known.
             if(context->codec_type==AVMEDIA_TYPE_VIDEO&&packet.p->duration<=0){
                 auto rate=context->framerate.num>0&&context->framerate.den>0?context->framerate:AVRational{30,1};
                 packet.p->duration=std::max<int64_t>(1,av_rescale_q(1,av_inv_q(rate),context->time_base));
             }
-            // Keep one global timeline across independently encoded fragments. A fixed one-second
-            // origin keeps AAC priming timestamps positive without per-segment timestamp shifts.
+            // Keep one global timeline across independently encoded segments. A fixed one-second
+            // origin keeps every timestamp positive without per-segment shifts.
             auto offset=av_rescale_q(AV_TIME_BASE,AV_TIME_BASE_Q,context->time_base);
             if(packet.p->pts!=AV_NOPTS_VALUE)packet.p->pts+=offset;if(packet.p->dts!=AV_NOPTS_VALUE)packet.p->dts+=offset;
             av_packet_rescale_ts(packet.p,context->time_base,stream->time_base);packet.p->stream_index=stream->index;ff(av_interleaved_write_frame(format,packet.p),"Segment packet");av_packet_unref(packet.p);}
@@ -167,7 +167,10 @@ Bytes media_segment(MediaSource source,const std::string& expected,MediaAdaptOpt
     if(options.width<320||options.width>2560||options.height<180||options.height>2160||segment>=43200)throw Error(Code::invalid,"Media adaptation bounds");
     Input input(std::move(source),std::move(stop));auto tracks=describe(input);
     if(tracks.hdr)throw Error(Code::unsupported,"HDR tone mapping is unavailable in adapted mode; use original playback");
-    if(!tracks.duration_ms||uint64_t(segment)*2000>=tracks.duration_ms)throw Error(Code::invalid,"Media segment outside duration");
+    // Two-second segments; a remainder under half a second joins the previous segment (last one <=2.5s),
+    // so no segment is a sliver holding one picture. Clients compute the same count: max(1,(ms+1499)/2000).
+    uint64_t segment_count=std::max<uint64_t>(1,(tracks.duration_ms+1499)/2000);
+    if(!tracks.duration_ms||segment>=segment_count)throw Error(Code::invalid,"Media segment outside duration");
     auto* format=input.format;int video=av_find_best_stream(format,AVMEDIA_TYPE_VIDEO,-1,-1,nullptr,0);ff(video,"Video track");
     auto* video_stream=format->streams[video];auto codec_id=video_stream->codecpar->codec_id;
     if(video_stream->codecpar->width<2||video_stream->codecpar->height<2||video_stream->codecpar->width>8192||video_stream->codecpar->height>4320||
@@ -199,19 +202,31 @@ Bytes media_segment(MediaSource source,const std::string& expected,MediaAdaptOpt
         fifo.p=av_audio_fifo_alloc(AV_SAMPLE_FMT_FLTP,2,4096);if(!fifo.p)throw std::bad_alloc();
     }
     auto origin=format->start_time==AV_NOPTS_VALUE?0:format->start_time;
-    int64_t begin=origin+int64_t(segment)*2*AV_TIME_BASE,end=std::min(begin+2*AV_TIME_BASE,origin+int64_t(tracks.duration_ms)*1000);
-    ff(av_seek_frame(format,video,av_rescale_q(begin,AV_TIME_BASE_Q,video_stream->time_base),AVSEEK_FLAG_BACKWARD),"Media seek");
+    bool last_segment=segment+1==segment_count;
+    int64_t begin=origin+int64_t(segment)*2*AV_TIME_BASE,end=last_segment?origin+int64_t(tracks.duration_ms)*1000:begin+2*AV_TIME_BASE;
+    // Audio uses one global grid of 1024-sample AAC frames (48 kHz from the media origin). A segment keeps
+    // the frames that start inside its two seconds, so consecutive segments tile without repeats or gaps.
+    // Two frames of real audio are encoded before and after and then dropped, so the overlap windows at
+    // each boundary come from the same signal and the player's continuous decoder hears no click.
+    const int64_t grid=1024;
+    int64_t keep_from=(int64_t(segment)*96000+grid-1)/grid*grid;
+    int64_t keep_until=last_segment?INT64_MAX:(int64_t(segment+1)*96000+grid-1)/grid*grid;
+    int64_t feed_from=std::max<int64_t>(0,keep_from-2*grid);
+    int64_t feed_from_us=origin+av_rescale(feed_from,AV_TIME_BASE,48000);
+    int64_t feed_until_us=last_segment?INT64_MAX:origin+av_rescale(keep_until+2*grid,AV_TIME_BASE,48000);
+    // Seek a little early so the audio pre-roll is still ahead of the demuxer position.
+    ff(av_seek_frame(format,video,av_rescale_q(std::max(origin,std::min(begin,feed_from_us)-AV_TIME_BASE/10),AV_TIME_BASE_Q,video_stream->time_base),AVSEEK_FLAG_BACKWARD),"Media seek");
     avcodec_flush_buffers(decoder.p);if(audio_decoder.p)avcodec_flush_buffers(audio_decoder.p);
     Codec encoder;Graph graph;AVFilterContext* buffers=nullptr,*sink=nullptr;Mux mux;AVStream* output_video=nullptr;
     if(audio_encoder.p)audio_stream=mux.add(audio_encoder.p);
-    bool header=false,video_done=false,audio_done=audio_index<0;int64_t audio_pts=int64_t(segment)*96000;
+    bool header=false,video_done=false,audio_done=audio_index<0,audio_started=false;int64_t audio_pts=feed_from;
     Frame last_before;
     auto audio_flush=[&](bool last){
         while(fifo.p&&av_audio_fifo_size(fifo.p)>0&&(last||av_audio_fifo_size(fifo.p)>=audio_encoder.p->frame_size)){
             Frame frame;frame.p->format=AV_SAMPLE_FMT_FLTP;frame.p->sample_rate=48000;ff(av_channel_layout_copy(&frame.p->ch_layout,&audio_encoder.p->ch_layout),"AAC frame layout");
             frame.p->nb_samples=std::min(av_audio_fifo_size(fifo.p),audio_encoder.p->frame_size);ff(av_frame_get_buffer(frame.p,0),"AAC frame buffer");
             ff(av_audio_fifo_read(fifo.p,reinterpret_cast<void**>(frame.p->data),frame.p->nb_samples),"Audio FIFO read");frame.p->pts=audio_pts;audio_pts+=frame.p->nb_samples;
-            ff(avcodec_send_frame(audio_encoder.p,frame.p),"AAC encode");if(header)mux.packets(audio_encoder.p,audio_stream);
+            ff(avcodec_send_frame(audio_encoder.p,frame.p),"AAC encode");if(header)mux.packets(audio_encoder.p,audio_stream,keep_from,keep_until);
         }
     };
     auto video_frame=[&](AVFrame* frame){
@@ -231,12 +246,18 @@ Bytes media_segment(MediaSource source,const std::string& expected,MediaAdaptOpt
         frame->pts=frame->best_effort_timestamp;ff(av_buffersrc_add_frame_flags(buffers,frame,AV_BUFFERSRC_FLAG_KEEP_REF),"GPU filter push");Frame resized;
         ff(av_buffersink_get_frame(sink,resized.p),"GPU filter frame");
         if(!encoder.p){
-            encoder.create(avcodec_find_encoder_by_name("hevc_nvenc"));encoder.p->width=int(width);encoder.p->height=int(height);encoder.p->pix_fmt=AV_PIX_FMT_CUDA;
+            // H.264 High in MPEG-TS: the only HLS video form Android's system player (and every
+            // external player) accepts. SPS/PPS travel in-band with each segment's IDR.
+            encoder.create(avcodec_find_encoder_by_name("h264_nvenc"));encoder.p->width=int(width);encoder.p->height=int(height);encoder.p->pix_fmt=AV_PIX_FMT_CUDA;
             encoder.p->hw_frames_ctx=av_buffer_ref(resized.p->hw_frames_ctx);encoder.p->time_base={1,90000};encoder.p->framerate=av_guess_frame_rate(format,video_stream,nullptr);
-            encoder.p->bit_rate=int64_t(std::clamp<uint64_t>(tracks.bitrate/3,750000,10000000));encoder.p->rc_max_rate=encoder.p->bit_rate;encoder.p->rc_buffer_size=int(encoder.p->bit_rate*2);
-            encoder.p->flags|=AV_CODEC_FLAG_GLOBAL_HEADER;
-            encoder.p->gop_size=std::max(1,int(std::ceil(av_q2d(encoder.p->framerate)*2)));encoder.p->max_b_frames=0;
+            double fps=encoder.p->framerate.num>0&&encoder.p->framerate.den>0?std::clamp(av_q2d(encoder.p->framerate),1.0,120.0):30.0;
+            // About 0.1 bit per pixel, never far above the source; the 8 Mbps cap keeps a worst-case
+            // 2.5-second final segment (rate*2.5 + one-second buffer) inside one 4 MiB protocol frame.
+            uint64_t wanted=uint64_t(double(width)*height*fps*0.1);if(tracks.bitrate)wanted=std::min<uint64_t>(wanted,tracks.bitrate*6/5);
+            encoder.p->bit_rate=int64_t(std::clamp<uint64_t>(wanted,1000000,8000000));encoder.p->rc_max_rate=encoder.p->bit_rate;encoder.p->rc_buffer_size=int(encoder.p->bit_rate);
+            encoder.p->gop_size=std::max(1,int(std::ceil(fps*2)));encoder.p->max_b_frames=0;
             ff(av_opt_set(encoder.p->priv_data,"preset","p4",0),"Media NVENC preset");ff(av_opt_set(encoder.p->priv_data,"tune","hq",0),"Media NVENC tune");
+            ff(av_opt_set(encoder.p->priv_data,"profile","high",0),"Media NVENC profile");ff(av_opt_set(encoder.p->priv_data,"aud","1",0),"Media NVENC delimiters");
             ff(avcodec_open2(encoder.p,encoder.p->codec,nullptr),"Media NVENC open");output_video=mux.add(encoder.p);mux.header();header=true;
         }
         if(subtitle){Frame cpu;ff(av_hwframe_transfer_data(cpu.p,resized.p,0),"Subtitle surface download");
@@ -249,15 +270,26 @@ Bytes media_segment(MediaSource source,const std::string& expected,MediaAdaptOpt
     };
     auto audio_frame=[&](AVFrame* frame){
         auto* stream=format->streams[audio_index];int64_t stamp=av_rescale_q(frame->best_effort_timestamp,stream->time_base,AV_TIME_BASE_Q);
-        if(stamp>=end){audio_done=true;return;}if(stamp+av_rescale(frame->nb_samples,AV_TIME_BASE,frame->sample_rate)<=begin)return;
-        int skip=stamp<begin?int(av_rescale(begin-stamp,frame->sample_rate,AV_TIME_BASE)):0;
-        int samples=std::min(frame->nb_samples-skip,int(av_rescale(end-std::max(stamp,begin),frame->sample_rate,AV_TIME_BASE)));
-        if(samples<=0)return;int planar=av_sample_fmt_is_planar(AVSampleFormat(frame->format)),bytes=av_get_bytes_per_sample(AVSampleFormat(frame->format));
+        if(stamp>=feed_until_us){audio_done=true;return;}if(stamp+av_rescale(frame->nb_samples,AV_TIME_BASE,frame->sample_rate)<=feed_from_us)return;
+        int skip=stamp<feed_from_us?int(av_rescale(feed_from_us-stamp,frame->sample_rate,AV_TIME_BASE)):0;
+        int samples=feed_until_us==INT64_MAX?frame->nb_samples-skip:
+            std::min(frame->nb_samples-skip,int(av_rescale(feed_until_us-std::max(stamp,feed_from_us),frame->sample_rate,AV_TIME_BASE)));
+        if(samples<=0)return;
+        if(!audio_started){audio_started=true;
+            // Audio that starts after the pre-roll point (stream start, or a late first packet) is
+            // placed at its real time by leading silence instead of being pulled earlier.
+            int64_t silence=av_rescale(std::max(stamp,feed_from_us)-feed_from_us,48000,AV_TIME_BASE);
+            if(silence>0){if(silence>48000*3)throw Error(Code::unsupported,"Audio starts far after the requested position");
+                Frame quiet;quiet.p->format=AV_SAMPLE_FMT_FLTP;quiet.p->sample_rate=48000;av_channel_layout_default(&quiet.p->ch_layout,2);quiet.p->nb_samples=int(silence);
+                ff(av_frame_get_buffer(quiet.p,0),"Audio silence buffer");ff(av_samples_set_silence(quiet.p->data,0,quiet.p->nb_samples,2,AV_SAMPLE_FMT_FLTP),"Audio silence");
+                ff(av_audio_fifo_realloc(fifo.p,av_audio_fifo_size(fifo.p)+quiet.p->nb_samples),"Audio FIFO capacity");
+                ff(av_audio_fifo_write(fifo.p,reinterpret_cast<void**>(quiet.p->data),quiet.p->nb_samples),"Audio silence write");}
+        }int planar=av_sample_fmt_is_planar(AVSampleFormat(frame->format)),bytes=av_get_bytes_per_sample(AVSampleFormat(frame->format));
         std::vector<const uint8_t*> data(size_t(planar?frame->ch_layout.nb_channels:1));for(size_t i=0;i<data.size();i++)data[i]=frame->extended_data[i]+skip*bytes*(planar?1:frame->ch_layout.nb_channels);
         Frame converted;converted.p->format=AV_SAMPLE_FMT_FLTP;converted.p->sample_rate=48000;av_channel_layout_default(&converted.p->ch_layout,2);
         converted.p->nb_samples=int(av_rescale_rnd(swr_get_delay(resampler.p,frame->sample_rate)+samples,48000,frame->sample_rate,AV_ROUND_UP));
         ff(av_frame_get_buffer(converted.p,0),"Audio conversion buffer");int got=swr_convert(resampler.p,converted.p->data,converted.p->nb_samples,data.data(),samples);ff(got,"Stereo resample");
-        if(av_audio_fifo_size(fifo.p)+got>48000*2)throw Error(Code::busy,"Bounded audio mux queue");
+        if(av_audio_fifo_size(fifo.p)+got>48000*4)throw Error(Code::busy,"Bounded audio mux queue");
         ff(av_audio_fifo_realloc(fifo.p,av_audio_fifo_size(fifo.p)+got),"Audio FIFO capacity");ff(av_audio_fifo_write(fifo.p,reinterpret_cast<void**>(converted.p->data),got),"Audio FIFO write");if(header)audio_flush(false);
     };
     Packet packet;Frame decoded;
@@ -273,7 +305,7 @@ Bytes media_segment(MediaSource source,const std::string& expected,MediaAdaptOpt
     if(!header&&last_before.p->width>0){last_before.p->best_effort_timestamp=av_rescale_q(begin,AV_TIME_BASE_Q,video_stream->time_base);video_frame(last_before.p);}
     if(!header)throw Error(Code::unsupported,"No decodable video at requested position");
     if(audio_decoder.p){ff(avcodec_send_packet(audio_decoder.p,nullptr),"Audio decoder drain");while(avcodec_receive_frame(audio_decoder.p,decoded.p)>=0){audio_frame(decoded.p);av_frame_unref(decoded.p);}audio_flush(true);
-        ff(avcodec_send_frame(audio_encoder.p,nullptr),"AAC drain");mux.packets(audio_encoder.p,audio_stream);}
+        ff(avcodec_send_frame(audio_encoder.p,nullptr),"AAC drain");mux.packets(audio_encoder.p,audio_stream,keep_from,keep_until);}
     ff(avcodec_send_frame(encoder.p,nullptr),"NVENC drain");mux.packets(encoder.p,output_video);ff(av_write_trailer(mux.format),"Segment finish");avio_flush(mux.io);
     check_cancel(input.stop);return std::move(mux.bytes);
 }

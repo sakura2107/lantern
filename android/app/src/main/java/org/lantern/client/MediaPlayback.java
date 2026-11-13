@@ -27,7 +27,7 @@ final class MediaPlayback {
     static Tracks query(Remote.Credentials c,String path)throws Exception{
         try(Remote remote=new Remote(c,1,2)){
             String caps=Remote.str(Remote.reader(remote.call(30,new byte[0])));
-            if(!caps.contains(";media-adapt=hevc-hls-fmp4-v2"))throw new IOException("电脑端未包含兼容的 fMP4 适配转码组件，请使用原画直读或下载后打开");
+            if(!caps.contains(";media-adapt=h264-hls-ts-v3"))throw new IOException("电脑端版本不支持适配本机屏幕，请更新电脑端，或使用原画播放");
             return new Tracks(Remote.reader(remote.call(70,Remote.body(o->{o.writeInt(1);Remote.str(o,path);} ))));
         }
     }
@@ -68,9 +68,13 @@ final class MediaPlayback {
             }catch(SocketTimeoutException idle){if(System.nanoTime()-lastRequest>30L*60*1_000_000_000)close();}
             catch(IOException error){if(!closed)failure="本机播放通道已关闭";return;}
         }}
+        // H.264/AAC in MPEG-TS with a version-3 playlist: Android's system player only demuxes TS
+        // (not fMP4) for HLS, and its TS demuxer has no HEVC. Every external player accepts this form.
+        // Two-second segments; a remainder under half a second joins the last one (<=2.5s). Same rule as the host.
+        static int segmentCount(long ms){return (int)Math.max(1,(ms+1499)/2000);}
         byte[] playlist(){
-            int count=(int)((tracks.durationMillis+1999)/2000);StringBuilder text=new StringBuilder("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MAP:URI=\"init.mp4\"\n");
-            for(int i=0;i<count;i++)text.append(String.format(Locale.ROOT,"#EXTINF:%.3f,\nseg/%d.m4s\n",Math.min(2000,tracks.durationMillis-i*2000)/1000.0,i));
+            int count=segmentCount(tracks.durationMillis);StringBuilder text=new StringBuilder("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:3\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n");
+            for(int i=0;i<count;i++)text.append(String.format(Locale.ROOT,"#EXTINF:%.3f,\nseg/%d.ts\n",(i==count-1?tracks.durationMillis-i*2000L:2000)/1000.0,i));
             text.append("#EXT-X-ENDLIST\n");return text.toString().getBytes(StandardCharsets.US_ASCII);
         }
         byte[] segment(int index)throws Exception{
@@ -83,23 +87,13 @@ final class MediaPlayback {
                     connections.add(remote);
                     try{
                         if(closed){remote.abort();throw new IOException("播放已结束");}
-                        DataInputStream r=Remote.reader(remote.call(71,Remote.body(o->{o.writeInt(2);Remote.str(o,path);Remote.str(o,tracks.version);o.writeInt(width);o.writeInt(height);o.writeInt(audio);o.writeInt(subtitle);o.writeInt(index);} )));
-                        if(r.readInt()!=2)throw new IOException("媒体分段版本");byte[] bytes=Remote.blob(r,Remote.MAX-512);if(r.available()!=0||bytes.length==0)throw new IOException("媒体分段无效");
+                        DataInputStream r=Remote.reader(remote.call(71,Remote.body(o->{o.writeInt(3);Remote.str(o,path);Remote.str(o,tracks.version);o.writeInt(width);o.writeInt(height);o.writeInt(audio);o.writeInt(subtitle);o.writeInt(index);} )));
+                        if(r.readInt()!=3)throw new IOException("媒体分段版本");byte[] bytes=Remote.blob(r,Remote.MAX-512);if(r.available()!=0||bytes.length==0)throw new IOException("媒体分段无效");
                         synchronized(cache){cache.put(index,bytes);}return bytes;
                     }finally{connections.remove(remote);}
                 }catch(Remote.RemoteError busy){if(busy.code!=8||System.nanoTime()>deadline){failure="分段 "+index+"："+busy.getMessage();throw busy;}Thread.sleep(100);}
                 finally{sockets.removeAll(attempts);}
             }throw new IOException("播放已结束");
-        }
-        static int fragmentOffset(byte[] bytes)throws IOException{
-            int at=0;boolean movie=false;
-            while(at<=bytes.length-8){java.nio.ByteBuffer box=java.nio.ByteBuffer.wrap(bytes,at,bytes.length-at);long size=Integer.toUnsignedLong(box.getInt());int type=box.getInt(),header=8;
-                if(size==1){if(box.remaining()<8)throw new IOException("MP4 box header");size=box.getLong();header=16;}
-                if(size<header||size>bytes.length-at)throw new IOException("MP4 box bound");
-                if(type==0x6d6f6f76)movie=true;
-                if(type==0x6d6f6f66){if(!movie)throw new IOException("MP4 initialization missing");return at;}
-                at+=(int)size;
-            }throw new IOException("MP4 fragment missing");
         }
         static String line(InputStream input,int[] budget)throws IOException{
             ByteArrayOutputStream bytes=new ByteArrayOutputStream();int previous=-1;
@@ -108,16 +102,17 @@ final class MediaPlayback {
         }
         void serve(Socket peer){try(Socket socket=peer){
             int[] budget={8192};InputStream input=socket.getInputStream();String[] request=line(input,budget).split(" ");
-            if(request.length!=3||(!request[0].equals("GET")&&!request[0].equals("HEAD"))||!request[2].equals("HTTP/1.1")){reply(socket,400,"text/plain",new byte[0],false,0,0);return;}
+            if(request.length!=3||(!request[0].equals("GET")&&!request[0].equals("HEAD"))||!request[2].startsWith("HTTP/1.")){reply(socket,400,"text/plain",new byte[0],false,0,0);return;}
             String host=null,range=null;for(int n=0;n<64;n++){String header=line(input,budget);if(header.isEmpty())break;int colon=header.indexOf(':');if(colon<1)throw new IOException("HTTP header");
                 String name=header.substring(0,colon).trim().toLowerCase(Locale.ROOT),value=header.substring(colon+1).trim();if(name.equals("host"))host=value;if(name.equals("range"))range=value;}
-            if(!("127.0.0.1:"+server.getLocalPort()).equals(host)||!request[1].startsWith("/"+token+"/")){reply(socket,404,"text/plain",new byte[0],false,0,0);return;}
+            // The random path token is the access check; players differ in how they spell the host.
+            String port=":"+server.getLocalPort();
+            if(host!=null&&!host.equals("127.0.0.1"+port)&&!host.equals("localhost"+port)&&!host.equals("127.0.0.1")&&!host.equals("localhost")||!request[1].startsWith("/"+token+"/")){reply(socket,404,"text/plain",new byte[0],false,0,0);return;}
             String file=request[1].substring(token.length()+2);byte[] bytes;String mime;
             if(file.equals("index.m3u8")){bytes=playlist();mime="application/vnd.apple.mpegurl";}
-            else if(file.equals("init.mp4")){byte[] complete=segment(0);bytes=Arrays.copyOf(complete,fragmentOffset(complete));mime="video/mp4";}
-            else if(file.matches("seg/[0-9]{1,5}\\.m4s")){
-                int index=Integer.parseInt(file.substring(4,file.length()-4));if(index<0||index>=(tracks.durationMillis+1999)/2000){reply(socket,404,"text/plain",new byte[0],false,0,0);return;}
-                byte[] complete=segment(index);bytes=Arrays.copyOfRange(complete,fragmentOffset(complete),complete.length);mime="video/iso.segment";
+            else if(file.matches("seg/[0-9]{1,5}\\.ts")){
+                int index=Integer.parseInt(file.substring(4,file.length()-3));if(index<0||index>=segmentCount(tracks.durationMillis)){reply(socket,404,"text/plain",new byte[0],false,0,0);return;}
+                bytes=segment(index);mime="video/mp2t";
             }else{reply(socket,404,"text/plain",new byte[0],false,0,0);return;}
             lastRequest=System.nanoTime();int begin=0,end=bytes.length;boolean partial=false;
             if(range!=null){if(!range.matches("bytes=[0-9]+-[0-9]*")){reply(socket,416,mime,new byte[0],false,0,0);return;}

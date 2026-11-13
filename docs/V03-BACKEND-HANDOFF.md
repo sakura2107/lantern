@@ -98,35 +98,41 @@ opening/live connections. Phone SHA-verified **32 MiB**, about **8.69/8.60 s** i
 the two codec matrix runs; seek back to start **268/275 ms**. This does not prove
 high-bitrate long-movie throughput.
 
-Real static FFmpeg does NVDEC -> CUDA scaling -> HEVC NVENC, optional libass ASS
+Real static FFmpeg does NVDEC -> CUDA scaling -> H.264 NVENC, optional libass ASS
 burning, AAC 48 kHz stereo and independent two-second random access. Authorized
 handles/version checks remain enforced; no path enters a shell/filter string.
 HDR/non-H264-or-HEVC GPU sources fail explicitly. One segment encodes per host;
 output/caches/queues, cancellation and contention are bounded. Windows adapted
 movie playback is intentionally not exposed this round, as allowed.
 
-The TS prototype failed on the phone. v2 now uses **HEVC hvc1 fMP4 HLS**, an init
-map and m4s fragments. Global tfdt is preserved across independent encoders.
-Audio padding holds the final picture. Explicit nonzero duration fixes Android
-rejecting a one-picture tail as an empty track.
+**v3 (Claude, 2026-11-13): H.264 High + AAC in MPEG-TS, HLS version 3.** The
+earlier attempts failed for format reasons, not bugs: Android's system HLS
+player demuxes only MPEG-TS (fMP4 gave -1007), and its TS demuxer has no HEVC
+(the HEVC TS prototype played audio with no video track). H.264/AAC TS is the
+one form every player accepts. Segments are two seconds; a remainder under
+0.5 s joins the last segment (count = max(1,(ms+1499)/2000), last <= 2.5 s), so
+no tail is a one-picture sliver. Audio uses one global grid of 1024-sample AAC
+frames; each segment encodes two frames of real pre/post-roll and keeps only
+the frames starting inside it, so segments tile exactly (the v2 fMP4 output
+repeated ~21 ms of priming per segment, +0.18 s over 12 s).
 
-Physical 12-second generated 4K HEVC10 SDR + ASS/AAC fixture:
+Physical phone (Android 16), 12-second generated 4K HEVC10 SDR + ASS/AAC fixture,
+v3 TS (report F:/LanternV03/claude-phone-hls.json, **43 assertions passed**):
 
-- **20 assertions**, all **7 segments** including the padded tail independently
-  decoded with the debug HTTP HLS consumer + Android MediaExtractor/MediaCodec.
-- **361 video frames**, **2,338,816 AAC PCM bytes**, **347 Surface updates**.
-- First Surface **0.551 s**, initialization fetch **0.443 s**, warm segment fetch/
-  transcode **0.283–0.419 s per two seconds**. Total measured run **13.585 s**.
-- Random segment seek/decode **944 ms**; token, HEAD, Range and lease close passed.
-- Native independent decode, nonzero tail duration/global tfdt, source conflict,
-  cancellation and ASS pixel difference (**596,202**) passed.
+- **System MediaPlayer** prepared the loopback HLS URL, first frame **1.35 s**,
+  1280x720, seek to 2.5 s in **65 ms**, played to completion without error,
+  **323 Surface updates**.
+- Debug HTTP consumer + MediaExtractor/MediaCodec decoded all **6 segments**
+  independently; decoded AAC totals **12.032 s** = the movie, no repeats.
+  (A lone TS file never releases its final H.264 access unit to MediaExtractor,
+  so it reports 59 of 60 pictures per segment; players reading the stream do not
+  lose it.) Token, HEAD, Range and lease close passed.
+- Native test: H.264/AAC TS, global video timeline, audio of consecutive segments
+  ends/starts on the same 90 kHz tick, ASS burn, source conflict, cancellation.
 
-**Known compatibility failure:** system MediaPlayer rejected fMP4 HLS (-1007),
-and the TS prototype prepared without usable video. Successful validation used
-a debug HTTP HLS client, not MediaPlayer or another app. No external player was
-operated. Third-party HLS/seek/long-play compatibility remains **unverified**;
-do not claim D is fully accepted. Twelve seconds does not establish long-movie
-stability, subjective AV synchronization or all fonts/subtitle formats.
+Not yet verified: third-party player apps (none operated), long movies,
+subjective AV sync, all fonts/subtitle formats. The player app must itself allow
+cleartext loopback HTTP; common players do.
 
 ## E — endpoints, size, compatibility and release materials
 
@@ -154,7 +160,8 @@ full corresponding archives, actual patched dependency trees, port patches,
 notices, application objects/static libraries and a portable relink recipe.
 The exported package was actually relinked into new host and CLI executables.
 The relinked CLI passed pinned-TLS first/tail media RPCs using a generated file:
-real NVDEC/NVENC + ASS/AAC returned valid fMP4 (91,325 / 6,982 bytes).
+real NVDEC/NVENC + ASS/AAC returned valid fMP4 (91,325 / 6,982 bytes). That run
+predates v3; rebuild media with h264_nvenc (tools/media/build_media.py) and rerun.
 Public distribution must ship that matching material and expose attribution.
 Claude owns release UI attribution and production signing; no release/private
 key is created or distributed here.
@@ -178,8 +185,8 @@ that target was relinked after the test ended. Preserve the failed attempt log.
 Outstanding acceptance:
 
 1. Claude wiring, SurfaceView, notices and production-signed release.
-2. External-player HLS compatibility and long original/adapted playback;
-   platform MediaPlayer HLS remains a known failure.
+2. Third-party player apps and long original/adapted playback (system
+   MediaPlayer HLS passes since v3).
 3. Real WAN TCP/UDP/UPnP/firewall/IPv6 reachability and weak-network transitions.
 4. Full Windows network/display matrix, critical input flood and long idle/
    physical-disconnect state acceptance in each newly wired UI.

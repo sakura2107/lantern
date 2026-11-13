@@ -33,15 +33,15 @@ try:
         if hashlib.sha256(tls.getpeercert(binary_form=True)).hexdigest()!=pin:raise RuntimeError('Certificate pin mismatch')
         call(tls,1,string(token)+struct.pack('>II',1,2))
         caps=call(tls,30);n=struct.unpack('>I',caps[:4])[0]
-        if b';media-adapt=hevc-hls-fmp4-v2' not in caps[4:4+n]:raise RuntimeError('Static media capability missing')
+        if b';media-adapt=h264-hls-ts-v3' not in caps[4:4+n]:raise RuntimeError('Static media capability missing')
         tracks=call(tls,70,struct.pack('>I',1)+string('movie.mkv'))
         if struct.unpack('>I',tracks[:4])[0]!=1:raise RuntimeError('Track version')
         n=struct.unpack('>I',tracks[12:16])[0];version=tracks[16:16+n].decode();duration=struct.unpack('>Q',tracks[16+n:24+n])[0]
         sizes=[]
-        for index in [0,(duration-1)//2000]:
-            body=struct.pack('>I',2)+string('movie.mkv')+string(version)+struct.pack('>IIiiI',1280,720,1,2,index)
+        for index in [0,max(1,(duration+1499)//2000)-1]:
+            body=struct.pack('>I',3)+string('movie.mkv')+string(version)+struct.pack('>IIiiI',1280,720,1,2,index)
             result=call(tls,71,body);schema,size=struct.unpack('>II',result[:8]);data=result[8:]
-            if schema!=2 or size!=len(data) or data[4:8]!=b'ftyp' or b'hvc1' not in data or b'moof' not in data:raise RuntimeError('Relinked fMP4 output invalid')
+            if schema!=3 or size!=len(data) or not data or data[0]!=0x47 or len(data)%188:raise RuntimeError('Relinked MPEG-TS output invalid')
             sizes.append(size)
     result={'relinked_cli_tls_pin_verified':True,'static_media_capability':True,'first_and_tail_nvdec_nvenc_ass_aac_rpc':True,'segment_bytes':sizes}
     pathlib.Path(a.report).write_text(json.dumps(result,indent=2),encoding='utf-8');print(json.dumps(result,indent=2))
