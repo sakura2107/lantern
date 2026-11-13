@@ -138,9 +138,14 @@ try {
   Shot $m 'host-devices'
   Cmd $m 51
   Shot $m 'host-sessions'
-  $sw = [Diagnostics.Stopwatch]::StartNew()
+  Check ([U]::SendMessage((& $c 64), 0xF0, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32() -eq 1) 'keep-awake option on by default'
+  Check ([U]::SendMessage((& $c 65), 0xF0, [IntPtr]::Zero, [IntPtr]::Zero).ToInt32() -eq 0) 'start with Windows is opt-in'
   [U]::SendMessage($m, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
-  Check ($mgr.WaitForExit(15000)) 'manager stops running host and closes'
+  Start-Sleep -Milliseconds 500
+  Check ((-not [U]::IsWindowVisible($m)) -and -not $mgr.HasExited) 'closing with a running host stays in the tray'
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  Cmd $m 401
+  Check ($mgr.WaitForExit(15000)) 'tray exit stops the host and closes'
   Write-Host ("manager close {0} ms" -f $sw.ElapsedMilliseconds)
 } finally { if (-not $mgr.HasExited) { $mgr | Stop-Process -Force } }
 Write-Host "PASSED $($checks.Count) checks"

@@ -6,6 +6,7 @@
 #include <commdlg.h>
 #include <fstream>
 #include <set>
+#include <shellapi.h>
 #include <shlobj.h>
 #include <thread>
 #include <wrl/client.h>
@@ -264,7 +265,10 @@ void layout() {
             ShowWindow(c(63), SW_HIDE);
         else
             s.place(c(63), dp(40));
-        y = s.bottom() + pad;
+        ui::Flow o(cx, cr, s.bottom() + dp(12), dp(8));
+        o.place(c(64), dp(34));
+        o.place(c(65), dp(34));
+        y = o.bottom() + pad;
         scene.card({x0, top, x0 + cw, y});
     }
     if (page == 0) {
@@ -539,6 +543,7 @@ void save_settings() {
     values["bind"] = text(c(13));
     values["port"] = text(c(14));
     values["mbps"] = text(c(36));
+    values["keep_awake"] = SendMessageW(c(64), BM_GETCHECK, 0, 0) == BST_CHECKED ? L"1" : L"0";
     std::error_code ec;
     fs::create_directories(file.parent_path(), ec);
     auto temp = file;
@@ -572,6 +577,8 @@ void load() {
 /** Startup: refill the network fields and load the last state folder. Never starts listening. */
 void restore_settings() {
     auto values = read_settings();
+    if (auto awake = values.find("keep_awake"); awake != values.end())
+        SendMessageW(c(64), BM_SETCHECK, awake->second == L"0" ? BST_UNCHECKED : BST_CHECKED, 0);
     for (auto [key, id] : {std::pair{"bind", 13}, std::pair{"port", 14}, std::pair{"mbps", 36}})
         if (auto it = values.find(key); it != values.end() && !it->second.empty())
             SetWindowTextW(c(id), it->second.c_str());
@@ -1688,6 +1695,167 @@ INT_PTR CALLBACK setup_proc(HWND dialog, UINT message, WPARAM w, LPARAM l) {
     }
     return FALSE;
 }
+// ---------------------------------------------------------------- tray, keep-awake, start with Windows
+// While a host runs, closing the window keeps it in the notification area; the tray menu stops it
+// and exits. "运行时阻止电脑睡眠" (default on) keeps the system awake only while the host runs (the
+// display may still turn off). "开机自动启动并开始监听" (default off, opt-in) adds a per-user Run
+// entry that starts this window hidden, loads the remembered host folder and starts listening.
+namespace tray {
+constexpr UINT icon_msg = WM_APP + 50;
+constexpr int open_id = 400, quit_id = 401;
+UINT taskbar_created = 0;
+bool added = false, quitting = false, told = false, autostarted = false;
+int show_command = SW_SHOWNORMAL;
+NOTIFYICONDATAW data() {
+    NOTIFYICONDATAW n{sizeof(n)};
+    n.hWnd = window;
+    n.uID = 1;
+    return n;
+}
+std::wstring tip() {
+    if (!host)
+        return L"Lantern 主机 · 未运行";
+    return L"Lantern 主机 · 运行中 · " + std::to_wstring(sessions.size()) + L" 个连接";
+}
+void update() {
+    auto n = data();
+    n.uFlags = NIF_TIP | NIF_SHOWTIP;
+    wcsncpy_s(n.szTip, tip().c_str(), _TRUNCATE);
+    if (added)
+        Shell_NotifyIconW(NIM_MODIFY, &n);
+}
+void add() {
+    auto n = data();
+    n.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+    n.uCallbackMessage = icon_msg;
+    n.hIcon = (HICON)SendMessageW(window, WM_GETICON, ICON_SMALL, 0);
+    if (!n.hIcon)
+        n.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wcsncpy_s(n.szTip, tip().c_str(), _TRUNCATE);
+    added = Shell_NotifyIconW(NIM_ADD, &n) != FALSE;
+    if (added) {
+        n.uVersion = NOTIFYICON_VERSION_4;
+        Shell_NotifyIconW(NIM_SETVERSION, &n);
+    }
+}
+void remove() {
+    if (!added)
+        return;
+    auto n = data();
+    Shell_NotifyIconW(NIM_DELETE, &n);
+    added = false;
+}
+void balloon(const wchar_t* title, const wchar_t* text) {
+    if (!added)
+        return;
+    auto n = data();
+    n.uFlags = NIF_INFO;
+    n.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
+    wcsncpy_s(n.szInfoTitle, title, _TRUNCATE);
+    wcsncpy_s(n.szInfo, text, _TRUNCATE);
+    Shell_NotifyIconW(NIM_MODIFY, &n);
+}
+void show_window() {
+    ShowWindow(window, IsIconic(window) ? SW_RESTORE : SW_SHOW);
+    SetForegroundWindow(window);
+}
+/** Window close while the host runs: stay in the tray (once explained by a notification). */
+bool hide_instead_of_close() {
+    if (quitting || !host || !added)
+        return false;
+    ShowWindow(window, SW_HIDE);
+    if (!told) {
+        told = true;
+        balloon(L"Lantern 主机仍在运行", L"手机和其他电脑可以继续连接。右键托盘图标可以停止并退出。");
+    }
+    return true;
+}
+void menu() {
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, open_id, L"打开主机管理");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, quit_id, host ? L"停止主机并退出" : L"退出");
+    POINT p{};
+    GetCursorPos(&p);
+    SetForegroundWindow(window);
+    int chosen = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, p.x, p.y, 0, window, nullptr);
+    DestroyMenu(m);
+    if (chosen == open_id)
+        show_window();
+    else if (chosen == quit_id) {
+        quitting = true;
+        PostMessageW(window, WM_CLOSE, 0, 0);
+    }
+}
+bool handle(UINT msg, WPARAM w, LPARAM l) {
+    if (taskbar_created && msg == taskbar_created) { // Explorer restarted
+        added = false;
+        add();
+        return true;
+    }
+    if (msg != icon_msg)
+        return false;
+    switch (LOWORD(l)) {
+    case WM_LBUTTONUP:
+    case WM_LBUTTONDBLCLK:
+    case NIN_SELECT:
+    case NIN_KEYSELECT:
+        show_window();
+        break;
+    case WM_CONTEXTMENU:
+    case WM_RBUTTONUP:
+        menu();
+        break;
+    }
+    (void)w;
+    return true;
+}
+
+// Keep-awake: the UI thread holds ES_SYSTEM_REQUIRED while a host runs and the option is on.
+bool keep_awake_on() {
+    return SendMessageW(c(64), BM_GETCHECK, 0, 0) == BST_CHECKED;
+}
+void keep_awake() {
+    SetThreadExecutionState(host && keep_awake_on() ? ES_CONTINUOUS | ES_SYSTEM_REQUIRED : ES_CONTINUOUS);
+}
+
+// Start with Windows: HKCU Run value. LANTERN_AUTOSTART_KEY redirects it (tests use their own key).
+std::wstring run_key() {
+    wchar_t buffer[512]{};
+    DWORD n = GetEnvironmentVariableW(L"LANTERN_AUTOSTART_KEY", buffer, 512);
+    return n && n < 512 ? std::wstring(buffer) : L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+}
+constexpr const wchar_t* run_value = L"Lantern Host";
+std::wstring run_command() {
+    return L"\"" + own_executable().wstring() + L"\" --autostart";
+}
+bool autostart_enabled() {
+    wchar_t value[1024]{};
+    DWORD size = sizeof(value), type = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, run_key().c_str(), run_value, RRF_RT_REG_SZ, &type, value, &size) != ERROR_SUCCESS)
+        return false;
+    return run_command() == value;
+}
+void set_autostart(bool on) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, run_key().c_str(), 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) !=
+        ERROR_SUCCESS)
+        throw Error(Code::io, "无法写入开机启动设置");
+    LSTATUS result;
+    if (on) {
+        auto command = run_command();
+        result = RegSetValueExW(key, run_value, 0, REG_SZ, (const BYTE*)command.c_str(),
+                                DWORD((command.size() + 1) * sizeof(wchar_t)));
+    } else {
+        result = RegDeleteValueW(key, run_value);
+        if (result == ERROR_FILE_NOT_FOUND)
+            result = ERROR_SUCCESS;
+    }
+    RegCloseKey(key);
+    if (result != ERROR_SUCCESS)
+        throw Error(Code::io, "无法写入开机启动设置");
+}
+} // namespace tray
 void command(int id) {
     if (id == 35) {
         if (host)
@@ -1841,9 +2009,28 @@ void command(int id) {
         check_firewall(false);
         pairing::host_changed();
         internet::refresh();
+        tray::keep_awake();
+        tray::update();
         layout();
     } else if (id == 16)
         stop();
+    else if (id == 64) {
+        tray::keep_awake();
+        save_settings();
+        message(tray::keep_awake_on() ? L"主机运行时会阻止电脑睡眠（屏幕仍可以按系统设置关闭）。"
+                                      : L"主机运行时不再阻止电脑睡眠；电脑睡眠后手机将连不上。");
+    } else if (id == 65) {
+        bool on = SendMessageW(c(65), BM_GETCHECK, 0, 0) == BST_CHECKED;
+        try {
+            tray::set_autostart(on);
+        } catch (...) {
+            SendMessageW(c(65), BM_SETCHECK, on ? BST_UNCHECKED : BST_CHECKED, 0);
+            throw;
+        }
+        save_settings();
+        message(on ? L"已设置开机自动启动：登录 Windows 后会在托盘里启动主机，并加载上次的配置开始监听。"
+                   : L"已取消开机自动启动。");
+    }
     else if (id == 34) {
         if (!admin)
             throw Error(Code::invalid, "先加载主机配置");
@@ -1905,6 +2092,8 @@ void command(int id) {
 }
 LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     try {
+        if (window == h && tray::handle(msg, w, l))
+            return 0;
         switch (msg) {
         case WM_CREATE: {
             window = h;
@@ -1946,6 +2135,10 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             button(16, 2, Kind::Danger, L"停止主机", g::stop);
             button(62, 2, Kind::Secondary, L"扫码添加设备", phone_glyph);
             button(63, 2, Kind::Secondary, L"允许通过防火墙", g::shield);
+            button(64, 2, Kind::Chip, L"运行时阻止电脑睡眠");
+            button(65, 2, Kind::Chip, L"开机自动启动并开始监听");
+            SendMessageW(c(64), BM_SETCHECK, BST_CHECKED, 0);
+            SendMessageW(c(65), BM_SETCHECK, tray::autostart_enabled() ? BST_CHECKED : BST_UNCHECKED, 0);
             // Devices and permissions.
             child(19, 0, L"STATIC", L"旧共享凭据状态将在加载后显示。", SS_NOTIFY | SS_CENTERIMAGE | SS_ENDELLIPSIS);
             button(34, 0, Kind::Danger, L"禁用旧共享凭据", g::shield);
@@ -2010,6 +2203,23 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         }
         case WM_APP + 2:
             restore_settings();
+            tray::taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
+            tray::add();
+            if (tray::autostarted) {
+                bool started = false;
+                try {
+                    if (admin) {
+                        command(15);
+                        started = host != nullptr;
+                    } else
+                        message(L"开机自动启动未能开始监听：没有找到上次使用的主机配置。");
+                } catch (const std::exception& e) {
+                    message(L"开机自动启动未能开始监听：" + wide(e.what()));
+                }
+                tray::update();
+                if (!started)
+                    ShowWindow(h, tray::show_command);
+            }
             address_fingerprint = host_address_fingerprint();
             refresh_network_note();
             check_firewall(false);
@@ -2075,6 +2285,11 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         case WM_COMMAND: {
             if (closing)
                 return 0;
+            if (LOWORD(w) == tray::quit_id) { // tray "停止主机并退出" (also used by tests)
+                tray::quitting = true;
+                PostMessageW(h, WM_CLOSE, 0, 0);
+                return 0;
+            }
             auto notice = HIWORD(w);
             if (l && (notice == EN_SETFOCUS || notice == EN_KILLFOCUS)) {
                 ui::invalidate_field(window, scene, (HWND)l);
@@ -2134,9 +2349,11 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
                     }
                 }
                 internet::tick();
+                tray::update();
             }
             return 0;
         case WM_APP + 1:
+            SetThreadExecutionState(ES_CONTINUOUS); // the host stopped: allow sleep again
             if (server.joinable())
                 server.join();
             if (stopper.joinable())
@@ -2162,6 +2379,8 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         case WM_CLOSE:
             if (closing)
                 return 0;
+            if (tray::hide_instead_of_close())
+                return 0;
             closing = true;
             KillTimer(h, 1);
             hide_secret();
@@ -2174,6 +2393,8 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             DestroyWindow(h);
             return 0;
         case WM_DESTROY:
+            tray::remove();
+            SetThreadExecutionState(ES_CONTINUOUS);
             if (firewall_worker.joinable())
                 firewall_worker.join();
             internet::shutdown();
@@ -2217,7 +2438,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         return 1;
     ui::window_icons(h);
     ui::initial_size(h, 1180, 860);
-    ShowWindow(h, show);
+    // Started with Windows: the window stays hidden; once the remembered folder is restored
+    // (WM_APP + 2) the host starts listening, and the window only appears if that fails.
+    tray::autostarted = wcsstr(GetCommandLineW(), L"--autostart") != nullptr;
+    tray::show_command = show;
+    if (!tray::autostarted)
+        ShowWindow(h, show);
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0)
         if (!(pairing::w && IsDialogMessageW(pairing::w, &msg)) && !IsDialogMessageW(h, &msg)) {
