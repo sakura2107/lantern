@@ -1020,6 +1020,7 @@ public final class MainActivity extends Activity {
     // ---- Control: one reliable InputChannel per control session. The channel reconnects, replays
     // unacknowledged events and coalesces moves; nothing here turns control off because of the network.
     InputChannel input;                                        // UI thread
+    volatile String lastInputResult = "";                      // diagnostics: seq:code:reason
     final ArrayDeque<Object[]> inputBacklog = new ArrayDeque<>(); // {op, body, tag, move} waiting for capacity
     static final Object TAG_KEY = new Object(), TAG_TEXT = new Object(), TAG_DRAG_END = new Object();
     /** Left clicks probe the keyboard afterwards; right clicks only report a refusal. */
@@ -1050,6 +1051,7 @@ public final class MainActivity extends Activity {
                 });
             }
             public void result(long seq, int code, String reason, byte[] payload, Object tag) {
+                lastInputResult = seq + ":" + code + ":" + reason;
                 if (tag == null) return; // pointer moves
                 if (code != 0) { if (inputEpoch.get() == epoch) status(S.CONTROL_REFUSED + reason); return; }
                 if (tag instanceof Click) {

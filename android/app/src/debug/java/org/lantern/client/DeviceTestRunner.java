@@ -407,7 +407,7 @@ public final class DeviceTestRunner extends Instrumentation {
             });
             long before=a.controlClicksCompleted.get();
             inputTap(a,taps[0][0],taps[0][1]);
-            check(a.controlClicksCompleted.get()==before+1,"real control acknowledgment " + step);
+            check(a.controlClicksCompleted.get()==before+1,"real control acknowledgment " + step + " last=" + a.lastInputResult + " link=" + (a.controlLink==null?"normal":a.controlLink.phase+"/"+a.controlLink.recoveringMillis) + " input=" + (a.input==null?"none":a.input.pending()+"/"+a.input.acknowledged()));
             expected.put(new JSONObject().put("label",new String[]{"h264_landscape_center","h264_landscape_quarter","h264_zoom_pan_center","h264_portrait_center","jpeg_portrait_center"}[step])
                 .put("fraction_x",expectedFraction[0]).put("fraction_y",expectedFraction[1]));
         }
