@@ -222,6 +222,7 @@ void consume(Request request, AvcView.Target target) throws Exception {
         encodedBytes.set(0);
         DesktopSession session=new DesktopSession(remote,request.credentials,request.profile,preferHevc);
         activeSession=session;request.absolute=session.version>=2;
+        vsync.start();
         DesktopSession.Status format=session.status;
         codec=createDecoder(request,target,epoch,format,session.headers);
         failure="";
@@ -283,6 +284,7 @@ void consume(Request request, AvcView.Target target) throws Exception {
             drain(codec, info, target,request);
         }
     } finally {
+        vsync.stop();
         streamEpoch.compareAndSet(epoch,epoch+1);
         if (codec != null) {
             target.detach(codec);
@@ -305,6 +307,9 @@ MediaCodec createDecoder(Request request,AvcView.Target target,long epoch,Deskto
         else{byte[][] sets=parameterSets(headers);format.setByteBuffer("csd-0",ByteBuffer.wrap(sets[0]));format.setByteBuffer("csd-1",ByteBuffer.wrap(sets[1]));}
         format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE,16*1024*1024);
         format.setInteger(MediaFormat.KEY_PRIORITY,0);
+        // The stream rate, so the decoder clocks for it. (It does not lift ColorOS's untouched 60 Hz.)
+        format.setInteger(MediaFormat.KEY_FRAME_RATE,fps);
+        format.setInteger(MediaFormat.KEY_OPERATING_RATE,fps);
         String selected=null;
         for(MediaCodecInfo info:new MediaCodecList(MediaCodecList.REGULAR_CODECS).getCodecInfos()){
             if(info.isEncoder()||(Build.VERSION.SDK_INT>=29&&!info.isHardwareAccelerated()))continue;
@@ -321,7 +326,7 @@ MediaCodec createDecoder(Request request,AvcView.Target target,long epoch,Deskto
             decoderName=codec.getCodecInfo().getName();hardwareDecoder=Build.VERSION.SDK_INT>=29&&codec.getCodecInfo().isHardwareAccelerated();
             width=w;height=h;codec.configure(format,target.surface,null,0);target.attach(codec);
             // Ask the display for the stream's rate (e.g. 120 Hz) instead of the panel's power-saving default.
-            if(Build.VERSION.SDK_INT>=30)try{target.surface.setFrameRate(fps,Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);}catch(RuntimeException ignored){}
+            if(Build.VERSION.SDK_INT>=30)try{target.surface.setFrameRate(fps,Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);}catch(RuntimeException ignored){}
         codec.setOnFrameRenderedListener((c, pts, nano) -> {
             if (!current(request, target)||streamEpoch.get()!=epoch)
                 return;
@@ -345,6 +350,11 @@ MediaCodec createDecoder(Request request,AvcView.Target target,long epoch,Deskto
             return codec;
         }catch(Exception error){target.detach(codec);codec.release();throw error;}
 }
+// While a picture decodes, a frame callback runs every refresh. ColorOS otherwise drops an app that
+// has not been touched for a few seconds to 60 Hz on a 120 Hz panel (measured on the compositor:
+// a 120 fps picture showed 57 fps untouched); with the callback it stays at 120 Hz (85-97 shown).
+// Pacing releases to that cadence was tried and gave no measurable gain over releasing at once.
+final VsyncClock vsync=new VsyncClock();
 void drain(MediaCodec codec, MediaCodec.BufferInfo info, AvcView.Target target,Request request) {
     for (int i = 0; i < 32; i++) {
         int output = codec.dequeueOutputBuffer(info, 0);
@@ -378,6 +388,7 @@ public synchronized void close() {
     notifyAll();
     worker.interrupt();
     notifications.quitSafely();
+    vsync.quit();
     controls.shutdownNow();
 }
 }

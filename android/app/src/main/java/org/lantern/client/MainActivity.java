@@ -820,7 +820,8 @@ public final class MainActivity extends Activity {
     /**
      * Asks for a display mode while the desktop picture is up: twice the stream rate where the panel
      * has it (60 fps on 120 Hz absorbs network jitter), else its fastest mode; the system default
-     * otherwise. Some phones keep third-party apps at 60 Hz unless the window asks explicitly.
+     * otherwise. This sets the panel mode only: ColorOS's adaptive refresh still presents an app that
+     * has not been touched for a few seconds at 60 Hz (measured on the compositor), whatever it asks.
      */
     int preferredMode = -1;
     void preferRefresh(int fps) {
