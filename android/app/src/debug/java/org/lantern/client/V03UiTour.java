@@ -45,6 +45,19 @@ final class V03UiTour {
         V03Validation.until(() -> Sheet.current != fileSheet, 15000, "track picker not shown");
         t.snapshot(a, "tour-tracks");
         t.runOnMainSync(() -> Sheet.current.dismiss());
-        t.report.put("ui_tour_screens", 8);
+        // Saved computers: the verified connection is in the list with its secret and last entry.
+        Computers.Saved saved = Computers.find(a, c.pin);
+        t.check(saved != null && saved.secret(a).equals(c.token), "connected computer saved with its encrypted secret");
+        t.check(!saved.lastHost.isEmpty() && saved.lastPort > 0, "last working entry remembered");
+        t.check(NetworkDialer.WINNERS.containsKey(c.pin), "dialer tries the remembered entry first");
+        t.runOnMainSync(() -> a.ui.select(AppShell.DEVICE));
+        V03Validation.until(() -> a.ui.device.computersRow.getVisibility() == android.view.View.VISIBLE, 5000, "saved computers row hidden");
+        t.snapshot(a, "tour-device-computers");
+        t.runOnMainSync(a::showComputers);
+        V03Validation.until(() -> Sheet.current != null && Sheet.current.dialog.isShowing(), 5000, "computers sheet not shown");
+        Thread.sleep(500);
+        t.snapshot(a, "tour-computers-sheet");
+        t.runOnMainSync(() -> Sheet.current.dismiss());
+        t.report.put("ui_tour_screens", 10);
     }
 }

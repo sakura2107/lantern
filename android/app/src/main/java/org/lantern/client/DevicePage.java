@@ -22,6 +22,8 @@ final class DevicePage {
     final LinearLayout form, formHeader;
     final ImageView formChevron;
     final TextView notifyState;
+    final LinearLayout computersRow;
+    final TextView computersSummary;
     boolean formOpen = true, secretVisible;
 
     DevicePage(AppShell s) {
@@ -84,6 +86,32 @@ final class DevicePage {
         actions.addView(disconnect, xp);
         disconnect.setVisibility(View.GONE);
         hero.addView(actions, Ui.lp(-1, -2));
+
+        // Saved computers: shown once one exists; opens the switch/remove sheet.
+        computersRow = Ui.row(a);
+        computersRow.setPadding(Theme.dp(16), Theme.dp(14), Theme.dp(12), Theme.dp(14));
+        computersRow.setBackground(Ui.press(Ui.outline(Theme.SURFACE, Theme.LINE, 20), 20));
+        computersRow.setGravity(Gravity.CENTER_VERTICAL);
+        computersRow.addView(Ui.glyphTile(a, Glyph.MONITORS, Theme.INK, 0, 40, 12), Ui.lp(Theme.dp(40), Theme.dp(40)));
+        LinearLayout computerLines = Ui.column(a);
+        computerLines.addView(Ui.medium(a, S.COMPUTERS_ROW, 15, Theme.INK));
+        computersSummary = Ui.text(a, "", 13, Theme.MUTED);
+        Ui.oneLine(computersSummary);
+        computerLines.addView(computersSummary);
+        LinearLayout.LayoutParams clp = Ui.weight(1);
+        clp.setMarginStart(Theme.dp(12));
+        computersRow.addView(computerLines, clp);
+        ImageView computerChevron = new ImageView(a);
+        computerChevron.setImageDrawable(new Glyph(Glyph.CHEVRON_RIGHT, Theme.MUTED));
+        computersRow.addView(computerChevron, Ui.lp(Theme.dp(24), Theme.dp(24)));
+        computersRow.setOnClickListener(v -> a.showComputers());
+        computersRow.setFocusable(true);
+        Ui.role(computersRow, Button.class);
+        Ui.id(computersRow, "device.computers");
+        LinearLayout.LayoutParams crp = Ui.lp(-1, -2);
+        crp.topMargin = Theme.dp(12);
+        content.addView(computersRow, crp);
+        computersRow.setVisibility(View.GONE);
 
         // Pairing details; collapses to a one-line summary once saved.
         formHeader = Ui.row(a);
@@ -253,6 +281,13 @@ final class DevicePage {
         formHeader.setContentDescription(S.PAIRING + "，" + (open ? S.EXPANDED : S.COLLAPSED));
     }
 
+    /** Saved computers row: hidden until one exists; names the current one. */
+    void computers(java.util.List<Computers.Saved> saved, String currentPin) {
+        computersRow.setVisibility(saved.isEmpty() ? View.GONE : View.VISIBLE);
+        String current = S.COMPUTERS_NONE;
+        for (Computers.Saved c : saved) if (c.pin.equals(currentPin)) current = c.title();
+        computersSummary.setText(String.format(Locale.ROOT, S.COMPUTERS_ROW_SUMMARY, saved.size(), current));
+    }
     void summarize() {
         boolean hasHost = host.length() > 0, hasPin = pin.length() > 0, hasSecret = secret.length() > 0;
         if (hasHost && hasPin && hasSecret) formSummary.setText(String.format(Locale.ROOT, S.PAIRING_SAVED, host.getText().toString().trim()));

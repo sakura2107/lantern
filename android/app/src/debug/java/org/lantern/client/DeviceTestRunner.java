@@ -720,13 +720,13 @@ public final class DeviceTestRunner extends Instrumentation {
         report.put(prefix + "desktop_ui_draw_interval_ms_p50", percentile(intervals, .5));
         report.put(prefix + "desktop_ui_draw_interval_ms_p95", percentile(intervals, .95));
     }
-    Map<String,?> savedDevice,savedSecret;byte[] savedJournal;boolean journalExisted;
+    Map<String,?> savedDevice,savedSecret,savedComputers;byte[] savedJournal;boolean journalExisted;
     MainActivity validationActivity;
-    void saveUserState(Context c)throws Exception{savedDevice=new HashMap<>(c.getSharedPreferences("device",0).getAll());savedSecret=new HashMap<>(c.getSharedPreferences("secret",0).getAll());File journal=new File(c.getFilesDir(),"transfers/tasks.json");journalExisted=journal.exists();if(journalExisted)savedJournal=java.nio.file.Files.readAllBytes(journal.toPath());}
+    void saveUserState(Context c)throws Exception{savedDevice=new HashMap<>(c.getSharedPreferences("device",0).getAll());savedSecret=new HashMap<>(c.getSharedPreferences("secret",0).getAll());savedComputers=new HashMap<>(c.getSharedPreferences("computers",0).getAll());File journal=new File(c.getFilesDir(),"transfers/tasks.json");journalExisted=journal.exists();if(journalExisted)savedJournal=java.nio.file.Files.readAllBytes(journal.toPath());}
     void restorePreference(Context c,String name,Map<String,?> values){if(values==null)return;android.content.SharedPreferences.Editor e=c.getSharedPreferences(name,0).edit().clear();for(Map.Entry<String,?> pair:values.entrySet()){Object value=pair.getValue();if(value instanceof String)e.putString(pair.getKey(),(String)value);else if(value instanceof Integer)e.putInt(pair.getKey(),(Integer)value);else if(value instanceof Boolean)e.putBoolean(pair.getKey(),(Boolean)value);else if(value instanceof Long)e.putLong(pair.getKey(),(Long)value);else if(value instanceof Float)e.putFloat(pair.getKey(),(Float)value);}e.commit();}
     void finishValidation(int code,Bundle result){
         try{Context c=getTargetContext();if(validationActivity!=null&&validationActivity.transfers!=null){runOnMainSync(()->validationActivity.transfers.close());long deadline=System.nanoTime()+5_000_000_000L;while(validationActivity.transfers.running!=null&&System.nanoTime()<deadline)Thread.sleep(20);}
-            restorePreference(c,"device",savedDevice);restorePreference(c,"secret",savedSecret);
+            restorePreference(c,"device",savedDevice);restorePreference(c,"secret",savedSecret);restorePreference(c,"computers",savedComputers);
             if(savedDevice!=null){File journal=new File(c.getFilesDir(),"transfers/tasks.json");if(journalExisted){android.util.AtomicFile atomic=new android.util.AtomicFile(journal);FileOutputStream out=atomic.startWrite();out.write(savedJournal);atomic.finishWrite(out);}else journal.delete();}
         }catch(Exception e){result.putString("restore_error",e.getClass().getSimpleName());}
         finish(code,result);

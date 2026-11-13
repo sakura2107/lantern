@@ -123,6 +123,14 @@ final class S {
     static final String Q_FPS_120 = "最跟手，电脑屏幕和手机都要支持高刷新率", Q_FPS_60 = "流畅，推荐", Q_FPS_30 = "省流量";
     static final String Q_CHANGED = "画质已切换为 %s", Q_AUTO_CHANGED = "已切换为自动画质，会按网络升降分辨率";
     static final String Q_SHORT = "网络跑不满 %s", Q_LOWER = "降到 %s";
+    static final String COMPUTERS_ROW = "已保存的电脑", COMPUTERS_ROW_SUMMARY = "%d 台 · 当前：%s · 点按切换";
+    static final String COMPUTERS_TITLE = "已保存的电脑", COMPUTERS_SUBTITLE = "点按一台即可切换连接；每台电脑的配对密钥分别加密保存在本机。";
+    static final String COMPUTERS_ADD = "添加电脑", COMPUTERS_ADD_DETAIL = "扫描另一台电脑上的配对二维码";
+    static final String COMPUTERS_REMOVE = "移除电脑", COMPUTERS_REMOVE_DETAIL = "从这台手机上删除保存的地址和配对密钥";
+    static final String COMPUTERS_REMOVE_SUBTITLE = "移除后，再连接这台电脑需要重新配对。";
+    static final String COMPUTERS_REMOVE_CONFIRM = "从手机上移除“%s”的地址和配对密钥？电脑上的授权不受影响，可以在电脑端撤销。";
+    static final String COMPUTERS_REMOVE_ACTION = "移除", COMPUTERS_REMOVED = "已移除“%s”";
+    static final String COMPUTERS_LAST_USED = "上次连接 %s", COMPUTERS_PRINT = "指纹 ", COMPUTERS_NONE = "无";
     static final String QUALITY_TITLE = "画质", QUALITY_SUBTITLE = "帧率是目标值，实际更新率显示在画面左上角。";
     static final String Q_SECTION_H264 = "硬件编码（H.264，需要电脑支持）", Q_SECTION_JPEG = "兼容模式（JPEG）";
     static final String Q_SMOOTH = "流畅", Q_SMOOTH_DETAIL = "1080p，60 fps，12 Mbps";

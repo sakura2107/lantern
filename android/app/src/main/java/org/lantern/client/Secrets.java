@@ -24,16 +24,24 @@ final class Secrets {
         }
         return (javax.crypto.SecretKey)store.getKey("lantern-pairing", null);
     }
-    static void save(Context context, String token) throws Exception {
+    /** {iv, ciphertext}, both Base64, sealed with the app's Keystore key. */
+    static String[] encrypt(String token) throws Exception {
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.ENCRYPT_MODE, key());
-        String iv = Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP),
-               data = Base64.encodeToString(cipher.doFinal(token.getBytes(StandardCharsets.UTF_8)),
-                                            Base64.NO_WRAP);
+        return new String[] {Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP),
+                             Base64.encodeToString(cipher.doFinal(token.getBytes(StandardCharsets.UTF_8)), Base64.NO_WRAP)};
+    }
+    static String decrypt(String iv, String data) throws Exception {
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.DECRYPT_MODE, key(), new GCMParameterSpec(128, Base64.decode(iv, Base64.NO_WRAP)));
+        return new String(cipher.doFinal(Base64.decode(data, Base64.NO_WRAP)), StandardCharsets.UTF_8);
+    }
+    static void save(Context context, String token) throws Exception {
+        String[] sealed = encrypt(token);
         context.getSharedPreferences("secret", 0)
             .edit()
-            .putString("iv", iv)
-            .putString("cipher", data)
+            .putString("iv", sealed[0])
+            .putString("cipher", sealed[1])
             .apply();
     }
     static String load(Context context) throws Exception {

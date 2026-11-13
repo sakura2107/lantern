@@ -128,6 +128,9 @@ public final class MainActivity extends Activity {
         job(() -> {
             String value = Secrets.load(this);
             runOnUiThread(() -> { secret.setText(value); ui.device.summarize(); });
+            Computers.migrate(this);
+            Computers.seedDialer(this);
+            refreshComputers();
         });
         desktopTools=new DesktopTools(this,new DesktopTools.Events(){public void status(String value){MainActivity.this.status(value);}public void monitors(List<DesktopTools.Monitor> values){showMonitors(values);}});
         screen = new DesktopView(this);
@@ -311,8 +314,9 @@ public final class MainActivity extends Activity {
     volatile ConnectionEndpoint via;
     List<ConnectionEndpoint> savedEndpoints(String fingerprint){
         var p=getSharedPreferences("device",0);
-        return fingerprint.equals(p.getString(ENDPOINTS_PIN,""))?ConnectionEndpoint.loadPreferences(p.getString(ENDPOINTS_KEY,null))
-                                                               :java.util.Collections.emptyList();
+        if(fingerprint.equals(p.getString(ENDPOINTS_PIN,"")))return ConnectionEndpoint.loadPreferences(p.getString(ENDPOINTS_KEY,null));
+        Computers.Saved other=Computers.find(this,fingerprint); // another saved computer
+        return other!=null&&!other.endpoints.isEmpty()?ConnectionEndpoint.loadPreferences(other.endpoints):java.util.Collections.emptyList();
     }
     void saveEndpoints(Remote.Credentials c){
         if(c.endpoints.isEmpty())return;
@@ -450,6 +454,8 @@ public final class MainActivity extends Activity {
                     .putString("pin", c.pin)
                     .apply();
                 saveEndpoints(learnt);
+                try { Computers.remember(this, learnt, used); } catch (Exception keystore) { /* the list is a convenience */ }
+                refreshComputers();
                 // Later connections race every entry; identity checks below follow the new object.
                 if (credentials == c) { credentials = learnt; via = used; }
                 runOnUiThread(()->{if(credentials!=learnt)return;ui.connected(where(learnt));ui.select(AppShell.FILES);transfers.setCredentials(learnt);refreshDesktopUi();startPresence(learnt);if(used!=null&&used.publicPath())status(S.PATH_PUBLIC_NOTICE);});
@@ -461,6 +467,55 @@ public final class MainActivity extends Activity {
                     runOnUiThread(() -> { entries=new ArrayList<>(); ui.files.noReadPermission=true; ui.renderFiles(entries,false); status("已配对，未授予文件读取；可按授权使用桌面或音频"); });
                 }
             });
+    }
+    // ---------------------------------------------------------------- saved computers
+    void refreshComputers() {
+        job(() -> {
+            List<Computers.Saved> saved = Computers.list(this);
+            runOnUiThread(() -> ui.device.computers(saved, credentials == null ? "" : credentials.pin));
+        });
+    }
+    /** Lists every saved computer; tapping one connects to it with its own pairing secret. */
+    void showComputers() {
+        job(() -> {
+            List<Computers.Saved> saved = Computers.list(this);
+            runOnUiThread(() -> {
+                String current = credentials == null ? pin.getText().toString() : credentials.pin;
+                Sheet sheet = new Sheet(this, S.COMPUTERS_TITLE, S.COMPUTERS_SUBTITLE);
+                for (Computers.Saved s : saved)
+                    sheet.option(s.title(), computerDetail(s), s.pin.equals(current), () -> switchComputer(s));
+                sheet.item(Glyph.PLUS, S.COMPUTERS_ADD, S.COMPUTERS_ADD_DETAIL, this::scanPairing);
+                if (!saved.isEmpty()) sheet.item(Glyph.TRASH, S.COMPUTERS_REMOVE, S.COMPUTERS_REMOVE_DETAIL, () -> removeComputers(saved));
+                sheet.show();
+            });
+        });
+    }
+    String computerDetail(Computers.Saved s) {
+        String when = s.lastUsed <= 0 ? "" : "，" + String.format(Locale.ROOT, S.COMPUTERS_LAST_USED,
+            java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT).format(new java.util.Date(s.lastUsed)));
+        return (s.name.isEmpty() ? "" : s.address() + "，") + S.COMPUTERS_PRINT + s.pin.substring(0, 8) + when;
+    }
+    void switchComputer(Computers.Saved s) {
+        job(() -> {
+            String key = s.secret(this);
+            runOnUiThread(() -> {
+                if (credentials != null && !credentials.pin.equals(s.pin)) disconnect(false);
+                host.setText((s.host.indexOf(':') >= 0 ? "[" + s.host + "]" : s.host) + ":" + s.port);
+                pin.setText(s.pin);
+                secret.setText(key);
+                ui.device.summarize();
+                pairDevice();
+            });
+        });
+    }
+    void removeComputers(List<Computers.Saved> saved) {
+        Sheet sheet = new Sheet(this, S.COMPUTERS_REMOVE, S.COMPUTERS_REMOVE_SUBTITLE);
+        for (Computers.Saved s : saved)
+            sheet.danger(Glyph.DESKTOP, s.title(), computerDetail(s), () ->
+                Sheet.confirm(this, S.COMPUTERS_REMOVE, String.format(Locale.ROOT, S.COMPUTERS_REMOVE_CONFIRM, s.title()), S.COMPUTERS_REMOVE_ACTION, true, () -> {
+                    job(() -> { Computers.remove(this, s.pin); refreshComputers(); status(String.format(Locale.ROOT, S.COMPUTERS_REMOVED, s.title())); });
+                }));
+        sheet.show();
     }
     // ---------------------------------------------------------------- scan-to-pair
     static final int REQUEST_SCAN = 103, REQUEST_CAMERA = 202;
@@ -538,6 +593,7 @@ public final class MainActivity extends Activity {
                 return;
             }
             saveEndpoints(c); // every entry from the code; pairDevice() reads them back for this fingerprint
+            Computers.pendingName(this, c.pin, link.hostName);
             runOnUiThread(() -> {
                 host.setText((c.host.indexOf(':') >= 0 ? "[" + c.host + "]" : c.host) + ":" + c.port);
                 pin.setText(c.pin);
@@ -594,6 +650,7 @@ public final class MainActivity extends Activity {
                 if (caps.contains("session=end-v1")) Remote.sessionEndPin = c.pin;
                 // Wi-Fi to mobile data and back: the winning entry tells which path we are on now.
                 ConnectionEndpoint used = r.selectedEndpoint, before = via;
+                Computers.lastEntry(this, c.pin, used);
                 boolean moved = used != null && (before == null || !before.host.equals(used.host) || before.port != used.port);
                 via = used;
                 if (caps.contains(";endpoints=v1"))
