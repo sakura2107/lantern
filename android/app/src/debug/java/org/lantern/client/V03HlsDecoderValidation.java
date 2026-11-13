@@ -59,7 +59,7 @@ final class V03HlsDecoderValidation {
         MediaPlayback.Tracks tracks=MediaPlayback.query(c,"movie.mkv");
         t.check(tracks.width==3840&&tracks.height==2160,"generated 4K source tracks");
         t.check(tracks.tracks.size()==2&&tracks.tracks.get(1).codec.equals("ass"),"generated audio/ASS tracks");
-        AvcView[] view={null};AvcView.Target[] target={null};t.runOnMainSync(()->{view[0]=new AvcView(activity);activity.setContentView(view[0]);});
+        TextureSink[] view={null};TextureSink.Target[] target={null};t.runOnMainSync(()->{view[0]=new TextureSink(activity);activity.setContentView(view[0]);});
         V03Validation.until(()->view[0].current!=null,5000,"Lantern decode Surface unavailable");t.runOnMainSync(()->target[0]=view[0].acquire());
         long began=System.nanoTime();
         java.util.concurrent.ExecutorService ahead=java.util.concurrent.Executors.newSingleThreadExecutor();

@@ -11,8 +11,8 @@ final class V03MediaValidation {
     static void run(DeviceTestRunner t,MainActivity activity,Remote.Credentials c)throws Exception{
         MediaPlayback.Tracks tracks=MediaPlayback.query(c,"movie.mkv");t.check(tracks.width==3840&&tracks.height==2160,"physical phone track query: original 4K source");
         t.check(tracks.tracks.size()==2&&tracks.tracks.get(1).codec.equals("ass"),"phone audio and ASS tracks");
-        AvcView[] view={null};AvcView.Target[] surface={null};
-        t.runOnMainSync(()->{view[0]=new AvcView(activity);activity.setContentView(view[0],new FrameLayout.LayoutParams(-1,-1));});
+        TextureSink[] view={null};TextureSink.Target[] surface={null};
+        t.runOnMainSync(()->{view[0]=new TextureSink(activity);activity.setContentView(view[0],new FrameLayout.LayoutParams(-1,-1));});
         V03Validation.until(()->view[0].current!=null,5000,"debug movie Surface unavailable");
         t.runOnMainSync(()->surface[0]=view[0].acquire());
         MediaPlayer player=new MediaPlayer();CountDownLatch prepared=new CountDownLatch(1),rendered=new CountDownLatch(1),seeked=new CountDownLatch(1),completed=new CountDownLatch(1);

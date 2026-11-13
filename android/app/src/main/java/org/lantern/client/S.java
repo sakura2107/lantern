@@ -111,6 +111,18 @@ final class S {
     static final String TIMING_FAST = "响应优先", TIMING_FAST_DETAIL = "画面不等声音，控制延迟最低。适合操作电脑。";
     static final String TIMING_SYNC = "声音同步", TIMING_SYNC_DETAIL = "画面按声音时钟最多等待 350 ms。适合看视频。";
     static final String TIMING_FAST_SHORT = "响应优先", TIMING_SYNC_SHORT = "声音同步";
+    // Link state banner (three levels: silent under a second, recovering, disconnected after 30 s).
+    static final String LINK_RECOVERING = "网络波动，正在恢复…", LINK_RECOVERING_FOR = "网络波动，正在恢复… %d 秒",
+                        LINK_LOST = "已断开，网络恢复后会自动重连", LINK_RECONNECT = "重新连接";
+    static final String CONTROL_STOPPED = "控制已停止：电脑结束了会话或授权有变化，请重新开启控制",
+                        CONTROL_REFUSED = "电脑没有执行这次操作：";
+    static final String Q_SECTION_RESOLUTION = "分辨率", Q_SECTION_FPS = "帧率", Q_FPS_UNIT = "帧", Q_AUTO = "自动";
+    static final String Q_AUTO_DETAIL = "按网络在 4K、2K、1080p、720p 之间升降，帧率保持 %d";
+    static final String Q_HOST_MAX = "电脑屏幕最高 %s", Q_PHONE_MAX = "手机最高 %s", Q_SENT_AT_LIMIT = "，按上限传输";
+    static final String Q_HOST_FPS_MAX = "电脑屏幕最高 %d 帧", Q_PHONE_FPS_MAX = "手机在 %s 下最高 %d 帧";
+    static final String Q_FPS_120 = "最跟手，电脑屏幕和手机都要支持高刷新率", Q_FPS_60 = "流畅，推荐", Q_FPS_30 = "省流量";
+    static final String Q_CHANGED = "画质已切换为 %s", Q_AUTO_CHANGED = "已切换为自动画质，会按网络升降分辨率";
+    static final String Q_SHORT = "网络跑不满 %s", Q_LOWER = "降到 %s";
     static final String QUALITY_TITLE = "画质", QUALITY_SUBTITLE = "帧率是目标值，实际更新率显示在画面左上角。";
     static final String Q_SECTION_H264 = "硬件编码（H.264，需要电脑支持）", Q_SECTION_JPEG = "兼容模式（JPEG）";
     static final String Q_SMOOTH = "流畅", Q_SMOOTH_DETAIL = "1080p，60 fps，12 Mbps";

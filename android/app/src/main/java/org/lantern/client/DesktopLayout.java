@@ -22,6 +22,7 @@ final class DesktopLayout {
     final FrameLayout outer, pane, anchor, toolbar;
     final LinearLayout page, toolRow;
     final TextView notice;
+    final LinearLayout link; final TextView linkText, linkAction; Runnable linkHandler;
     final View fullButton, toolsButton;
     final ToolButton controlButton, audioButton, rightButton;
     boolean fullscreen, visible, onDesktopPage;
@@ -120,6 +121,28 @@ final class DesktopLayout {
         notice.setVisibility(View.GONE);
         hideNotice = () -> notice.animate().alpha(0).setDuration(200).withEndAction(() -> notice.setVisibility(View.GONE));
 
+        // Persistent link banner, top centre, in both the page preview and fullscreen. Never a dialog.
+        link = Ui.row(a);
+        link.setGravity(Gravity.CENTER_VERTICAL);
+        link.setBackground(Ui.round(Theme.VIDEO_CHROME, 16));
+        link.setPadding(Theme.dp(14), Theme.dp(6), Theme.dp(6), Theme.dp(6));
+        link.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        linkText = Ui.text(a, "", 13, Color.WHITE);
+        linkText.setSingleLine();
+        linkText.setPadding(0, Theme.dp(2), Theme.dp(8), Theme.dp(2));
+        link.addView(linkText, Ui.lp(-2, -2));
+        linkAction = Ui.text(a, S.LINK_RECONNECT, 13, Theme.LAMP);
+        linkAction.setPadding(Theme.dp(10), Theme.dp(4), Theme.dp(10), Theme.dp(4));
+        linkAction.setBackground(Ui.press(Ui.round(0, 12), 12));
+        linkAction.setOnClickListener(v -> { if (linkHandler != null) linkHandler.run(); });
+        Ui.role(linkAction, Button.class);
+        Ui.id(linkAction, "desktop.reconnect");
+        link.addView(linkAction, Ui.lp(-2, -2));
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        lp.setMargins(gap, gap, gap, gap);
+        pane.addView(link, lp);
+        link.setVisibility(View.GONE);
+
         pane.setOnApplyWindowInsetsListener((v, insets) -> {
             if (fullscreen) {
                 int top = insets.getSystemWindowInsetTop(), left = insets.getSystemWindowInsetLeft(),
@@ -133,6 +156,8 @@ final class DesktopLayout {
                 margins(toolbar, gap + left, gap + top, gap + right, gap);
                 margins(toolsButton, gap + left, gap, gap + right, gap);
                 margins(notice, gap * 2 + left, gap, gap * 2 + right, gap * 2 + bottom);
+                linkInsetTop = top;
+                placeLink();
             }
             return insets;
         });
@@ -200,6 +225,27 @@ final class DesktopLayout {
     void showToolbar(boolean show) {
         toolbar.setVisibility(show ? View.VISIBLE : View.GONE);
         toolsButton.setVisibility(fullscreen && !show ? View.VISIBLE : View.GONE);
+        toolbar.post(this::placeLink);
+    }
+
+    int linkInsetTop;
+    /** Below the fullscreen toolbar when it is open, otherwise at the top edge. */
+    void placeLink() {
+        int top = gap + (fullscreen ? linkInsetTop : 0);
+        if (fullscreen && toolbar.getVisibility() == View.VISIBLE && toolbar.getHeight() > 0)
+            top = toolbar.getBottom() + gap;
+        margins(link, gap, top, gap, gap);
+    }
+    /** text null hides the banner; label/action null hides the button. */
+    void link(String text, String label, Runnable action) {
+        if (text == null) { link.setVisibility(View.GONE); linkHandler = null; return; }
+        if (!text.contentEquals(linkText.getText())) linkText.setText(text);
+        if (label != null && !label.contentEquals(linkAction.getText())) { linkAction.setText(label); linkAction.setContentDescription(label); }
+        if (label == null) action = null;
+        linkHandler = action;
+        linkAction.setVisibility(action == null ? View.GONE : View.VISIBLE);
+        link.setPadding(Theme.dp(14), Theme.dp(6), Theme.dp(action == null ? 14 : 6), Theme.dp(6));
+        if (link.getVisibility() != View.VISIBLE) { link.setVisibility(View.VISIBLE); placeLink(); }
     }
 
     /** Control state: 0 off, 1 requesting, 2 on. */

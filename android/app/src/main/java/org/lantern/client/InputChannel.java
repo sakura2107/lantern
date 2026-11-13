@@ -6,12 +6,17 @@ final class InputChannel implements AutoCloseable {
     enum Phase { NORMAL, RECOVERING, DISCONNECTED }
     static final class State {
         final Phase phase; final long recoveringMillis;
-        State(Phase p,long n){phase=p;recoveringMillis=n;}
+        /** Not a network outage: revoked trust, ended session or an uncertain replay. Needs a deliberate restart. */
+        final boolean terminal;
+        State(Phase p,long n){this(p,n,false);}
+        State(Phase p,long n,boolean t){phase=p;recoveringMillis=n;terminal=t;}
     }
-    interface Events { void state(State s); default void result(long seq,int code,String reason){} default void result(long seq,int code,String reason,byte[] payload){result(seq,code,reason);} }
+    interface Events { void state(State s); default void result(long seq,int code,String reason){} default void result(long seq,int code,String reason,byte[] payload){result(seq,code,reason);}
+        /** tag = the object given to submit (null for none). Coalesced moves never report. */
+        default void result(long seq,int code,String reason,byte[] payload,Object tag){result(seq,code,reason,payload);} }
     static final class Command {
         final int op; final byte[] payload; final boolean move;
-        boolean internal;
+        boolean internal; Object tag;
         Command(int op,byte[] bytes) throws IOException {
             if(bytes.length>8192)throw new IOException("Input payload bound");
             this.op=op;payload=bytes.clone();
@@ -31,8 +36,9 @@ final class InputChannel implements AutoCloseable {
         worker=new Thread(this::run,"Lantern reliable input");worker.start();
     }
     /** False = bounded backpressure: caller retains this event and retries; no critical event is evicted. */
-    synchronized boolean submit(int op,byte[] payload) throws IOException {
-        Command c=new Command(op,payload);
+    synchronized boolean submit(int op,byte[] payload) throws IOException {return submit(op,payload,null);}
+    synchronized boolean submit(int op,byte[] payload,Object tag) throws IOException {
+        Command c=new Command(op,payload);c.tag=tag;
         if(closed||terminal)return false;
         Command tail=queue.peekLast();
         if(c.move&&tail!=null&&tail.move&&tail.op==op&&(!sending||queue.size()>1))queue.removeLast();
@@ -41,7 +47,7 @@ final class InputChannel implements AutoCloseable {
     }
     synchronized State state() {
         long elapsed=recovery==0?0:Math.max(1,(System.nanoTime()-recovery)/1_000_000);
-        return new State(closed||terminal||elapsed>=30000?Phase.DISCONNECTED:elapsed>0?Phase.RECOVERING:Phase.NORMAL,elapsed);
+        return new State(closed||terminal||elapsed>=30000?Phase.DISCONNECTED:elapsed>0?Phase.RECOVERING:Phase.NORMAL,elapsed,closed||terminal);
     }
     synchronized int pending(){return queue.size();}
     synchronized long acknowledged(){return acknowledged;}
@@ -76,7 +82,7 @@ final class InputChannel implements AutoCloseable {
                     }else try{payload=remote.call(command.op,command.payload);}catch(Remote.RemoteError rejected){
                         if(rejected.code==2||Remote.endedByHost(rejected))throw rejected;code=rejected.code;message=rejected.getMessage();payload=new byte[0];}
                     synchronized(this){queue.removeFirst();acknowledged=seq;sending=false;recovery=0;}
-                    if(events!=null&&!command.internal)try{events.result(seq,code,message,payload);}catch(RuntimeException ignored){}
+                    if(events!=null&&!command.internal)try{events.result(seq,code,message,payload,command.tag);}catch(RuntimeException ignored){}
                     publish();
                 }catch(Exception error){
                     if(remote!=null)try{remote.abort();}catch(IOException ignored){}

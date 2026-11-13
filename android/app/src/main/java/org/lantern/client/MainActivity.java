@@ -26,14 +26,7 @@ public final class MainActivity extends Activity {
     final AtomicLong keyboardRequestId = new AtomicLong();
     final Handler inputUi = new Handler(Looper.getMainLooper());
     boolean draggingRemote, rightArmed;
-    long dragId, workerDragId;
     float dragX, dragY;
-    static final class PointerMove {
-        final long id, epoch; final int[] point; final Remote.Credentials c;
-        PointerMove(long i, long e, int[] p, Remote.Credentials credentials) { id=i; epoch=e; point=p; c=credentials; }
-    }
-    final AtomicReference<PointerMove> pendingMove = new AtomicReference<>();
-    final AtomicBoolean moveQueued = new AtomicBoolean();
     final AtomicLong dragEndsCompleted = new AtomicLong(), textCommitsCompleted = new AtomicLong();
     final Runnable dragHeartbeat = new Runnable() {
         public void run() {
@@ -43,11 +36,6 @@ public final class MainActivity extends Activity {
     };
     volatile boolean controlRequested;
     final AtomicLong inputEpoch = new AtomicLong(), controlClicksCompleted = new AtomicLong();
-    final ThreadPoolExecutor inputs = new ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS, new ArrayBlockingQueue<>(32));
-    volatile Remote inputConnection;
-    volatile java.net.Socket inputOpening;
-    Remote.Credentials inputCredentials;
-    long lastInputMs;
     FileBrowser browser;
     TransferQueue transfers;
     ListView list;
@@ -57,10 +45,7 @@ public final class MainActivity extends Activity {
     AvcView avcView;
     AvcDesktop video;
     volatile boolean hardwareDesktop = true;
-    static final AvcDesktop.Profile[] VIDEO_PROFILES = {new AvcDesktop.Profile(1920, 60, 12_000_000),
-                                                        new AvcDesktop.Profile(1280, 60, 8_000_000),
-                                                        new AvcDesktop.Profile(1280, 30, 6_000_000)};
-    volatile AvcDesktop.Profile videoProfile = VIDEO_PROFILES[0];
+    volatile AvcDesktop.Profile videoProfile;
     final ThreadPoolExecutor work =
         new ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS, new ArrayBlockingQueue<>(16));
     final ScheduledExecutorService frames = Executors.newSingleThreadScheduledExecutor();
@@ -126,7 +111,15 @@ public final class MainActivity extends Activity {
         desktopProfile =
             PROFILES[Math.max(0, Math.min(PROFILES.length - 1, preferences.getInt("desktop_profile", 1)))];
         hardwareDesktop = preferences.getBoolean("desktop_h264", true);
-        videoProfile = VIDEO_PROFILES[Math.max(0, Math.min(2, preferences.getInt("video_profile", 0)))];
+        if (preferences.contains("video_width")) {
+            qualityWidth = preferences.getInt("video_width", 1920); qualityFps = preferences.getInt("video_fps", 60); qualityAuto = preferences.getBoolean("video_auto", false);
+        } else { // v0.2 presets: 0 = 1080p60, 1 = 720p60, 2 = 720p30
+            int old = preferences.getInt("video_profile", 0);
+            qualityWidth = old == 0 ? 1920 : 1280; qualityFps = old == 2 ? 30 : 60;
+        }
+        if (Arrays.binarySearch(new int[]{1280, 1920, 2560, 3840}, qualityWidth) < 0) qualityWidth = 1920;
+        if (qualityFps != 30 && qualityFps != 60 && qualityFps != 120) qualityFps = 60;
+        videoProfile = qualityProfile();
         long limit = preferences.getLong("transfer_limit", 0);
         if (limit >= 1024 * 1024 && limit <= 32L * 1024 * 1024) TransferPacer.SHARED.userLimit = limit;
         String savedHost=preferences.getString("host", "");host.setText(savedHost.isEmpty()?"":(savedHost.indexOf(':')>=0?"["+savedHost+"]":savedHost)+":"+preferences.getInt("port",47443));
@@ -151,9 +144,11 @@ public final class MainActivity extends Activity {
         });
         desktopLayout.systemBars();
         systemAudio = new SystemAudio(this, new SystemAudio.Events() {
-            public void started(int rate) { if(audioSubscribed) { audioState(AUDIO_ON); status("系统音频已连接："+rate+"Hz / "+systemAudio.encoding); } }
+            public void started(int rate) { if(audioSubscribed) { boolean again=audioSeen; audioSeen=true; audioLink=null; audioState(AUDIO_ON); if(!again) status("系统音频已连接："+rate+"Hz / "+systemAudio.encoding); } }
             public void failed(String reason) { audioSubscribed=false; audioState(AUDIO_OFF); status("系统音频停止："+reason); }
-            public void reconnecting(String reason){if(audioSubscribed){audioState(AUDIO_RECONNECTING);status("系统音频正在自动重连："+reason);}}
+            // Recovery is shown by the link banner; the sound toggle stays on.
+            public void reconnecting(String reason){if(audioSubscribed)audioState(AUDIO_RECONNECTING);}
+            public void connectionState(ConnectionStatus.Snapshot state){if(!audioSubscribed)return;audioLink=state;audioLinkAt=SystemClock.uptimeMillis();if(state.phase==ConnectionStatus.Phase.NORMAL&&audioState==AUDIO_RECONNECTING)audioState(AUDIO_ON);linkChanged();}
         });
         keyboard = new RemoteKeyboard(this, new RemoteKeyboard.Sink() {
             public void text(String text) { desktopText(text); }
@@ -174,6 +169,7 @@ public final class MainActivity extends Activity {
                 status("H264 桌面：" + w + "×" + h + "，" + (hardware ? "硬件解码" : "解码器硬件属性未知"));
             }
             public void frame() {
+                if (!videoSeen && hardwareDesktop && subscribed.get()) { videoSeen = true; videoLink = null; loadQualityLimits(credentials); linkChanged(); }
                 if (hardwareDesktop && subscribed.get() && display.get())
                     screen.videoFrame();
             }
@@ -185,7 +181,10 @@ public final class MainActivity extends Activity {
                 status("硬件桌面不可用，已降级为 JPEG：" + reason);
             }
             // Only the picture reconnects; control, keyboard and sound keep their own connections.
-            public void reconnecting(String reason){screen.cancelDrag();status("网络波动，正在恢复画面…");}
+            // The picture recovers on its own; control and sound keep running. The banner shows progress.
+            public void reconnecting(String reason){}
+            public void connectionState(ConnectionStatus.Snapshot state){videoLink=state;videoLinkAt=SystemClock.uptimeMillis();linkChanged();}
+            public void quality(DesktopSession.Status status){if(hardwareDesktop&&subscribed.get())MainActivity.this.quality(status);}
         });
         screen.tap = this::desktopTap;
         screen.doubleTap = (x, y) -> desktopClick(x, y, true);
@@ -415,7 +414,7 @@ public final class MainActivity extends Activity {
             audioSubscribed=false; if(systemAudio!=null) systemAudio.stop(); audioState(AUDIO_OFF);
             String fingerprint=normalizeFingerprint(pin.getText().toString());if(!fingerprint.equals(pin.getText().toString()))pin.setText(fingerprint);
             Remote.Credentials c;try{c=credentialsForAddress(host.getText().toString().trim(),fingerprint,secret.getText().toString().trim());}catch(IllegalArgumentException e){status(e.getMessage());ui.setConnection(AppShell.INVALID,"");return;}
-            controlRequested = false; control.set(false); inputEpoch.incrementAndGet(); abortInput(); controlLabels();
+            controlRequested = false; control.set(false); inputEpoch.incrementAndGet(); closeInput(); controlLabels();
             credentials = c;
             offset = 0;ui.setConnection(AppShell.CONNECTING,display(c));
             via = null;
@@ -562,7 +561,7 @@ public final class MainActivity extends Activity {
         if (desktopLayout != null) desktopLayout.setFullscreen(false);
         if (subscribed.get()) { subscribed.set(false); updateDesktopPresentation(); }
         audioSubscribed = false; if (systemAudio != null) systemAudio.stop(); audioState(AUDIO_OFF);
-        controlRequested = false; control.set(false); inputEpoch.incrementAndGet(); abortInput(); controlLabels();
+        controlRequested = false; control.set(false); inputEpoch.incrementAndGet(); closeInput(); controlLabels();
         if (desktopTools != null) desktopTools.cancel();
         browser.cancel(); entries = new ArrayList<>(); ui.renderFiles(entries, false);
         transfers.setCredentials(null); // pauses the running task; tasks resume after reconnecting
@@ -682,7 +681,7 @@ public final class MainActivity extends Activity {
         if (avcView != null)
             avcView.setVisibility(hardwareDesktop && subscribed.get() ? View.VISIBLE : View.GONE);
     }
-    void selectMonitor(int monitor){if(monitor<0||monitor>=32)return;screen.cancelDrag();controlRequested=false;control.set(false);inputEpoch.incrementAndGet();abortInput();controlLabels();selectedMonitor=monitor;monitorGeneration.incrementAndGet();AvcDesktop.Profile p=videoProfile;videoProfile=new AvcDesktop.Profile(p.width,p.fps,p.bitrate,monitor);video.stop();Remote old=desktop;desktop=null;if(old!=null)try{old.abort();}catch(IOException ignored){}screen.zoom=1;screen.panX=screen.panY=0;screen.imageWidth=screen.imageHeight=0;screen.setImageDrawable(null);screen.viewport.valid=false;screen.updateTransform();updateDesktopPresentation();status("已选择显示器 "+(monitor+1)+"；控制已关闭，请确认画面后重新开启");}
+    void selectMonitor(int monitor){if(monitor<0||monitor>=32)return;screen.cancelDrag();controlRequested=false;control.set(false);inputEpoch.incrementAndGet();closeInput();controlLabels();selectedMonitor=monitor;monitorGeneration.incrementAndGet();videoProfile=qualityProfile();liveQuality=null;constrainedSince=0;video.stop();Remote old=desktop;desktop=null;if(old!=null)try{old.abort();}catch(IOException ignored){}screen.zoom=1;screen.panX=screen.panY=0;screen.imageWidth=screen.imageHeight=0;screen.setImageDrawable(null);screen.viewport.valid=false;screen.updateTransform();updateDesktopPresentation();status("已选择显示器 "+(monitor+1)+"；控制已关闭，请确认画面后重新开启");}
     void showDesktopTools(){
         new Sheet(this,S.TOOLS_TITLE,S.TOOLS_SUBTITLE)
             .item(Glyph.CLIPBOARD,S.CLIP_PUSH,S.CLIP_PUSH_DETAIL,()->desktopTools.push(credentials))
@@ -751,49 +750,190 @@ public final class MainActivity extends Activity {
         r.addView(Ui.numeric(Ui.medium(this,value,15,Theme.INK)));
         parent.addView(r,Ui.lp(-1,-2));
     }
-    String profileLabel(){
-        if(hardwareDesktop){AvcDesktop.Profile p=videoProfile;return (p.width>=1920?"1080p":"720p")+p.fps;}
-        return desktopProfile.width+"px";
-    }
     void refreshDesktopUi(){
         if(ui==null)return;
         int controlState=control.get()?2:controlRequested?1:0;
         ui.desktop.update(subscribed.get(),display.get(),controlRequested,control.get(),audioState,profileLabel(),selectedMonitor,timeline.synchronize);
         if(desktopLayout!=null){desktopLayout.setControl(controlState);desktopLayout.setAudio(audioState);}
+        linkChanged();
+        preferRefresh(hardwareDesktop && subscribed.get() && display.get() && desktopLayout != null && desktopLayout.visible ? qualityFps : 0);
+    }
+    /**
+     * Asks for a display mode while the desktop picture is up: twice the stream rate where the panel
+     * has it (60 fps on 120 Hz absorbs network jitter), else its fastest mode; the system default
+     * otherwise. Some phones keep third-party apps at 60 Hz unless the window asks explicitly.
+     */
+    int preferredMode = -1;
+    void preferRefresh(int fps) {
+        int want = 0;
+        try {
+            if (fps > 0) {
+                Display d = getWindowManager().getDefaultDisplay();
+                Display.Mode current = d.getMode(), best = null, fastest = null;
+                for (Display.Mode m : d.getSupportedModes()) {
+                    if (m.getPhysicalWidth() != current.getPhysicalWidth() || m.getPhysicalHeight() != current.getPhysicalHeight()) continue;
+                    if (fastest == null || m.getRefreshRate() > fastest.getRefreshRate()) fastest = m;
+                    if (m.getRefreshRate() >= Math.min(fps * 2, 120) - 1 && (best == null || m.getRefreshRate() < best.getRefreshRate())) best = m;
+                }
+                Display.Mode chosen = best != null ? best : fastest;
+                if (chosen != null) want = chosen.getModeId();
+            }
+        } catch (RuntimeException unavailable) { want = 0; }
+        if (want == preferredMode) return;
+        preferredMode = want;
+        WindowManager.LayoutParams lp = getWindow().getAttributes();
+        lp.preferredDisplayModeId = want;
+        getWindow().setAttributes(lp);
+    }
+    // ---- Picture quality: resolution (4K / 2K / 1080p / 720p, "自动" last) × frame rate (120 / 60 / 30).
+    // Choices above the computer screen or the phone decoder are allowed; the host sends at the real
+    // limit and the option says which limit applies. Changes apply online on v3+ hosts.
+    static final int[] Q_WIDTHS = {3840, 2560, 1920, 1280}, Q_FPS = {120, 60, 30};
+    volatile int qualityWidth = 1920, qualityFps = 60; volatile boolean qualityAuto;
+    List<DesktopSession.Display> hostDisplays; Remote.Credentials hostDisplaysFor; boolean hostDisplaysLoading;
+    static volatile List<DecoderCapabilities.Limit> phoneDecoders;
+    DesktopSession.Status liveQuality; long constrainedSince;
+    static String tierName(int width) {
+        return width >= 3840 ? "4K" : width >= 2560 ? "2K" : width >= 1920 ? "1080p" : width >= 1280 ? "720p" : width + "p";
+    }
+    static String screenName(int width, int height) {
+        for (int w : Q_WIDTHS) if (width == w && height == w * 9 / 16) return tierName(w);
+        return width + "×" + height;
+    }
+    /** Bitrate only matters to hosts older than desktop v3; newer hosts choose their own budget. */
+    static int legacyBitrate(int width, int fps) {
+        int base = width >= 3840 ? 30_000_000 : width >= 2560 ? 20_000_000 : width >= 1920 ? 12_000_000 : 8_000_000;
+        return fps <= 30 ? base * 2 / 3 : base;
+    }
+    AvcDesktop.Profile qualityProfile() {
+        int width = qualityAuto ? 3840 : qualityWidth;
+        return new AvcDesktop.Profile(width, qualityFps, legacyBitrate(width, qualityFps), selectedMonitor, qualityAuto);
+    }
+    void loadQualityLimits(Remote.Credentials c) {
+        if (c == null || hostDisplaysFor == c || hostDisplaysLoading) return;
+        hostDisplaysLoading = true;
+        try { work.execute(() -> {
+            List<DesktopSession.Display> displays = null;
+            try { displays = DesktopSession.limits(c); } catch (Exception older) { /* pre-v3 host: no limits */ }
+            if (phoneDecoders == null) try { phoneDecoders = DecoderCapabilities.query(); } catch (RuntimeException ignored) {}
+            List<DesktopSession.Display> found = displays;
+            runOnUiThread(() -> { hostDisplaysLoading = false; if (credentials == c) { hostDisplays = found; hostDisplaysFor = c; } });
+        }); } catch (RejectedExecutionException busy) { hostDisplaysLoading = false; }
+    }
+    DesktopSession.Display hostDisplay() {
+        List<DesktopSession.Display> list = hostDisplaysFor == credentials ? hostDisplays : null;
+        if (list == null) return null;
+        for (DesktopSession.Display d : list) if (d.index == selectedMonitor) return d;
+        return list.isEmpty() ? null : list.get(0);
+    }
+    /** Largest standard width the phone decodes at this frame rate (0 = unknown). */
+    static int phoneMaxWidth(int fps, boolean hevc) {
+        List<DecoderCapabilities.Limit> limits = phoneDecoders;
+        if (limits == null) return 0;
+        int best = 0;
+        for (DecoderCapabilities.Limit l : limits)
+            if (l.fps >= fps && (l.mime.equals("video/avc") || hevc)) best = Math.max(best, l.width);
+        return best;
+    }
+    static int phoneMaxFps(int width, boolean hevc) {
+        List<DecoderCapabilities.Limit> limits = phoneDecoders;
+        if (limits == null) return 0;
+        int best = 0;
+        for (DecoderCapabilities.Limit l : limits)
+            if (l.width >= width && (l.mime.equals("video/avc") || hevc)) best = Math.max(best, l.fps);
+        return best;
+    }
+    String resolutionDetail(int width) {
+        DesktopSession.Display host = hostDisplay();
+        boolean hevc = host == null || host.hevc;
+        List<String> limits = new ArrayList<>();
+        if (host != null && host.width < width) limits.add(String.format(S.Q_HOST_MAX, screenName(host.width, host.height)));
+        int phone = phoneMaxWidth(Math.min(qualityFps, 60), hevc);
+        if (phone > 0 && phone < width) limits.add(String.format(S.Q_PHONE_MAX, tierName(phone)));
+        String size = width + "×" + (width * 9 / 16);
+        return limits.isEmpty() ? size : size + "，" + String.join("，", limits) + S.Q_SENT_AT_LIMIT;
+    }
+    String fpsDetail(int fps) {
+        DesktopSession.Display host = hostDisplay();
+        boolean hevc = host == null || host.hevc;
+        List<String> limits = new ArrayList<>();
+        if (host != null && host.refresh > 0 && host.refresh < fps) limits.add(String.format(S.Q_HOST_FPS_MAX, host.refresh));
+        int width = qualityAuto ? 1280 : qualityWidth;
+        int phone = phoneMaxFps(width, hevc);
+        if (phone > 0 && phone < fps) limits.add(String.format(S.Q_PHONE_FPS_MAX, tierName(width), phone));
+        String base = fps == 120 ? S.Q_FPS_120 : fps == 60 ? S.Q_FPS_60 : S.Q_FPS_30;
+        return limits.isEmpty() ? base : String.join("，", limits) + S.Q_SENT_AT_LIMIT;
+    }
+    void applyQuality(String message) {
+        hardwareDesktop = true;
+        videoProfile = qualityProfile(); liveQuality = null; constrainedSince = 0;
+        getSharedPreferences("device", 0).edit().putBoolean("desktop_h264", true)
+            .putInt("video_width", qualityWidth).putInt("video_fps", qualityFps).putBoolean("video_auto", qualityAuto).apply();
+        updateDesktopPresentation();
+        refreshDesktopUi();
+        status(message);
     }
     void showQuality() {
-        int current = hardwareDesktop ? Arrays.asList(VIDEO_PROFILES).indexOf(matchingVideoProfile()) : 3 + Arrays.asList(PROFILES).indexOf(desktopProfile);
-        String[] titles = {S.Q_SMOOTH, S.Q_SAVER, S.Q_ECO, S.Q_FAST, S.Q_BALANCED, S.Q_SHARP};
-        String[] details = {S.Q_SMOOTH_DETAIL, S.Q_SAVER_DETAIL, S.Q_ECO_DETAIL, S.Q_FAST_DETAIL, S.Q_BALANCED_DETAIL, S.Q_SHARP_DETAIL};
+        loadQualityLimits(credentials);
         Sheet sheet = new Sheet(this, S.QUALITY_TITLE, S.QUALITY_SUBTITLE);
-        sheet.section(S.Q_SECTION_H264);
+        sheet.section(S.Q_SECTION_RESOLUTION);
+        for (int width : Q_WIDTHS)
+            sheet.option(tierName(width), resolutionDetail(width), hardwareDesktop && !qualityAuto && qualityWidth == width, () -> {
+                qualityAuto = false; qualityWidth = width; applyQuality(String.format(S.Q_CHANGED, tierName(width) + qualityFps));
+            });
+        sheet.option(S.Q_AUTO, String.format(S.Q_AUTO_DETAIL, qualityFps), hardwareDesktop && qualityAuto, () -> {
+            qualityAuto = true; applyQuality(S.Q_AUTO_CHANGED);
+        });
+        sheet.section(S.Q_SECTION_FPS);
+        for (int fps : Q_FPS)
+            sheet.option(fps + " " + S.Q_FPS_UNIT, fpsDetail(fps), hardwareDesktop && qualityFps == fps, () -> {
+                qualityFps = fps; applyQuality(String.format(S.Q_CHANGED, (qualityAuto ? S.Q_AUTO : tierName(qualityWidth)) + fps));
+            });
+        String[] titles = {S.Q_FAST, S.Q_BALANCED, S.Q_SHARP};
+        String[] details = {S.Q_FAST_DETAIL, S.Q_BALANCED_DETAIL, S.Q_SHARP_DETAIL};
+        sheet.section(S.Q_SECTION_JPEG);
         for (int i = 0; i < titles.length; i++) {
-            if (i == 3) sheet.section(S.Q_SECTION_JPEG);
             final int index = i;
-            sheet.option(titles[i], details[i], i == current, () -> {
-                          hardwareDesktop = index < 3;
-                          if (hardwareDesktop)
-                              videoProfile = new AvcDesktop.Profile(VIDEO_PROFILES[index].width,VIDEO_PROFILES[index].fps,VIDEO_PROFILES[index].bitrate,selectedMonitor);
-                          else
-                              desktopProfile = PROFILES[index - 3];
-                          getSharedPreferences("device", 0)
-                              .edit()
-                              .putBoolean("desktop_h264", hardwareDesktop)
-                              .putInt(hardwareDesktop ? "video_profile" : "desktop_profile",
-                                      hardwareDesktop ? index : index - 3)
-                              .apply();
-                          updateDesktopPresentation();
-                          status("画质已调整；实际更新率显示在画面左上角");
+            sheet.option(titles[i], details[i], !hardwareDesktop && desktopProfile == PROFILES[i], () -> {
+                hardwareDesktop = false; desktopProfile = PROFILES[index];
+                getSharedPreferences("device", 0).edit().putBoolean("desktop_h264", false).putInt("desktop_profile", index).apply();
+                updateDesktopPresentation(); refreshDesktopUi();
+                status("画质已调整；实际更新率显示在画面左上角");
             });
         }
         sheet.show();
     }
-    AvcDesktop.Profile matchingVideoProfile(){AvcDesktop.Profile p=videoProfile;for(AvcDesktop.Profile v:VIDEO_PROFILES)if(v.width==p.width&&v.fps==p.fps&&v.bitrate==p.bitrate)return v;return null;}
+    /** One step down from a fixed choice that the network cannot carry (banner action). */
+    void lowerQuality() {
+        for (int i = 0; i < Q_WIDTHS.length - 1; i++)
+            if (qualityWidth >= Q_WIDTHS[i]) { qualityWidth = Q_WIDTHS[i + 1]; applyQuality(String.format(S.Q_CHANGED, tierName(qualityWidth) + qualityFps)); return; }
+        if (qualityFps > 30) { qualityFps = qualityFps == 120 ? 60 : 30; applyQuality(String.format(S.Q_CHANGED, tierName(qualityWidth) + qualityFps)); }
+    }
+    String lowerQualityLabel() {
+        if (qualityAuto) return null;
+        for (int i = 0; i < Q_WIDTHS.length - 1; i++) if (qualityWidth >= Q_WIDTHS[i]) return String.format(S.Q_LOWER, tierName(Q_WIDTHS[i + 1]) + qualityFps);
+        return qualityFps > 30 ? String.format(S.Q_LOWER, tierName(qualityWidth) + (qualityFps == 120 ? 60 : 30)) : null;
+    }
+    void quality(DesktopSession.Status s) {
+        liveQuality = s;
+        boolean short_ = !qualityAuto && (s.constrained || s.dropping);
+        if (!short_) constrainedSince = 0; else if (constrainedSince == 0) constrainedSince = SystemClock.uptimeMillis();
+        refreshDesktopUi();
+    }
+    String profileLabel(){
+        if (!hardwareDesktop) return desktopProfile.width + "px";
+        DesktopSession.Status s = liveQuality;
+        String chosen = qualityAuto ? S.Q_AUTO : tierName(qualityWidth) + qualityFps;
+        if (s == null || s.width <= 0) return chosen;
+        String actual = tierName(s.width) + s.fps;
+        String path = "tcp".equalsIgnoreCase(s.path) ? " · TCP" : ""; // marks a UDP fallback
+        return (qualityAuto ? S.Q_AUTO + " " + actual : actual.equals(chosen) ? chosen : chosen + "→" + actual) + path;
+    }
     void controlLabels() {
         if (screen != null) screen.controlEnabled = control.get();
         if (!control.get()) {
             if (screen != null) screen.cancelDrag();
-            draggingRemote = false; pendingMove.set(null); moveQueued.set(false); inputUi.removeCallbacks(dragHeartbeat);
+            draggingRemote = false; inputUi.removeCallbacks(dragHeartbeat);
             if (keyboard != null) keyboard.close();
             disarmRightClick();
         }
@@ -811,19 +951,6 @@ public final class MainActivity extends Activity {
         rightArmed = false;
         if (desktopLayout != null) desktopLayout.setRightArmed(false);
     }
-    void desktopRightClick(float touchX, float touchY) {
-        disarmRightClick();
-        if (!control.get() || !subscribed.get() || !display.get()) return;
-        int[] point = screen.viewport.pointer(touchX, touchY);
-        if (point == null) return; // Letterbox or outside the picture.
-        long epoch = inputEpoch.get(); Remote.Credentials c = credentials;
-        keyboardRequestId.incrementAndGet();
-        inputJob(epoch, () -> {
-            if (inputEpoch.get() != epoch || !control.get() || !subscribed.get() || credentials != c) return;
-            // Op 52 = right_click: x, y, monitor (same body as click).
-            inputRemote(c, epoch).call(52, Remote.body(o -> { o.writeInt(point[0]); o.writeInt(point[1]); o.writeInt(selectedMonitor); }));
-        });
-    }
     void audioState(int value) { audioState = value; refreshDesktopUi(); }
     void toggleAudio() {
         TransferPacer.SHARED.realtime=true;
@@ -831,109 +958,203 @@ public final class MainActivity extends Activity {
         if(credentials==null) { status(S.NEED_DEVICE); return; }
         audioSubscribed=true; audioState(AUDIO_CONNECTING); systemAudio.start(credentials);
     }
-    void abortInput() {
-        java.net.Socket opening = inputOpening;
-        if (opening != null) try { opening.close(); } catch (IOException ignored) {}
-        Remote remote = inputConnection;
-        if (remote != null) try { remote.abort(); } catch (IOException ignored) {}
+    // ---- Control: one reliable InputChannel per control session. The channel reconnects, replays
+    // unacknowledged events and coalesces moves; nothing here turns control off because of the network.
+    InputChannel input;                                        // UI thread
+    final ArrayDeque<Object[]> inputBacklog = new ArrayDeque<>(); // {op, body, tag, move} waiting for capacity
+    static final Object TAG_KEY = new Object(), TAG_TEXT = new Object(), TAG_DRAG_END = new Object();
+    /** Left clicks probe the keyboard afterwards; right clicks only report a refusal. */
+    static final class Click { final long request; final boolean left; Click(long r, boolean l) { request = r; left = l; } }
+    static final class Probe { final long request; final boolean retried; Probe(long r, boolean t) { request = r; retried = t; } }
+    void closeInput() {
+        InputChannel old = input; input = null;
+        inputBacklog.clear(); inputUi.removeCallbacks(drainInput);
+        controlLink = null;
+        if (old != null) old.close();
+        linkChanged();
     }
-    /** First failure of the current control outage (input thread); 0 while control works. */
-    volatile long inputFailingSince;
-    void inputJob(long epoch, Job task) {
-        try { inputs.execute(() -> {
-            if (inputEpoch.get() != epoch) return;
-            try {
-                task.run();
-                if (inputFailingSince != 0) { inputFailingSince = 0; runOnUiThread(() -> { if (inputEpoch.get() == epoch) status("控制已恢复"); }); }
+    void openInput(Remote.Credentials c) {
+        closeInput();
+        long epoch = inputEpoch.get();
+        input = new InputChannel(c, new InputChannel.Events() {
+            public void state(InputChannel.State s) {
+                runOnUiThread(() -> {
+                    if (inputEpoch.get() != epoch || input == null) return;
+                    if (s.terminal) {
+                        // Revoked trust, an ended session or an uncertain replay: never retried silently.
+                        controlRequested = false; control.set(false); inputEpoch.incrementAndGet(); closeInput(); controlLabels();
+                        status(S.CONTROL_STOPPED);
+                        return;
+                    }
+                    controlLink = s.phase == InputChannel.Phase.NORMAL ? null : s; controlLinkAt = SystemClock.uptimeMillis();
+                    linkChanged();
+                });
             }
-            catch (Exception error) {
-                Remote failed = inputConnection; inputConnection = null; inputOpening = null;
-                if (failed != null) try { failed.close(); } catch (IOException ignored) {}
-                // The computer refused this one event (e.g. a drag whose lease ran out): drop only it.
-                if (error instanceof Remote.RemoteError && ((Remote.RemoteError)error).code != 2) return;
-                // A lost connection never turns control off by itself: the next event reconnects.
-                // Revoked trust, a changed certificate or thirty seconds without a connection do.
-                boolean network = !(error instanceof Remote.RemoteError) && !(error instanceof javax.net.ssl.SSLException) &&
-                    !(error instanceof NetworkDialer.ConnectException && ((NetworkDialer.ConnectException)error).reason == NetworkDialer.Failure.PIN_MISMATCH);
-                long now = SystemClock.uptimeMillis();
-                if (network) {
-                    if (inputFailingSince == 0) inputFailingSince = now;
-                    if (now - inputFailingSince < 30_000) { runOnUiThread(() -> { if (inputEpoch.get() == epoch) status("网络波动，正在恢复控制…"); }); return; }
-                }
-                inputFailingSince = 0;
-                String why = network ? "控制连接中断超过 30 秒，已关闭控制" : "控制失败：" + error.getMessage();
-                runOnUiThread(() -> { if (inputEpoch.get() != epoch) return; control.set(false); controlRequested = false; inputEpoch.incrementAndGet(); controlLabels(); status(why); });
+            public void result(long seq, int code, String reason, byte[] payload, Object tag) {
+                if (tag == null) return; // pointer moves
+                if (code != 0) { if (inputEpoch.get() == epoch) status(S.CONTROL_REFUSED + reason); return; }
+                if (tag instanceof Click) {
+                    Click click = (Click) tag;
+                    if (!click.left) return;
+                    controlClicksCompleted.incrementAndGet();
+                    inputUi.postDelayed(() -> probeKeyboard(epoch, c, click.request, false), 160);
+                } else if (tag instanceof Probe) {
+                    Probe probe = (Probe) tag;
+                    int flags;
+                    try { flags = Remote.reader(payload).readInt(); } catch (IOException bad) { return; }
+                    lastFocusFlags = flags;
+                    runOnUiThread(() -> {
+                        if (inputEpoch.get() != epoch || !control.get() || !subscribed.get() || !display.get() || keyboardRequestId.get() != probe.request) return;
+                        if ((flags & 1) != 0) keyboard.open((flags & 2) != 0);
+                        else {
+                            keyboard.close();
+                            if (!probe.retried) inputUi.postDelayed(() -> probeKeyboard(epoch, c, probe.request, true), 350);
+                        }
+                    });
+                } else if (tag == TAG_DRAG_END) dragEndsCompleted.incrementAndGet();
+                else if (tag == TAG_TEXT) textCommitsCompleted.incrementAndGet();
             }
-        }); } catch (RejectedExecutionException error) {
-            // Backed up behind a slow network: drop this one event, keep control on.
-            status("网络太慢，部分输入已丢弃；控制仍然开启");
+        });
+    }
+    static boolean pointerMove(int op, byte[] body) {
+        return body.length >= 4 && ((op == 36 && java.nio.ByteBuffer.wrap(body).getInt(0) == 2) || (op == 22 && java.nio.ByteBuffer.wrap(body).getInt(0) == 0));
+    }
+    /** UI thread. When the channel is full the event waits here, in order; only the newest pointer move is kept. */
+    void sendInput(int op, byte[] body, Object tag) {
+        InputChannel channel = input;
+        if (channel == null) return;
+        boolean move = pointerMove(op, body);
+        if (inputBacklog.isEmpty()) {
+            try { if (channel.submit(op, body, tag)) return; }
+            catch (IOException invalid) { status(invalid.getMessage()); return; }
+            inputUi.postDelayed(drainInput, 30);
+        } else {
+            Object[] tail = inputBacklog.peekLast();
+            if (move && (Boolean) tail[3]) inputBacklog.removeLast();
+        }
+        inputBacklog.addLast(new Object[]{op, body, tag, move});
+    }
+    final Runnable drainInput = new Runnable() {
+        public void run() {
+            InputChannel channel = input;
+            if (channel == null) { inputBacklog.clear(); return; }
+            while (!inputBacklog.isEmpty()) {
+                Object[] next = inputBacklog.peekFirst();
+                try { if (!channel.submit((Integer) next[0], (byte[]) next[1], next[2])) { inputUi.postDelayed(this, 30); return; } }
+                catch (IOException invalid) { /* bounded payloads; cannot happen for queued events */ }
+                inputBacklog.pollFirst();
+            }
+        }
+    };
+    /** Test barrier: returns once every submitted control event has been acknowledged by the computer. */
+    void awaitInput(long millis) throws Exception {
+        long end = SystemClock.uptimeMillis() + millis;
+        while (true) {
+            CountDownLatch read = new CountDownLatch(1); boolean[] idle = {false};
+            runOnUiThread(() -> { InputChannel ch = input; idle[0] = ch == null || (inputBacklog.isEmpty() && ch.pending() == 0); read.countDown(); });
+            read.await();
+            if (idle[0]) { Thread.sleep(30); return; }
+            if (SystemClock.uptimeMillis() > end) throw new TimeoutException("control input not acknowledged");
+            Thread.sleep(20);
         }
     }
-    Remote inputRemote(Remote.Credentials c, long epoch) throws Exception {
-        if (inputEpoch.get() != epoch || credentials != c || !controlRequested) throw new IOException("控制操作已取消");
-        if (inputConnection != null && (inputCredentials != c || SystemClock.uptimeMillis() - lastInputMs > 5000)) {
-            inputConnection.close(); inputConnection = null;
+    static byte[] pointerBody(int a, int b, int c) {
+        return java.nio.ByteBuffer.allocate(12).putInt(a).putInt(b).putInt(c).array();
+    }
+
+    // ---- Link banner: silent under a second, "recovering" while any live channel recovers,
+    // "disconnected" plus a reconnect button after 30 seconds. Never a dialog.
+    ConnectionStatus.Snapshot videoLink, audioLink; InputChannel.State controlLink;
+    long videoLinkAt, audioLinkAt, controlLinkAt;
+    boolean videoSeen, audioSeen; // a channel only "recovers" after it has worked once
+    final Runnable linkTick = this::linkChanged;
+    static long elapsed(long recovering, long at, long now) { return recovering + Math.max(0, now - at); }
+    void linkChanged() {
+        inputUi.removeCallbacks(linkTick);
+        if (desktopLayout == null) return;
+        if (!subscribed.get() || !hardwareDesktop) { videoSeen = false; videoLink = null; }
+        if (!audioSubscribed) { audioSeen = false; audioLink = null; }
+        long now = SystemClock.uptimeMillis(), worst = 0; boolean lost = false;
+        if (videoSeen && videoLink != null && videoLink.phase != ConnectionStatus.Phase.NORMAL) {
+            long e = elapsed(videoLink.recoveringMillis, videoLinkAt, now); worst = Math.max(worst, e);
+            lost |= videoLink.phase == ConnectionStatus.Phase.DISCONNECTED || e >= 30_000;
         }
-        if (inputConnection == null) {
-            inputConnection = new Remote(c, 8, 0, socket -> {
-                inputOpening = socket;
-                if (inputEpoch.get() != epoch || credentials != c || !controlRequested) socket.close();
-            });
-            inputCredentials = c;
+        if (audioSeen && audioLink != null && audioLink.phase != ConnectionStatus.Phase.NORMAL) {
+            long e = elapsed(audioLink.recoveringMillis, audioLinkAt, now); worst = Math.max(worst, e);
+            lost |= audioLink.phase == ConnectionStatus.Phase.DISCONNECTED || e >= 30_000;
         }
-        lastInputMs = SystemClock.uptimeMillis();
-        return inputConnection;
+        if (controlRequested && input != null && controlLink != null && controlLink.phase != InputChannel.Phase.NORMAL) {
+            long e = elapsed(controlLink.recoveringMillis, controlLinkAt, now); worst = Math.max(worst, e);
+            lost |= controlLink.phase == InputChannel.Phase.DISCONNECTED || e >= 30_000;
+        }
+        // A fixed choice the network cannot carry: suggest one step down, never switch by itself.
+        String lower = lowerQualityLabel();
+        boolean short_ = hardwareDesktop && videoSeen && constrainedSince != 0 && now - constrainedSince >= 3000;
+        if (lost) desktopLayout.link(S.LINK_LOST, S.LINK_RECONNECT, this::reconnectLinks);
+        else if (worst >= 3000) desktopLayout.link(String.format(Locale.ROOT, S.LINK_RECOVERING_FOR, worst / 1000), null, null);
+        else if (worst >= 1000) desktopLayout.link(S.LINK_RECOVERING, null, null);
+        else if (short_) desktopLayout.link(String.format(S.Q_SHORT, tierName(qualityWidth) + qualityFps), lower, lower == null ? null : this::lowerQuality);
+        else desktopLayout.link(null, null, null);
+        if (worst > 0 || (constrainedSince != 0 && !short_)) inputUi.postDelayed(linkTick, 500);
+    }
+    /** “重新连接”: restarts every channel the user has on, with the same authorization. */
+    void reconnectLinks() {
+        Remote.Credentials c = credentials;
+        if (c == null) { status(S.NEED_DEVICE); return; }
+        videoLink = audioLink = null; controlLink = null;
+        if (subscribed.get() && hardwareDesktop) { video.stop(); videoSeen = false; } // the frame loop starts it again
+        if (audioSubscribed) { systemAudio.stop(); audioSeen = false; audioState(AUDIO_CONNECTING); systemAudio.start(c); }
+        if (controlRequested && control.get()) openInput(c);
+        linkChanged();
     }
     void toggleControl() {
         long epoch = inputEpoch.incrementAndGet();
         if (controlRequested) {
-            controlRequested = false; control.set(false); abortInput(); controlLabels(); status("控制已关闭"); return;
+            controlRequested = false; control.set(false); closeInput(); controlLabels(); status("控制已关闭"); return;
         }
         Remote.Credentials c = credentials;
         if (c == null) { status(S.NEED_DEVICE); return; }
         controlRequested = true; controlLabels();
-        inputJob(epoch, () -> {
-            Remote remote = inputRemote(c, epoch);
-            String capabilities = Remote.str(Remote.reader(remote.call(30, new byte[0])));
-            if (!capabilities.contains("gesture-v1") || !capabilities.contains("unicode-ime-v1")) throw new IOException("主机需要更新才能使用拖拽与输入法");
-            runOnUiThread(() -> {
-                if (inputEpoch.get() == epoch && credentials == c && controlRequested) {
-                    control.set(true); controlLabels(); status("控制已开启：单指拖拽、双击打开、双指轻点右键，双指缩放和平移");
-                }
-            });
-        });
+        try { work.execute(() -> {
+            try (Remote probe = new Remote(c, 8, 0)) {
+                String capabilities = Remote.str(Remote.reader(probe.call(30, new byte[0])));
+                if (!capabilities.contains("gesture-v1") || !capabilities.contains("unicode-ime-v1")) throw new IOException("主机需要更新才能使用拖拽与输入法");
+                runOnUiThread(() -> {
+                    if (inputEpoch.get() != epoch || credentials != c || !controlRequested) return;
+                    openInput(c); control.set(true); controlLabels();
+                    status("控制已开启：单指拖拽、双击打开、双指轻点右键，双指缩放和平移");
+                });
+            } catch (Exception error) {
+                String why = error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage();
+                runOnUiThread(() -> {
+                    if (inputEpoch.get() != epoch) return;
+                    controlRequested = false; control.set(false); controlLabels(); status("无法开启控制：" + why);
+                });
+                status(why); // lets an ended session reach disconnect()
+            }
+        }); } catch (RejectedExecutionException busy) { controlRequested = false; controlLabels(); status("操作队列已满"); }
     }
     void desktopTap(float touchX, float touchY) {
         if (rightArmed) { desktopRightClick(touchX, touchY); return; }
         desktopClick(touchX, touchY, false);
     }
+    void desktopRightClick(float touchX, float touchY) {
+        disarmRightClick();
+        if (!control.get() || !subscribed.get() || !display.get()) return;
+        int[] point = screen.viewport.pointer(touchX, touchY);
+        if (point == null) return; // Letterbox or outside the picture.
+        // Op 52 = right_click: x, y, monitor (same body as click).
+        sendInput(52, pointerBody(point[0], point[1], selectedMonitor), new Click(keyboardRequestId.incrementAndGet(), false));
+    }
     void desktopClick(float touchX, float touchY, boolean twice) {
         if (!control.get() || !subscribed.get() || !display.get()) return;
         int[] point = screen.viewport.pointer(touchX, touchY);
         if (point == null) return; // Ignore letterboxes and coordinates outside the view.
-        long epoch = inputEpoch.get(); Remote.Credentials c = credentials;
-        long keyboardRequest = keyboardRequestId.incrementAndGet();
-        inputJob(epoch, () -> {
-            if (inputEpoch.get() != epoch || !control.get() || !subscribed.get() || credentials != c) return;
-            inputRemote(c, epoch).call(twice ? 37 : 35, Remote.body(o -> { o.writeInt(point[0]); o.writeInt(point[1]); o.writeInt(selectedMonitor); }));
-            controlClicksCompleted.incrementAndGet();
-            inputUi.postDelayed(() -> probeKeyboard(epoch, c, keyboardRequest, false), 160);
-        });
+        sendInput(twice ? 37 : 35, pointerBody(point[0], point[1], selectedMonitor), new Click(keyboardRequestId.incrementAndGet(), true));
     }
     void probeKeyboard(long epoch, Remote.Credentials c, long request, boolean retried) {
-        if (!control.get() || draggingRemote || credentials != c || inputEpoch.get() != epoch || keyboardRequestId.get()!=request) return;
-        inputJob(epoch, () -> {
-            int flags = Remote.reader(inputRemote(c, epoch).call(40, new byte[0])).readInt();
-            lastFocusFlags = flags;
-            runOnUiThread(() -> {
-                if (inputEpoch.get() != epoch || !control.get() || !subscribed.get() || !display.get() || keyboardRequestId.get()!=request) return;
-                if ((flags & 1) != 0) keyboard.open((flags & 2) != 0);
-                else {
-                    keyboard.close();
-                    if (!retried) inputUi.postDelayed(() -> probeKeyboard(epoch,c,request,true),350);
-                }
-            });
-        });
+        if (!control.get() || draggingRemote || credentials != c || inputEpoch.get() != epoch || keyboardRequestId.get() != request) return;
+        sendInput(40, new byte[0], new Probe(request, retried));
     }
     void showKeyboard() {
         if (!control.get()) { status("请先开启控制，再点击电脑输入框"); return; }
@@ -942,45 +1163,26 @@ public final class MainActivity extends Activity {
     boolean desktopDragBegin(float x, float y) {
         if (!control.get() || !subscribed.get() || !display.get()) return false;
         int[] point = screen.viewport.pointer(x, y); if (point == null) return false;
-        keyboardRequestId.incrementAndGet(); keyboard.close(); draggingRemote = true; long id = ++dragId;
+        keyboardRequestId.incrementAndGet(); keyboard.close(); draggingRemote = true;
         dragX = x; dragY = y;
-        long epoch = inputEpoch.get(); Remote.Credentials c = credentials;
-        inputJob(epoch, () -> { pointerCall(c, epoch, 1, point); workerDragId = id; });
+        sendPointer(1, point, TAG_KEY);
         inputUi.removeCallbacks(dragHeartbeat); inputUi.postDelayed(dragHeartbeat, 250);
         return true;
     }
-    void pointerCall(Remote.Credentials c, long epoch, int phase, int[] point) throws Exception {
-        inputRemote(c, epoch).call(36, Remote.body(o -> { o.writeInt(phase); o.writeInt(point[0]); o.writeInt(point[1]); o.writeInt(selectedMonitor); }));
+    void sendPointer(int phase, int[] point, Object tag) {
+        sendInput(36, java.nio.ByteBuffer.allocate(16).putInt(phase).putInt(point[0]).putInt(point[1]).putInt(selectedMonitor).array(), tag);
     }
     void desktopDragMove(float x, float y) {
         if (!draggingRemote || !control.get()) return;
         dragX = x; dragY = y;
         int[] point = screen.viewport.dragPointer(x, y); if (point == null) return;
-        pendingMove.set(new PointerMove(dragId, inputEpoch.get(), point, credentials)); queueMove();
-    }
-    void queueMove() {
-        if (!moveQueued.compareAndSet(false, true)) return;
-        inputJob(inputEpoch.get(), () -> {
-            try {
-                PointerMove move = pendingMove.getAndSet(null);
-                if (move != null && move.epoch == inputEpoch.get() && workerDragId == move.id)
-                    pointerCall(move.c, move.epoch, 2, move.point);
-            } finally {
-                moveQueued.set(false);
-                if (pendingMove.get() != null) queueMove();
-            }
-        });
+        sendPointer(2, point, null);
     }
     void desktopDragEnd(float x, float y, boolean cancel) {
         if (!draggingRemote) return;
-        draggingRemote = false; inputUi.removeCallbacks(dragHeartbeat); pendingMove.set(null);
+        draggingRemote = false; inputUi.removeCallbacks(dragHeartbeat);
         int[] point = screen.viewport.dragPointer(x, y); if (point == null) point = new int[]{0, 0};
-        final int[] last = point; long id = dragId, epoch = inputEpoch.get(); Remote.Credentials c = credentials;
-        inputJob(epoch, () -> {
-            if (workerDragId != id) return;
-            try { pointerCall(c, epoch, cancel ? 4 : 3, last); dragEndsCompleted.incrementAndGet(); }
-            finally { workerDragId = 0; }
-        });
+        sendPointer(cancel ? 4 : 3, point, TAG_DRAG_END);
     }
     void desktopText(String value) {
         if (!control.get() || !subscribed.get() || !display.get() || value.isEmpty()) return;
@@ -1001,15 +1203,11 @@ public final class MainActivity extends Activity {
         if (chunk.length()>0) sendText(chunk.toString());
     }
     void sendText(String value) {
-        long epoch=inputEpoch.get(); Remote.Credentials c=credentials;
-        inputJob(epoch, () -> {
-            inputRemote(c, epoch).call(38, Remote.body(o -> Remote.str(o, value))); textCommitsCompleted.incrementAndGet();
-        });
+        try { sendInput(38, Remote.body(o -> Remote.str(o, value)), TAG_TEXT); } catch (Exception invalid) { status(invalid.getMessage()); }
     }
     void desktopKey(int vk, int count) {
         if (!control.get() || !subscribed.get() || !display.get()) return;
-        long epoch=inputEpoch.get(); Remote.Credentials c=credentials;
-        inputJob(epoch, () -> inputRemote(c, epoch).call(39, Remote.body(o -> { o.writeInt(vk); o.writeInt(count); })));
+        sendInput(39, java.nio.ByteBuffer.allocate(8).putInt(vk).putInt(count).array(), TAG_KEY);
     }
     @Override
     public void onBackPressed() {
@@ -1160,7 +1358,7 @@ public final class MainActivity extends Activity {
         });
     }
     final Runnable taskTick=new Runnable(){public void run(){if(ui!=null)renderTransfers();inputUi.postDelayed(this,1000);}};
-    @Override protected void onStart(){super.onStart();inputUi.removeCallbacks(taskTick);inputUi.post(taskTick);if(networkWatcher==null)networkWatcher=new NetworkWatcher(this,()->{if(video!=null)video.networkChanged();if(systemAudio!=null)systemAudio.networkChanged();controlRequested=false;control.set(false);inputEpoch.incrementAndGet();abortInput();controlLabels();status("网络已变化，订阅与传输将按原授权尝试恢复");});}
+    @Override protected void onStart(){super.onStart();inputUi.removeCallbacks(taskTick);inputUi.post(taskTick);if(networkWatcher==null)networkWatcher=new NetworkWatcher(this,()->{if(video!=null)video.networkChanged();if(systemAudio!=null)systemAudio.networkChanged();status("网络已变化，正在按原授权恢复连接");});}
     @Override
     protected void onStop() {
         discoveryCancel.set(true);
@@ -1170,7 +1368,7 @@ public final class MainActivity extends Activity {
         if(systemAudio!=null) {audioSubscribed=false;systemAudio.stop();audioState(AUDIO_OFF);}
         subscribed.set(false);
         TransferPacer.SHARED.realtime=false;
-        controlRequested = false; control.set(false); inputEpoch.incrementAndGet(); abortInput(); controlLabels();
+        controlRequested = false; control.set(false); inputEpoch.incrementAndGet(); closeInput(); controlLabels();
         updateDesktopPresentation();
         super.onStop();
     }
@@ -1192,8 +1390,7 @@ public final class MainActivity extends Activity {
         Bitmap pending = latestBitmap.getAndSet(null);
         if (pending != null)
             pending.recycle();
-        controlRequested = false; control.set(false); inputEpoch.incrementAndGet(); abortInput();
-        inputs.shutdownNow();
+        controlRequested = false; control.set(false); inputEpoch.incrementAndGet(); closeInput();
         work.shutdownNow();
         super.onDestroy();
     }

@@ -170,7 +170,7 @@ public final class DeviceTestRunner extends Instrumentation {
             a.screen.dispatchTouchEvent(e); e.recycle();
         });
         Thread.sleep(420);
-        a.inputs.submit(() -> {}).get(5, java.util.concurrent.TimeUnit.SECONDS);
+        a.awaitInput(5000);
         Thread.sleep(50);
     }
     void pinch(MainActivity a) {
@@ -207,7 +207,7 @@ public final class DeviceTestRunner extends Instrumentation {
             Thread.sleep(100);
             if (step==4 && !cancel) Thread.sleep(2100); // Heartbeats keep a stationary drag alive beyond the host lease.
         }
-        a.inputs.submit(() -> {}).get(5,java.util.concurrent.TimeUnit.SECONDS);
+        a.awaitInput(5000);
     }
     void interactionChecks(MainActivity a, Remote.Credentials c) throws Exception {
         phase("Physical drag, Windows double click and Android IME");
@@ -235,7 +235,7 @@ public final class DeviceTestRunner extends Instrumentation {
                 e=MotionEvent.obtain(t+i*90,t+i*90+30,MotionEvent.ACTION_UP,doublePoint[0][0],doublePoint[0][1],0); a.screen.dispatchTouchEvent(e); e.recycle();
             }
         });
-        Thread.sleep(450); a.inputs.submit(() -> {}).get(5,java.util.concurrent.TimeUnit.SECONDS);
+        Thread.sleep(450); a.awaitInput(5000);
         check(a.controlClicksCompleted.get()==before+1 && a.screen.zoom==1,"double click request without zoom");
         float[][] editPoint={null};
         runOnMainSync(() -> editPoint[0]=fixturePoint(a,inputFixture.optDouble("edit_x")/w+.1,inputFixture.optDouble("edit_y")/h+.08));
@@ -259,7 +259,7 @@ public final class DeviceTestRunner extends Instrumentation {
             connection.commitText(" 😀x",1);
             connection.deleteSurroundingText(1,0);
         });
-        a.inputs.submit(() -> {}).get(5,java.util.concurrent.TimeUnit.SECONDS); Thread.sleep(300);
+        a.awaitInput(5000); Thread.sleep(300);
         check(a.textCommitsCompleted.get()>=3,"IME composition committed without sending candidates");
         report.put("expected_test_text","Lantern 中文 😀");
         runOnMainSync(() -> a.keyboard.close());

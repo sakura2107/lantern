@@ -2,6 +2,7 @@ package org.lantern.client;
 
 import android.media.*;
 import android.os.*;
+import android.view.Surface;
 import java.io.*;
 import java.nio.*;
 import java.util.*;
@@ -235,7 +236,7 @@ void consume(Request request, AvcView.Target target) throws Exception {
             DesktopSession.Status updated=session.metadata(packet);
             byte[] data = Remote.blob(packet, session.version>=3?16*1024*1024-512:Remote.MAX-256);
             if(updated.width!=format.width||updated.height!=format.height||updated.fps!=format.fps){
-                codec.stop();codec.release();codec=null;
+                target.detach(codec);codec.stop();codec.release();codec=null;
                 codec=createDecoder(request,target,epoch,updated,session.headers);format=updated;
             }
             if(session.version>=3)main.post(()->{if(current(request,target))events.quality(updated);});
@@ -284,6 +285,7 @@ void consume(Request request, AvcView.Target target) throws Exception {
     } finally {
         streamEpoch.compareAndSet(epoch,epoch+1);
         if (codec != null) {
+            target.detach(codec);
             try {
                 codec.stop();
             } catch (Exception ignored) {
@@ -317,13 +319,16 @@ MediaCodec createDecoder(Request request,AvcView.Target target,long epoch,Deskto
         MediaCodec codec=MediaCodec.createByCodecName(selected);
         try{
             decoderName=codec.getCodecInfo().getName();hardwareDecoder=Build.VERSION.SDK_INT>=29&&codec.getCodecInfo().isHardwareAccelerated();
-            width=w;height=h;codec.configure(format,target.surface,null,0);
+            width=w;height=h;codec.configure(format,target.surface,null,0);target.attach(codec);
+            // Ask the display for the stream's rate (e.g. 120 Hz) instead of the panel's power-saving default.
+            if(Build.VERSION.SDK_INT>=30)try{target.surface.setFrameRate(fps,Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);}catch(RuntimeException ignored){}
         codec.setOnFrameRenderedListener((c, pts, nano) -> {
             if (!current(request, target)||streamEpoch.get()!=epoch)
                 return;
             if(connection.snapshot().phase!=ConnectionStatus.Phase.NORMAL){connection.normal();main.post(()->{if(current(request,target))events.connectionState(connection.snapshot());});}
             synchronized (this) {
                 renderTimes[(int)(rendered++ % renderTimes.length)] = nano;
+                view.rendered(System.nanoTime()); // callback time; the render timestamp uses another clock base
                 if(request.absolute)request.timeline.observe(pts,nano);
                 if (firstFrameNs == 0)
                     firstFrameNs = System.nanoTime();
@@ -338,7 +343,7 @@ MediaCodec createDecoder(Request request,AvcView.Target target,long epoch,Deskto
         codec.start();
             main.post(()->{if(current(request,target)&&streamEpoch.get()==epoch)events.configured(w,h,decoderName,hardwareDecoder);});
             return codec;
-        }catch(Exception error){codec.release();throw error;}
+        }catch(Exception error){target.detach(codec);codec.release();throw error;}
 }
 void drain(MediaCodec codec, MediaCodec.BufferInfo info, AvcView.Target target,Request request) {
     for (int i = 0; i < 32; i++) {
