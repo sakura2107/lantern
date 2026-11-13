@@ -12,6 +12,7 @@ namespace lantern {
 using Bytes = std::vector<uint8_t>;
 constexpr uint16_t protocol_version = 1;
 constexpr uint32_t max_frame = 4 * 1024 * 1024, chunk_size = 256 * 1024;
+constexpr uint32_t max_video_frame = 16 * 1024 * 1024;
 enum class Code : uint32_t {
     ok,
     invalid,
@@ -71,14 +72,21 @@ enum class Op : uint16_t {
     clipboard_read = 53,
     clipboard_write = 54,
     pair = 55,
-    endpoints = 56
+    endpoints = 56,
+    input_reliable = 57,
+    desktop_limits = 58,
+    desktop_update = 59,
+    desktop_probe = 60,
+    media_path = 61,
+    media_tracks = 70,
+    media_segment = 71
 };
 struct Writer {
     Bytes b;
     void u16(uint16_t n);
     void u32(uint32_t n);
     void u64(uint64_t n);
-    void blob(std::span<const uint8_t> s);
+    void blob(std::span<const uint8_t> s, uint32_t limit = max_frame);
     void str(const std::string& s);
 };
 struct Reader {

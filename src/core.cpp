@@ -14,8 +14,8 @@ void Writer::u64(uint64_t n) {
     for (int i = 7; i >= 0; --i)
         b.push_back(uint8_t(n >> (8 * i)));
 }
-void Writer::blob(std::span<const uint8_t> s) {
-    if (s.size() > max_frame)
+void Writer::blob(std::span<const uint8_t> s, uint32_t limit) {
+    if (s.size() > std::min(limit, max_video_frame))
         throw Error(Code::invalid, "Oversized blob");
     u32(uint32_t(s.size()));
     b.insert(b.end(), s.begin(), s.end());
