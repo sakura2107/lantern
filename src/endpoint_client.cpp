@@ -248,7 +248,8 @@ void last_winner_first(const std::string& pin, std::vector<ConnectionEndpoint>& 
 }
 } // namespace
 EndpointConnection connect_endpoints(const std::vector<ConnectionEndpoint>& list, const std::string& pin,
-                                     std::chrono::milliseconds timeout) {
+                                     std::chrono::milliseconds timeout,
+                                     const std::optional<ConnectionEndpoint>& preferred) {
     if (!valid_sha(pin) || list.empty() || list.size() > 8 || timeout.count() < 1 ||
         timeout > std::chrono::seconds(60))
         throw Error(Code::invalid, "Invalid connection parameters");
@@ -256,6 +257,13 @@ EndpointConnection connect_endpoints(const std::vector<ConnectionEndpoint>& list
     if (ordered.empty())
         throw EndpointConnectError(EndpointFailure::timeout, {});
     last_winner_first(pin, ordered); // the others keep their order and 250 ms stagger
+    if (preferred) {
+        auto it = std::find_if(ordered.begin(), ordered.end(), [&](const auto& e) {
+            return e.host == preferred->host && e.port == preferred->port;
+        });
+        if (it != ordered.end())
+            std::rotate(ordered.begin(), it, it + 1);
+    }
     Race race;
     auto begin = Clock::now(), deadline = begin + timeout;
     std::vector<std::jthread> threads;

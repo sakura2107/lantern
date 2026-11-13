@@ -299,12 +299,16 @@ final class NetworkDialer {
     }
     static Result connect(List<ConnectionEndpoint> candidates, String pin, int timeout,
                           Remote.SocketReady opening) throws Exception {
-        return connect(candidates, pin, timeout, opening, false);
+        return connect(candidates, pin, timeout, opening, false, null);
+    }
+    static Result connect(List<ConnectionEndpoint> candidates, String pin, int timeout,
+                          Remote.SocketReady opening, ConnectionEndpoint preferred) throws Exception {
+        return connect(candidates, pin, timeout, opening, false, preferred);
     }
     static Result connectLegacy(String host, int port, String pin, int timeout, Remote.SocketReady opening)
         throws Exception {
         return connect(Collections.singletonList(ConnectionEndpoint.of(host, port)), pin, timeout, opening,
-                       true);
+                       true, null);
     }
     /**
      * Per computer (certificate pin), the entry that won the last race. Away from home the LAN entries would
@@ -324,13 +328,20 @@ final class NetworkDialer {
         return out;
     }
     private static Result connect(List<ConnectionEndpoint> candidates, String pin, int timeout,
-                                  Remote.SocketReady opening, boolean legacy) throws Exception {
+                                  Remote.SocketReady opening, boolean legacy, ConnectionEndpoint preferred) throws Exception {
         if (timeout < 1 || timeout > 60000 || candidates.isEmpty() || candidates.size() > 8)
             throw new IOException("连接参数无效");
         List<ConnectionEndpoint> list = legacy ? candidates
                                                : lastWinnerFirst(pin, ConnectionEndpoint.merge(
                                                      Collections.emptyList(), candidates,
                                                      System.currentTimeMillis() / 1000));
+        if (preferred != null) {
+            list = new ArrayList<>(list);
+            for (int i=0;i<list.size();i++)
+                if (list.get(i).host.equals(preferred.host) && list.get(i).port == preferred.port) {
+                    list.add(0,list.remove(i)); break;
+                }
+        }
         Race race = new Race(list, context(pin), timeout);
         if (opening != null)
             opening.opened(race.group);

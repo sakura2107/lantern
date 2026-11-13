@@ -334,7 +334,7 @@ synchronized void sendOnly(int op, byte[] payload) throws IOException {
 }
 byte[] receive(int op) throws IOException {
     int n;try{n=input.readInt();}catch(IOException error){throw new TransportError(error);}
-    if (n < 8 || n > MAX)
+    if (n < 8 || n > (op==33?16*1024*1024:MAX))
         throw new IOException("协议帧越界");
     byte[] response = new byte[n];
     try{input.readFully(response);}catch(IOException error){throw new TransportError(error);}
@@ -502,9 +502,9 @@ void download(String path, File dest, AtomicBoolean cancel, Progress progress) t
                         pending.add(length);
                         next += length;
                     }
-                    int expected = pending.poll();
+                    int expectedLength = pending.poll();
                     byte[] b = blob(reader(receive(4)), CHUNK);
-                    if (b.length != expected)
+                    if (b.length != expectedLength)
                         throw new IOException("源文件意外结束");
                     out.write(b);
                     TransferPacer.SHARED.down.add(b.length);

@@ -429,7 +429,7 @@ int wmain(int argc, wchar_t** argv) {
             Client viewing("127.0.0.1", 47449, pin, token, view, 1);
             error(Code::invalid, [&] { viewing.call(Op::desktop_stream); }, "stream truncated request");
             Writer incompatible;
-            incompatible.u32(3);
+            incompatible.u32(UINT32_MAX); // v3 is now the negotiated adaptive desktop protocol.
             error(
                 Code::unsupported, [&] { viewing.call(Op::desktop_stream, incompatible); },
                 "stream version incompatible");

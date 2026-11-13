@@ -16,7 +16,8 @@ struct EndpointConnection {
     bool public_path = false;
 };
 EndpointConnection connect_endpoints(const std::vector<ConnectionEndpoint>&, const std::string& pin,
-                                     std::chrono::milliseconds timeout = std::chrono::seconds(10));
+                                     std::chrono::milliseconds timeout = std::chrono::seconds(10),
+                                     const std::optional<ConnectionEndpoint>& preferred = {});
 std::vector<EndpointProbe> probe_endpoints(const std::vector<ConnectionEndpoint>&, const std::string& pin,
                                            std::chrono::milliseconds timeout = std::chrono::seconds(10));
 std::vector<ConnectionEndpoint> client_endpoints(Client&); // Capability-gated; empty for older hosts.

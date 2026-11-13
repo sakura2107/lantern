@@ -150,7 +150,8 @@ public final class InteropTest {
                 if (resumed[0] == 0)
                     resumed[0] = n;
             });
-            check(resumed[0] == Remote.CHUNK, "Java upload resumed");
+            check(resumed[0] >= Remote.CHUNK && resumed[0] <= Remote.CHUNK * Remote.PIPELINE,
+                  "Java upload resumes confirmed or already delivered pipeline blocks");
             check(remote.stat("java-upload.bin", true).hash.equals(info.hash), "Java upload verified");
             boolean malformed = false;
             try {
