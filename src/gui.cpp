@@ -1,8 +1,10 @@
 #include "lantern/discovery.hpp"
+#include "lantern/media_receiver.hpp"
 #include "lantern/pairing.hpp"
 #include "lantern/pairing_client.hpp"
 #include "lantern/windows_client.hpp"
 #include "lantern/windows_clipboard.hpp"
+#include "lantern/windows_input_channel.hpp"
 #include "lantern/windows_media.hpp"
 #include "lantern/windows_playback.hpp"
 #include "lantern/windows_thumbnail.hpp"
@@ -20,7 +22,8 @@ using namespace lantern;
 using Microsoft::WRL::ComPtr;
 namespace {
 constexpr UINT WM_UPDATE = WM_APP + 1, WM_IMAGE = WM_APP + 2, WM_TASKS = WM_APP + 3,
-               WM_INPUT_FAILURE = WM_APP + 4, WM_SHUTDOWN = WM_APP + 5, WM_THUMB = WM_APP + 6;
+               WM_INPUT_FAILURE = WM_APP + 4, WM_SHUTDOWN = WM_APP + 5, WM_THUMB = WM_APP + 6,
+               WM_LINK = WM_APP + 7;
 HWND window, desktop, statusbox;
 std::map<int, HWND> controls;
 /** Page that owns a control: -1 = every normal page, 0..3 = one page, or one of the fullscreen roles. */
@@ -89,13 +92,6 @@ std::optional<ConnectionEndpoint> via;
 std::deque<Update> updates;
 bool update_posted = false;
 std::deque<std::function<void()>> work;
-struct InputEvent {
-    Op op;
-    Writer body;
-    bool move = false;
-    unsigned epoch = 0;
-};
-std::deque<InputEvent> input_queue;
 std::thread work_thread, video_thread, audio_thread, input_thread;
 std::unique_ptr<WindowsTransfers> transfers;
 std::unique_ptr<WindowsMediaBridge> media_bridge;
@@ -116,6 +112,48 @@ std::atomic_uint video_epoch = 0, audio_epoch = 0, input_epoch = 0, monitor_inde
                  source_h = 1080;
 std::atomic_uint target_width = 1920, target_fps = 60, target_bitrate = 12'000'000;
 std::atomic<double> zoom = 1;
+std::atomic_bool target_auto = false, sync_warned = false;
+/** Link state per channel (0 picture, 1 sound, 2 control): written by workers, shown by the banner. */
+struct LinkView {
+    ConnectionPhase phase = ConnectionPhase::normal;
+    uint64_t recovering_ms = 0;
+    std::chrono::steady_clock::time_point at{};
+    bool seen = false; // a channel only "recovers" after it has worked once
+};
+std::mutex link_mutex;
+LinkView links[3];
+QualityStatus live_quality;                     // under link_mutex
+bool live_quality_valid = false;                // under link_mutex
+std::vector<DisplayLimits> host_limits;         // under link_mutex
+std::shared_ptr<DesktopConnection> live_desktop; // under link_mutex: online quality changes go here
+std::chrono::steady_clock::time_point constrained_since{}; // UI thread
+std::wstring banner_text;                       // UI thread
+int banner_action = 0;                          // 1 reconnect, 2 one step lower
+/** Control: one reliable channel per control session (UI thread). Full channel = ordered backlog. */
+struct PendingInput {
+    Op op;
+    Bytes body;
+    bool move;
+};
+std::unique_ptr<InputChannel> input_channel;
+std::deque<PendingInput> input_backlog;
+void link_event(int channel, ConnectionState s) {
+    {
+        std::lock_guard lock(link_mutex);
+        auto& l = links[channel];
+        l.phase = s.phase;
+        l.recovering_ms = s.recovering_ms;
+        l.at = std::chrono::steady_clock::now();
+    }
+    PostMessageW(window, WM_LINK, 0, 0);
+}
+std::wstring tier_name(uint32_t width) {
+    return width >= 3840 ? L"4K" : width >= 2560 ? L"2K" : width >= 1920 ? L"1080p" : width >= 1280 ? L"720p"
+                                                                                                : std::to_wstring(width) + L"p";
+}
+QualitySettings quality_settings() {
+    return {target_width.load(), target_fps.load(), target_auto.load()};
+}
 Cancel file_cancel, audio_cancel;
 std::vector<Entry> entries;
 std::vector<TransferTask> task_snapshot;
@@ -267,24 +305,38 @@ std::wstring bytes(uint64_t n) {
       << (n >= 1024ull * 1024 * 1024 ? L" GiB" : L" MiB");
     return s.str();
 }
+bool movable_input(Op op, const Bytes& body) {
+    if (body.size() < 4)
+        return false;
+    uint32_t first = uint32_t(body[0]) << 24 | uint32_t(body[1]) << 16 | uint32_t(body[2]) << 8 | body[3];
+    return (op == Op::pointer_gesture && first == 2) || (op == Op::input && first == 0);
+}
+/** UI thread. Clicks/keys/text keep their order; when the channel is full they wait here (never dropped). */
 void input(Op op, Writer w, bool move_event = false) {
-    if (!control_on)
+    if (!control_on || !input_channel)
         return;
-    std::lock_guard lock(input_mutex);
-    if (move_event && !input_queue.empty() && input_queue.back().move) {
-        input_queue.back().body = std::move(w);
+    Bytes body = std::move(w.b);
+    move_event = move_event || movable_input(op, body);
+    if (!input_backlog.empty()) {
+        if (move_event && input_backlog.back().move)
+            input_backlog.back() = {op, std::move(body), true};
+        else
+            input_backlog.push_back({op, std::move(body), move_event});
         return;
     }
-    if (input_queue.size() >= 64) {
-        // Backed up (slow network): stale pointer moves go first; clicks and keys stay queued.
-        std::erase_if(input_queue, [](const InputEvent& e) { return e.move; });
-        if (input_queue.size() >= 256) {
-            input_queue.clear();
-            status(L"网络太慢，已丢弃积压的输入；控制仍然开启。");
-        }
+    if (input_channel->submit(op, body))
+        return;
+    input_backlog.push_back({op, std::move(body), move_event});
+    SetTimer(window, 8, 30, nullptr);
+}
+void drain_input() {
+    while (input_channel && !input_backlog.empty()) {
+        if (!input_channel->submit(input_backlog.front().op, input_backlog.front().body))
+            return; // the timer tries again
+        input_backlog.pop_front();
     }
-    input_queue.push_back({op, std::move(w), move_event, input_epoch.load()});
-    input_cv.notify_one();
+    input_backlog.clear();
+    KillTimer(window, 8);
 }
 void pointer(uint32_t phase, int32_t x, int32_t y) {
     Writer w;
@@ -302,15 +354,37 @@ void cancel_pointer() {
     }
     KillTimer(desktop, 1);
 }
+/** Closing joins the channel's worker, which may be inside a bounded connect: never on the UI thread. */
+void close_input_channel(bool wait = false) {
+    input_backlog.clear();
+    KillTimer(window, 8);
+    if (input_channel) {
+        std::shared_ptr<InputChannel> old(std::move(input_channel));
+        if (wait)
+            old->close();
+        else
+            std::thread([old] { old->close(); }).detach();
+    }
+    std::lock_guard lock(link_mutex);
+    links[2] = {};
+}
+void open_input() {
+    close_input_channel();
+    unsigned epoch = input_epoch;
+    input_channel = open_input_channel(creds(), [epoch](ConnectionState s) {
+        if (epoch == input_epoch)
+            link_event(2, s);
+    });
+    std::lock_guard lock(link_mutex);
+    links[2].seen = true;
+}
 void release_control() {
     cancel_pointer();
     control_on = false;
     ++input_epoch;
-    input_connection.interrupt();
-    std::lock_guard lock(input_mutex);
-    input_queue.clear();
+    close_input_channel();
 }
-constexpr int strip_ids[] = {16, 17, 20, 23, 25, 21, 74, 26, 31, 24, 117};
+constexpr int strip_ids[] = {16, 17, 20, 23, 25, 132, 21, 74, 26, 31, 24, 117};
 bool in_strip(int id) {
     return std::find(std::begin(strip_ids), std::end(strip_ids), id) != std::end(strip_ids);
 }
@@ -345,6 +419,8 @@ void layout() {
     scene.clear();
     auto visible = [](int id) {
         int p = pages[id];
+        if (id == 133 || id == 134) // link banner
+            return !banner_text.empty() && (id == 133 || banner_action != 0) && (fullscreen || page == 1);
         if (fullscreen)
             return chrome_hidden ? p == CHROME_HANDLE : in_strip(id);
         if (p == CHROME_HANDLE || p == FULL_ONLY)
@@ -364,6 +440,7 @@ void layout() {
     for (int id : strip_ids)
         ui::set_surface(ctl(id), fullscreen ? ui::Surface::Chrome : ui::Surface::Bg);
     ui::style_combo(ctl(25), fullscreen);
+    ui::style_combo(ctl(132), fullscreen);
 
     if (fullscreen) {
         int strip = 0;
@@ -380,6 +457,7 @@ void layout() {
             for (int id : {16, 17, 20, 23})
                 f.place(ctl(id), bh);
             place_combo(25, f.next(dp(160), bh));
+            place_combo(132, f.next(dp(140), bh));
             for (int id : {21, 74, 26})
                 f.place(ctl(id), bh);
             strip = f.bottom() + top;
@@ -387,6 +465,14 @@ void layout() {
         } else {
             move(118, w / 2 - dp(36), 0, dp(72), dp(24));
             SetWindowPos(ctl(118), HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        }
+        if (!banner_text.empty()) {
+            int lh = dp(34), bw = banner_action ? ui::preferred_width(ctl(134), lh) : 0;
+            move(133, dp(16), strip + dp(6), w - bw - dp(44), lh);
+            if (banner_action)
+                move(134, w - bw - dp(16), strip + dp(6), bw, lh);
+            scene.area({0, strip, w, strip + lh + dp(12)}, ui::pal.chrome);
+            strip += lh + dp(12);
         }
         MoveWindow(desktop, 0, strip, w, std::max(1, h - strip), TRUE);
         InvalidateRect(window, nullptr, FALSE);
@@ -445,10 +531,18 @@ void layout() {
         for (int id : {16, 17, 20, 23})
             f.place(ctl(id), dp(56));
         ui::Flow g(x0, R, f.bottom() + dp(12), dp(8));
-        place_combo(25, g.next(dp(170), bh));
+        place_combo(25, g.next(dp(220), bh));
+        place_combo(132, g.next(dp(190), bh));
         for (int id : {21, 74, 26})
             g.place(ctl(id), bh);
         int y = g.bottom() + dp(14);
+        if (!banner_text.empty()) { // link banner directly above the picture
+            int bw = banner_action ? ui::preferred_width(ctl(134), bh) : 0;
+            move(133, x0, y, R - x0 - (bw ? bw + dp(8) : 0), bh);
+            if (banner_action)
+                move(134, R - bw, y, bw, bh);
+            y += bh + dp(10);
+        }
         // Keyboard and clipboard bar along the bottom; wraps to two rows on narrow windows.
         int keys = ui::row_width({ctl(28), ctl(29), ctl(30)}, bh, dp(8)) + dp(8) + dp(170);
         int clip = ui::row_width({ctl(63), ctl(64), ctl(65)}, bh, dp(8));
@@ -536,6 +630,192 @@ void layout() {
     InvalidateRect(window, nullptr, FALSE);
 }
 /** Repaints everything that mirrors live state (tiles, navigation, rail chip, empty desktop). */
+void refresh_state();
+// ---- Picture quality: resolution 4K/2K/1080p/720p with 自动 last (combo 25), frame rate 120/60/30
+// (combo 132). Every combination is selectable; items name the PC-screen limit they are sent at.
+constexpr uint32_t quality_widths[] = {3840, 2560, 1920, 1280}, quality_rates[] = {120, 60, 30};
+void fill_quality_combos() {
+    DisplayLimits screen{};
+    bool known = false;
+    {
+        std::lock_guard lock(link_mutex);
+        for (auto& d : host_limits)
+            if (d.index == monitor_index || !known) {
+                screen = d;
+                known = true;
+            }
+    }
+    auto fill = [](HWND combo, const std::vector<std::wstring>& items, int selected) {
+        SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+        for (auto& s : items)
+            SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)s.c_str());
+        SendMessageW(combo, CB_SETCURSEL, selected, 0);
+    };
+    std::wstring screen_name = known ? (screen.width == 3840 || screen.width == 2560 || screen.width == 1920 ||
+                                                screen.width == 1280) &&
+                                               screen.height == screen.width * 9 / 16
+                                           ? tier_name(screen.width)
+                                           : std::to_wstring(screen.width) + L"×" + std::to_wstring(screen.height)
+                                     : L"";
+    std::vector<std::wstring> sizes;
+    int selected = 4;
+    for (int i = 0; i < 4; ++i) {
+        auto w = quality_widths[i];
+        sizes.push_back(tier_name(w) + (known && screen.width < w ? L"（电脑屏幕最高 " + screen_name + L"）" : L""));
+        if (!target_auto && target_width == w)
+            selected = i;
+    }
+    sizes.push_back(L"自动（按网络升降）");
+    fill(ctl(25), sizes, selected);
+    std::vector<std::wstring> rates;
+    int rate = 1;
+    for (int i = 0; i < 3; ++i) {
+        auto f = quality_rates[i];
+        rates.push_back(std::to_wstring(f) + L" 帧" +
+                        (known && screen.refresh && screen.refresh < f
+                             ? L"（电脑屏幕最高 " + std::to_wstring(screen.refresh) + L" 帧）"
+                             : L""));
+        if (target_fps == f)
+            rate = i;
+    }
+    fill(ctl(132), rates, rate);
+}
+std::wstring quality_name() {
+    return (target_auto ? std::wstring(L"自动") : tier_name(target_width)) + std::to_wstring(target_fps.load());
+}
+/** Online on v3+ hosts (same stream, one IDR); older hosts restart the picture. */
+void apply_quality() {
+    std::shared_ptr<DesktopConnection> live;
+    {
+        std::lock_guard lock(link_mutex);
+        live = live_desktop;
+    }
+    constrained_since = {};
+    auto q = quality_settings();
+    if (live && live->online_quality())
+        enqueue([live, q] { live->set_quality(q, true); });
+    else {
+        ++video_epoch;
+        video_connection.interrupt();
+    }
+    status(L"画质已切换为 " + quality_name());
+}
+/** One step down from a fixed choice the network cannot carry; returns "" when already lowest. */
+std::wstring lower_quality_name() {
+    if (target_auto)
+        return L"";
+    for (int i = 0; i < 3; ++i)
+        if (target_width >= quality_widths[i])
+            return tier_name(quality_widths[i + 1]) + std::to_wstring(target_fps.load());
+    return target_fps > 30 ? tier_name(target_width) + std::to_wstring(target_fps == 120 ? 60 : 30) : L"";
+}
+void lower_quality() {
+    for (int i = 0; i < 3; ++i)
+        if (target_width >= quality_widths[i]) {
+            target_width = quality_widths[i + 1];
+            fill_quality_combos();
+            apply_quality();
+            return;
+        }
+    if (target_fps > 30) {
+        target_fps = target_fps == 120 ? 60 : 30;
+        fill_quality_combos();
+        apply_quality();
+    }
+}
+/** “重新连接”: restarts every channel that is switched on, with the same authorization. */
+void reconnect_links() {
+    {
+        std::lock_guard lock(link_mutex);
+        for (auto& l : links)
+            l = {};
+    }
+    if (subscribed) {
+        ++video_epoch;
+        video_connection.interrupt();
+    }
+    if (audio_on) {
+        ++audio_epoch;
+        audio_cancel.requested = true;
+    }
+    if (control_on)
+        open_input();
+}
+/**
+ * Link banner above the picture: silent under a second, "网络波动，正在恢复…" (with seconds after 3 s),
+ * "已断开" plus 重新连接 after 30 s; a fixed quality the network cannot carry suggests one step down.
+ * Never a dialog. Same rules as the phone.
+ */
+void update_banner() {
+    KillTimer(window, 7);
+    auto now = std::chrono::steady_clock::now();
+    uint64_t worst = 0;
+    bool lost = false, control_ended = false;
+    QualityStatus q;
+    bool quality_known = false;
+    {
+        std::lock_guard lock(link_mutex);
+        bool on[3] = {subscribed.load(), audio_on.load(), control_on.load()};
+        for (int i = 0; i < 3; ++i) {
+            auto& l = links[i];
+            if (!on[i] || !l.seen || l.phase == ConnectionPhase::normal)
+                continue;
+            if (i == 2 && l.phase == ConnectionPhase::disconnected && l.recovering_ms < 29000)
+                control_ended = true; // revoked trust, ended session or uncertain replay
+            uint64_t elapsed =
+                l.recovering_ms + uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(now - l.at).count());
+            worst = std::max(worst, elapsed);
+            lost |= l.phase == ConnectionPhase::disconnected || elapsed >= 30000;
+        }
+        q = live_quality;
+        quality_known = live_quality_valid;
+    }
+    if (control_ended) {
+        release_control();
+        status(L"控制已停止：电脑结束了会话或授权有变化，请重新开启控制。");
+        refresh_state();
+        update_banner();
+        return;
+    }
+    bool short_ = false;
+    if (quality_known && subscribed && !target_auto && (q.constrained || q.dropping)) {
+        if (constrained_since == std::chrono::steady_clock::time_point{})
+            constrained_since = now;
+        short_ = now - constrained_since >= std::chrono::seconds(3);
+    } else
+        constrained_since = {};
+    std::wstring text, button;
+    int action = 0;
+    if (lost) {
+        text = L"已断开，网络恢复后会自动重连";
+        button = L"重新连接";
+        action = 1;
+    } else if (worst >= 3000)
+        text = L"网络波动，正在恢复… " + std::to_wstring(worst / 1000) + L" 秒";
+    else if (worst >= 1000)
+        text = L"网络波动，正在恢复…";
+    else if (short_) {
+        text = L"网络跑不满 " + quality_name();
+        auto lower = lower_quality_name();
+        if (!lower.empty()) {
+            button = L"降到 " + lower;
+            action = 2;
+        }
+    }
+    if (text != banner_text || action != banner_action) {
+        bool relayout = text.empty() != banner_text.empty() || (action == 0) != (banner_action == 0);
+        banner_text = text;
+        banner_action = action;
+        SetWindowTextW(ctl(133), text.c_str());
+        SetWindowTextW(ctl(134), button.c_str());
+        if (relayout)
+            layout();
+        else
+            InvalidateRect(ctl(134), nullptr, TRUE);
+    }
+    if (worst > 0 || (constrained_since != std::chrono::steady_clock::time_point{} && !short_))
+        SetTimer(window, 7, 500, nullptr);
+}
 void refresh_state() {
     for (int id : {16, 17, 20, 23, 101, 102, 103, 104})
         InvalidateRect(ctl(id), nullptr, FALSE);
@@ -731,6 +1011,51 @@ bool retry_wait(unsigned attempt, unsigned current, std::atomic_uint& generation
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     return !closing && enabled && current == generation_;
 }
+bool quality_differs(const QualityStatus& a, const QualityStatus& b) {
+    return a.width != b.width || a.fps != b.fps || a.codec != b.codec || a.path != b.path ||
+           a.selected_width != b.selected_width || a.constrained != b.constrained || a.dropping != b.dropping;
+}
+/** JPEG compatibility picture for hosts whose hardware stream is unavailable. */
+void jpeg_loop(unsigned e, const ClientCredentials& c, const std::wstring& reason) {
+    unsigned retries = 0;
+    status(L"JPEG兼容模式：CPU解码，最多30次请求/秒（硬件画面不可用：" + reason + L"）。");
+    while (!closing && subscribed && e == video_epoch) {
+        try {
+            auto client = c.connect(view, 1);
+            video_connection.set(client);
+            gpu_picture = false;
+            while (!closing && subscribed && e == video_epoch) {
+                auto began = std::chrono::steady_clock::now();
+                Writer w;
+                w.u32(monitor_index);
+                w.u32(std::min(1920u, target_width.load()));
+                w.u32(70);
+                auto b = client->call(Op::frame, std::move(w));
+                Reader r{b};
+                auto encoded = r.blob();
+                r.end();
+                auto p = jpeg(encoded);
+                source_w = p.w;
+                source_h = p.h;
+                if (show_picture)
+                    set_picture(std::move(p));
+                std::this_thread::sleep_until(began + std::chrono::milliseconds(33));
+            }
+        } catch (const TransportError&) {
+            if (!retry_wait(retries++, e, video_epoch, subscribed))
+                break;
+        } catch (const std::exception& error) {
+            status(L"桌面失败：" + wide(error.what()));
+            subscribed = false;
+        }
+    }
+    video_connection.set({});
+}
+/**
+ * Picture: one DesktopReceiver per subscription. It reconnects in the background and keeps the
+ * chosen quality; changes of size/codec/headers rebuild the decoder before the next IDR. Only
+ * authorization/protocol/codec failures end the subscription (codec ones fall back to JPEG).
+ */
 void video_loop() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     while (!closing) {
@@ -738,128 +1063,125 @@ void video_loop() {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
         }
-        unsigned e = video_epoch, retries = 0;
+        unsigned e = video_epoch;
+        sync_warned = false;
         auto c = creds();
         auto timeline = timeline_snapshot();
-        bool fallback = false;
-        while (!closing && subscribed && e == video_epoch) {
-            try {
-                auto client = c.connect(view, 1);
-                video_connection.set(client);
-                if (!subscribed || e != video_epoch)
-                    break;
-                if (fallback) {
-                    gpu_picture = false;
-                    status(L"JPEG兼容模式：CPU解码，最多30次请求/秒。");
-                    while (!closing && subscribed && e == video_epoch) {
-                        auto began = std::chrono::steady_clock::now();
-                        Writer w;
-                        w.u32(monitor_index);
-                        w.u32(std::min(1920u, target_width.load()));
-                        w.u32(70);
-                        auto b = client->call(Op::frame, std::move(w));
-                        Reader r{b};
-                        auto encoded = r.blob();
-                        r.end();
-                        auto p = jpeg(encoded);
-                        source_w = p.w;
-                        source_h = p.h;
-                        if (show_picture)
-                            set_picture(std::move(p));
-                        std::this_thread::sleep_until(began + std::chrono::milliseconds(33));
+        DecoderLimits limits;
+        limits.hevc = WindowsVideo::supports_hevc();
+        try {
+            enqueue([c] {
+                std::vector<DisplayLimits> found;
+                try {
+                    found = DesktopConnection::limits(c);
+                } catch (...) { // hosts before desktop v3 report no limits
+                }
+                {
+                    std::lock_guard lock(link_mutex);
+                    host_limits = std::move(found);
+                }
+                PostMessageW(window, WM_LINK, 1, 0);
+            });
+        } catch (...) {
+        }
+        std::unique_ptr<WindowsVideo> decoder;
+        VideoConfig shown{};
+        bool fresh = true;
+        std::atomic_bool failed = false, fallback = false;
+        std::mutex failure_mutex;
+        std::string failure;
+        {
+            DesktopReceiver receiver(
+                [c, limits](bool automatic) {
+                    auto connection = std::make_shared<DesktopConnection>(c, monitor_index.load(), quality_settings(),
+                                                                          limits, automatic);
+                    std::lock_guard lock(link_mutex);
+                    live_desktop = connection;
+                    return connection;
+                },
+                [&](const DesktopPacket& p) {
+                    static thread_local bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+                    (void)com;
+                    if (!decoder || p.config.width != shown.width || p.config.height != shown.height ||
+                        p.config.codec != shown.codec || p.config.headers != shown.headers) {
+                        decoder.reset();
+                        decoder = std::make_unique<WindowsVideo>(desktop, p.config, timeline, [e] {
+                            return !closing && subscribed && e == video_epoch;
+                        });
+                        shown = p.config;
+                        fresh = true;
+                        source_w = p.config.width;
+                        source_h = p.config.height;
+                        gpu_picture = true;
+                        PostMessageW(window, WM_LINK, 0, 0);
                     }
-                } else {
-                    auto capability = client->call(Op::capabilities);
-                    Reader capability_reader{capability};
-                    bool absolute = capability_reader.str().find("av-clock=host-qpc-v1") != std::string::npos;
-                    capability_reader.end();
-                    Writer w;
-                    w.u32(absolute ? 2 : 1);
-                    w.u32(monitor_index);
-                    w.u32(target_width);
-                    w.u32(target_fps);
-                    w.u32(target_bitrate);
-                    auto b = client->call(Op::desktop_stream, std::move(w));
-                    Reader r{b};
-                    if (r.u32() != (absolute ? 2u : 1u))
-                        throw Error(Code::invalid, "Desktop version");
-                    VideoConfig cfg;
-                    cfg.width = r.u32();
-                    cfg.height = r.u32();
-                    cfg.fps = r.u32();
-                    cfg.bitrate = r.u32();
-                    cfg.capture_provider = r.str();
-                    cfg.encoder_provider = r.str();
-                    cfg.headers = r.blob(65536);
-                    if (absolute && r.str() != "host-qpc-us")
-                        throw Error(Code::invalid, "Desktop clock domain");
-                    r.end();
-                    WindowsVideo decoder(desktop, cfg, absolute ? timeline : nullptr,
-                                         [e] { return !closing && subscribed && e == video_epoch; });
-                    source_w = cfg.width;
-                    source_h = cfg.height;
-                    gpu_picture = true;
-                    Writer ready;
-                    ready.u32(1);
-                    client->send(Op::desktop_ready, std::move(ready));
-                    status(L"H.264 · GPU解码与渲染 · " + std::to_wstring(cfg.width) + L"×" +
-                           std::to_wstring(cfg.height) + L" · " + std::to_wstring(cfg.fps) +
-                           L" fps为请求上限");
-                    bool first = true;
-                    bool syncWarned = false;
-                    while (!closing && subscribed && e == video_epoch) {
-                        auto packet = client->receive(Op::desktop_packet);
-                        Reader v{packet};
-                        v.u64();
-                        auto pts = v.u64();
-                        v.u32();
-                        auto payload = v.blob();
-                        v.end();
-                        if (first) {
-                            payload.insert(payload.begin(), cfg.headers.begin(), cfg.headers.end());
-                            first = false;
-                        }
-                        decoder.frame(payload, pts, show_picture && visible_desktop, zoom);
-                        if (!syncWarned && timeline->fallbacks()) {
-                            syncWarned = true;
-                            status(L"音频设备延迟超过同步预算，当前优先及时显示画面，音画可能有偏差。");
-                        }
+                    if (fresh) { // SPS/PPS (or VPS/SPS/PPS) ahead of the first IDR of a new decoder
+                        Bytes payload = p.config.headers;
+                        payload.insert(payload.end(), p.frame.annex_b.begin(), p.frame.annex_b.end());
+                        decoder->frame(payload, p.frame.pts_us, show_picture && visible_desktop, zoom);
+                        fresh = false;
+                    } else
+                        decoder->frame(p.frame.annex_b, p.frame.pts_us, show_picture && visible_desktop, zoom);
+                    bool changed;
+                    {
+                        std::lock_guard lock(link_mutex);
+                        changed = !live_quality_valid || quality_differs(live_quality, p.status) || !links[0].seen;
+                        live_quality = p.status;
+                        live_quality_valid = true;
+                        links[0].seen = true;
                     }
-                }
-                break;
-            } catch (const TransportError& error) {
-                // The picture reconnects on its own; control and sound keep their own connections.
-                if (!subscribed || e != video_epoch || closing)
-                    break;
-                if (retries >= 10) {
-                    status(wide(error.what()));
-                    subscribed = false;
-                    break;
-                }
-                status(L"网络波动，正在恢复画面…");
-                retry_wait(retries++, e, video_epoch, subscribed);
-            } catch (const Error& error) {
-                if (!subscribed || e != video_epoch || closing)
-                    break;
-                if (error.code == Code::unsupported && !fallback) {
-                    fallback = true;
-                    status(L"硬件链路不可用，降级JPEG：" + wide(error.what()));
-                } else {
-                    status(L"桌面失败：" + wide(error.what()));
-                    subscribed = false;
-                    break;
-                }
-            } catch (const std::exception& error) {
-                status(wide(error.what()));
+                    if (changed) {
+                        status(L"画面：" + tier_name(p.status.width) + std::to_wstring(p.status.fps) + L" · " +
+                               (p.status.codec == "hevc" ? L"HEVC" : L"H.264") + L" · " +
+                               (p.status.path == "udp" ? L"UDP" : L"TCP") + L" · GPU解码");
+                        PostMessageW(window, WM_LINK, 0, 0);
+                    }
+                    if (timeline->fallbacks() && !sync_warned.exchange(true))
+                        status(L"音频设备延迟超过同步预算，当前优先及时显示画面，音画可能有偏差。");
+                },
+                [e](ConnectionState s) {
+                    if (e == video_epoch)
+                        link_event(0, s);
+                },
+                [&](Code code, const std::string& message) {
+                    {
+                        std::lock_guard lock(failure_mutex);
+                        failure = message;
+                    }
+                    fallback = code == Code::unsupported;
+                    failed = true;
+                });
+            while (!closing && subscribed && e == video_epoch && !failed)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            receiver.close();
+        }
+        decoder.reset();
+        gpu_picture = false;
+        {
+            std::lock_guard lock(link_mutex);
+            live_desktop.reset();
+            live_quality_valid = false;
+            links[0] = {};
+        }
+        PostMessageW(window, WM_LINK, 0, 0);
+        if (failed && !closing && subscribed && e == video_epoch) {
+            std::string why;
+            {
+                std::lock_guard lock(failure_mutex);
+                why = failure;
+            }
+            if (fallback)
+                jpeg_loop(e, c, wide(why));
+            else {
+                status(L"桌面失败：" + wide(why));
                 subscribed = false;
-                break;
+                PostMessageW(window, WM_INPUT_FAILURE, 0, 0);
             }
         }
-        video_connection.set({});
-        gpu_picture = false;
     }
     CoUninitialize();
 }
+/** Sound: one AudioReceiver per subscription; the renderer follows each (re)connection's format. */
 void audio_loop() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     while (!closing) {
@@ -868,151 +1190,78 @@ void audio_loop() {
             continue;
         }
         auto c = creds();
-        unsigned e = audio_epoch, retry = 0;
+        unsigned e = audio_epoch;
         auto timeline = timeline_snapshot();
-        while (!closing && audio_on && e == audio_epoch) {
-            try {
-                audio_cancel.requested = false;
-                auto client = c.connect(audio, 4);
-                audio_connection.set(client);
-                if (!audio_on || e != audio_epoch)
-                    break;
-                Writer w;
-                w.u32(2);
-                w.u32(WindowsAudio::supports_opus() ? 1 : 0);
-                auto b = client->call(Op::audio_stream, std::move(w));
-                Reader r{b};
-                if (r.u32() != 2)
-                    throw Error(Code::invalid, "Audio version");
-                auto rate = r.u32(), channels = r.u32(), bits_ = r.u32();
-                r.str();
-                auto codec = r.u32(), lookahead = r.u32();
-                r.end();
-                if (channels != 2 || bits_ != 16)
-                    throw Error(Code::unsupported, "Audio PCM16 stereo required");
-                WindowsAudio renderer(rate, codec, lookahead, timeline);
-                Writer ready;
-                ready.u32(1);
-                client->send(Op::audio_ready, std::move(ready));
-                status(codec ? L"系统音频：Opus → WASAPI独立播放。" : L"系统音频：PCM → WASAPI独立播放。");
-                while (!closing && audio_on && e == audio_epoch) {
-                    auto packet = client->receive(Op::audio_packet);
-                    Reader a{packet};
-                    a.u64();
-                    auto pts = a.u64();
-                    auto flags = a.u32();
-                    auto data = a.blob();
-                    a.end();
-                    renderer.packet(data, flags, audio_cancel, pts);
-                }
-                break;
-            } catch (const TransportError& error) {
-                if (!audio_on || e != audio_epoch || closing)
-                    break;
-                if (retry >= 10) {
-                    status(wide(error.what()));
-                    audio_on = false;
-                    break;
-                }
-                status(L"音频断线，正在重建播放缓冲。");
-                retry_wait(retry++, e, audio_epoch, audio_on);
-            } catch (const std::exception& error) {
-                if (audio_on && e == audio_epoch && !closing) {
-                    status(L"音频失败：" + wide(error.what()));
-                    audio_on = false;
-                }
-                break;
-            }
+        std::unique_ptr<WindowsAudio> renderer;
+        std::shared_ptr<AudioConnection> latest, rendering;
+        std::mutex latest_mutex;
+        std::atomic_bool failed = false;
+        std::string failure;
+        audio_cancel.requested = false;
+        {
+            AudioReceiver receiver(
+                [&, c](bool automatic) {
+                    auto connection = std::make_shared<AudioConnection>(c, WindowsAudio::supports_opus(), automatic);
+                    std::lock_guard lock(latest_mutex);
+                    latest = connection;
+                    return connection;
+                },
+                [&](const AudioPacket& p) {
+                    static thread_local bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+                    (void)com;
+                    std::shared_ptr<AudioConnection> current;
+                    {
+                        std::lock_guard lock(latest_mutex);
+                        current = latest;
+                    }
+                    if (current && current != rendering) {
+                        renderer.reset();
+                        renderer = std::make_unique<WindowsAudio>(current->config.sample_rate, current->codec,
+                                                                  current->lookahead, timeline);
+                        bool first = !rendering;
+                        rendering = current;
+                        if (first)
+                            status(current->codec ? L"系统音频：Opus → WASAPI独立播放。"
+                                                  : L"系统音频：PCM → WASAPI独立播放。");
+                    }
+                    if (renderer)
+                        renderer->packet(p.payload, p.flags, audio_cancel, p.pts_us);
+                    bool first_packet;
+                    {
+                        std::lock_guard lock(link_mutex);
+                        first_packet = !links[1].seen;
+                        links[1].seen = true;
+                    }
+                    if (first_packet)
+                        PostMessageW(window, WM_LINK, 0, 0);
+                },
+                [e](ConnectionState s) {
+                    if (e == audio_epoch)
+                        link_event(1, s);
+                },
+                [&](Code, const std::string& message) {
+                    failure = message;
+                    failed = true;
+                });
+            while (!closing && audio_on && e == audio_epoch && !failed)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            audio_cancel.requested = true; // unblocks a renderer waiting for buffer space
+            receiver.close();
         }
-        audio_connection.set({});
+        renderer.reset();
+        audio_cancel.requested = false;
+        {
+            std::lock_guard lock(link_mutex);
+            links[1] = {};
+        }
+        PostMessageW(window, WM_LINK, 0, 0);
+        if (failed && audio_on && e == audio_epoch && !closing) {
+            status(L"音频失败：" + wide(failure));
+            audio_on = false;
+            PostMessageW(window, WM_INPUT_FAILURE, 0, 0);
+        }
     }
     CoUninitialize();
-}
-void input_loop() {
-    std::shared_ptr<Client> client;
-    unsigned current = 0;
-    std::optional<std::chrono::steady_clock::time_point> failing_since; // first failure of this outage
-    while (!closing) {
-        InputEvent event;
-        {
-            std::unique_lock lock(input_mutex);
-            input_cv.wait_for(lock, std::chrono::milliseconds(100),
-                              [] { return closing || !input_queue.empty(); });
-            if (closing)
-                break;
-            if (input_queue.empty()) {
-                if (!control_on || current != input_epoch) {
-                    client.reset();
-                    input_connection.set({});
-                }
-                continue;
-            }
-            event = std::move(input_queue.front());
-            input_queue.pop_front();
-        }
-        if (!control_on || event.epoch != input_epoch)
-            continue;
-        // A lost connection never turns control off by itself: reconnect and carry on. An event that
-        // never left is sent again; one that was sent but not answered is not (it may have run).
-        bool sent = false, connected = false;
-        try {
-            if (!client || current != input_epoch) {
-                client = creds().connect(control, 0);
-                current = event.epoch;
-                input_connection.set(client);
-            }
-            connected = true;
-            if (!control_on || current != input_epoch)
-                continue;
-            Writer body = event.body;
-            client->send(event.op, std::move(body));
-            sent = true;
-            client->receive(event.op);
-            if (failing_since) {
-                failing_since.reset();
-                status(L"控制已恢复。");
-            }
-        } catch (const std::exception& error) {
-            auto endpoint = dynamic_cast<const EndpointConnectError*>(&error);
-            if (endpoint && endpoint->reason == EndpointFailure::pin_mismatch) {
-                client.reset();
-                input_connection.set({});
-                failing_since.reset();
-                control_on = false;
-                ++input_epoch;
-                PostMessageW(window, WM_INPUT_FAILURE, 0, 0);
-                status(L"电脑身份（证书指纹）不一致，已关闭控制。");
-                continue;
-            }
-            if (connected && !dynamic_cast<const TransportError*>(&error))
-                continue; // the computer refused this one event (e.g. a drag whose lease ran out): drop it
-            // Network: reconnect on the next round; thirty seconds without a connection ends control.
-            client.reset();
-            input_connection.set({});
-            auto now = std::chrono::steady_clock::now();
-            if (!failing_since)
-                failing_since = now;
-            if (now - *failing_since > std::chrono::seconds(30)) {
-                failing_since.reset();
-                control_on = false;
-                ++input_epoch;
-                {
-                    std::lock_guard lock(input_mutex);
-                    input_queue.clear();
-                }
-                PostMessageW(window, WM_INPUT_FAILURE, 0, 0);
-                status(L"控制连接中断超过 30 秒，已关闭控制：" + wide(error.what()));
-                continue;
-            }
-            status(L"网络波动，正在恢复控制…");
-            if (!sent && !event.move) {
-                std::lock_guard lock(input_mutex);
-                input_queue.push_front(std::move(event));
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(300));
-        }
-    }
-    input_connection.set({});
 }
 void add_column(HWND list, int index, const wchar_t* name, int width) {
     LVCOLUMNW c{};
@@ -1457,7 +1706,7 @@ void command(int id) {
         video_connection.interrupt();
         if (!subscribed)
             release_control();
-        status(subscribed ? L"正在订阅H.264桌面…" : L"桌面采集/传输已停止，文件与音频独立。");
+        status(subscribed ? L"正在连接桌面画面…" : L"桌面采集/传输已停止，文件与音频独立。");
     } else if (id == 17) {
         show_picture = !show_picture;
         cancel_pointer();
@@ -1473,6 +1722,7 @@ void command(int id) {
                 throw Error(Code::invalid, "请先开启桌面画面");
             ++input_epoch;
             control_on = true;
+            open_input();
         }
         status(control_on ? L"控制：拖拽、双击、右键、滚轮；Ctrl+滚轮缩放。" : L"控制已关闭");
     } else if (id == 23) {
@@ -1506,13 +1756,23 @@ void command(int id) {
             video_connection.interrupt();
             status(L"显示器 " + std::to_wstring(monitor_index + 1));
         });
-    } else if (id == 25) {
-        auto i = SendMessageW(ctl(25), CB_GETCURSEL, 0, 0);
-        target_width = i == 0 ? 1280 : 1920;
-        target_fps = i == 0 ? 30 : 60;
-        target_bitrate = i == 0 ? 4'000'000 : i == 1 ? 8'000'000 : 12'000'000;
-        ++video_epoch;
-        video_connection.interrupt();
+    } else if (id == 25 || id == 132) {
+        auto i = int(SendMessageW(ctl(id), CB_GETCURSEL, 0, 0));
+        if (id == 25 && i == 4)
+            target_auto = true;
+        else if (id == 25 && i >= 0 && i < 4) {
+            target_auto = false;
+            target_width = quality_widths[i];
+        } else if (id == 132 && i >= 0 && i < 3)
+            target_fps = quality_rates[i];
+        apply_quality();
+        update_banner();
+    } else if (id == 134) {
+        if (banner_action == 1)
+            reconnect_links();
+        else if (banner_action == 2)
+            lower_quality();
+        update_banner();
     } else if (id == 26) {
         zoom = 1;
         InvalidateRect(desktop, nullptr, TRUE);
@@ -1978,9 +2238,10 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             tile(20, L"控制", g::pointer, L"键鼠可操作", L"仅观看", [] { return control_on.load(); });
             tile(23, L"声音", g::speaker, L"已开启", L"关闭", [] { return audio_on.load(); });
             child(25, 1, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP);
-            for (auto s : {L"流畅 720p30", L"均衡 1080p60", L"清晰 12Mbps"})
-                SendMessageW(ctl(25), CB_ADDSTRING, 0, (LPARAM)s);
-            SendMessageW(ctl(25), CB_SETCURSEL, 2, 0);
+            child(132, 1, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP);
+            fill_quality_combos();
+            child(133, 1, L"STATIC", L"", SS_NOPREFIX | SS_CENTERIMAGE | SS_ENDELLIPSIS);
+            button(134, 1, Kind::Secondary, L"重新连接");
             button(21, 1, Kind::Secondary, L"切换显示器", g::monitors);
             button(74, 1, Kind::Secondary, L"时序：响应优先", g::clock);
             button(26, 1, Kind::Ghost, L"缩放复位", g::zoom);
@@ -2123,7 +2384,6 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             });
             video_thread = std::thread(video_loop);
             audio_thread = std::thread(audio_loop);
-            input_thread = std::thread(input_loop);
             layout();
             task_list();
             return 0;
@@ -2132,7 +2392,7 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             auto id = LOWORD(wp), notice = HIWORD(wp);
             if (id == 68 || id == 69)
                 return 0;
-            if ((id == 25 || id == 36 || id == 56) && notice != CBN_SELCHANGE)
+            if ((id == 25 || id == 132 || id == 36 || id == 56) && notice != CBN_SELCHANGE)
                 return 0;
             if (id == 1 || id == 2 || id == 3 || id == 4 || id == 27 || id == 32 || id == 38 || id == 51 ||
                 id == 62) {
@@ -2335,6 +2595,18 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_INPUT_FAILURE:
             cancel_pointer();
             refresh_state();
+            update_banner();
+            return 0;
+        case WM_LINK:
+            if (wp == 1)
+                fill_quality_combos(); // the computer's screen limits arrived
+            update_banner();
+            return 0;
+        case WM_TIMER:
+            if (wp == 7)
+                update_banner();
+            else if (wp == 8)
+                drain_input();
             return 0;
         case WM_TASKS:
             task_list();
@@ -2369,7 +2641,6 @@ LRESULT CALLBACK proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             audio_connection.interrupt();
             file_connection.interrupt();
             work_cv.notify_all();
-            input_cv.notify_all();
             SetWindowTextW(statusbox, L"正在结束连接并保存任务…");
             // Keep pumping: DXGI may marshal window operations to this UI thread.
             if (clipboard_sync)

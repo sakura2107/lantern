@@ -80,6 +80,12 @@ struct Host::Impl {
     }
     std::vector<std::thread> workers;
     std::atomic_uint video_sessions = 0;
+    // Encoder capabilities per monitor, learnt from real streams or an idle probe. A probe opens a
+    // duplication of its own, and one process cannot duplicate an output twice (E_INVALIDARG): it
+    // never runs while a stream is open or opening, and stream opening waits for a running probe.
+    struct EncoderCaps { bool avc = false; int hevc = -1; };
+    std::mutex encoder_mutex;
+    std::map<uint32_t, EncoderCaps> encoder_caps;
     std::atomic_uint audio_sessions = 0;
     std::atomic_uint preview_sessions = 0;
     std::atomic_bool media_busy=false;
@@ -180,7 +186,14 @@ struct Host::Impl {
             for(uint32_t i=0;i<displays.size();++i) {
                 auto& display=displays[i];w.u32(i);w.u32(display.width);w.u32(display.height);w.u32(display.refresh_hz);w.str(display.name);
                 bool avc=false,hevc=false;
-                try{auto probe=open_desktop_stream(i,640,30,1'000'000,true);avc=true;hevc=probe->config().codec=="hevc";}catch(const Error&){}
+                {
+                    std::lock_guard lock(encoder_mutex);
+                    auto known=encoder_caps.find(i);
+                    if(known!=encoder_caps.end()&&known->second.hevc>=0){avc=known->second.avc;hevc=known->second.hevc==1;}
+                    else if(video_sessions.load()==0){
+                        try{auto probe=open_desktop_stream(i,640,30,1'000'000,true);avc=true;hevc=probe->config().codec=="hevc";encoder_caps[i]={avc,hevc?1:0};}catch(const Error&){}
+                    }else avc=hevc=true; // a stream is running, so an encoder works; HEVC not yet learnt
+                }
                 w.u32(avc?1:0);w.u32(hevc?1:0);
             }break;
         }
@@ -951,7 +964,13 @@ struct Host::Impl {
             adaptive.configure(controller->settings,ceiling,controller->initial_bps);
             width=std::min(adaptive.state().width,ceiling);fps=std::min(fps,controller->max_fps);bitrate=adaptive.state().bitrate;
         }
-        auto source = open_desktop_stream(monitor, width, fps, bitrate,hevc);
+        std::unique_ptr<DesktopStream> source;
+        {
+            std::lock_guard lock(encoder_mutex);
+            source = open_desktop_stream(monitor, width, fps, bitrate,hevc);
+            auto& known=encoder_caps[monitor];known.avc=true;
+            if(hevc)known.hevc=source->config().codec=="hevc"?1:0;
+        }
         const auto& cfg = source->config();
         const auto stream_id=version>=3?random_token():std::string{};
         struct EraseControl {Impl& host;const std::string& id;~EraseControl(){std::lock_guard lock(host.video_mutex);host.video_controls.erase(id);}} erase{*this,stream_id};
