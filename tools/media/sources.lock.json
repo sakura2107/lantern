@@ -1,0 +1,49 @@
+{
+  "vcpkg_commit": "4bca8fd8654e5ba76f92661db7bfe954768ad8ef",
+  "compiler": "MSVC 19.44.35229 x64 /MT; FFmpeg default release -O2 (extra flags recorded)",
+  "llvm": "20.1.8 (NVPTX, sm_75)",
+  "ffmpeg": {
+    "version": "7.1.2",
+    "archive": "ffmpeg-7.1.2.tar.xz",
+    "url": "https://ffmpeg.org/releases/ffmpeg-7.1.2.tar.xz",
+    "sha256": "089bc60fb59d6aecc5d994ff530fd0dcb3ee39aa55867849a2bbc4e555f9c304"
+  },
+  "dependency_sources": [
+    {
+      "archive": "FFmpeg-nv-codec-headers-n13.0.19.0.tar.gz",
+      "sha256": "86d15d1a7c0ac73a0eafdfc57bebfeba7da8264595bf531cf4d8db1c22940116"
+    },
+    {
+      "archive": "libass-libass-0.17.5.tar.gz",
+      "sha256": "fa286fc9ee1ba3b932703a3df7b8474d01dc8abe29ec69b6fa68781dc4bf7acc"
+    },
+    {
+      "archive": "fribidi-fribidi-v1.0.16.tar.gz",
+      "sha256": "5a1d187a33daa58fcee2ad77f0eb9d136dd6fa4096239199ba31e850d397e8a8"
+    },
+    {
+      "archive": "harfbuzz-harfbuzz-14.2.1.tar.gz",
+      "sha256": "3c2a9006a7e1bf58737e557014d7882c554c628fb379a9f00008f5ea53dbbdfb"
+    },
+    {
+      "archive": "freetype-freetype-VER-2-14-3.tar.gz",
+      "sha256": "dc49de6b01a266eef4876a4dd34d9842c475d3e28ff2eff63bd2fb760ab56261"
+    },
+    {
+      "archive": "pnggroup-libpng-v1.6.58.tar.gz",
+      "sha256": "a9d4df463d36a6e5f9c29bd6f4967312d17e996c1854f3511f833924eb1993cf"
+    },
+    {
+      "archive": "madler-zlib-v1.3.2.tar.gz",
+      "sha256": "b99a0b86c0ba9360ec7e78c4f1e43b1cbdf1e6936c8fa0f6835c0cd694a495a1"
+    },
+    {
+      "archive": "bzip2-1.0.8.tar.gz",
+      "sha256": "ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269"
+    },
+    {
+      "archive": "google-brotli-v1.2.0.tar.gz",
+      "sha256": "816c96e8e8f193b40151dad7e8ff37b1221d019dbcb9c35cd3fadbfe6477dfec"
+    }
+  ]
+}

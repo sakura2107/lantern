@@ -1,3 +1,5 @@
 # Existing Windows sources are stored with CRLF. Check real whitespace without
 # treating their required carriage return as trailing whitespace.
 * whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+# Preserve imported legal notices byte-for-byte, including upstream whitespace.
+licenses/media/* -whitespace

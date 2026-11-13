@@ -13,7 +13,7 @@
 | NVIDIA 编码驱动 | 可选硬件 H.264 提供者，从 System32 动态加载 | 用户驱动提供，不随本软件分发；没有捆绑 CUDA/NVIDIA SDK 运行库 |
 | 示例插件 | 字节预览 | MIT，无外部依赖 |
 
-当前没有 FFmpeg、libass、mpv、Qt、Chromium、OpenSSL 或 QUIC 运行库；可选libopus静态编码/解码见下节。外部播放器/办公应用由设备用户安装，它们的能力和许可证由应用本身负责。
+启用媒体前缀时，主机静态链接 FFmpeg/libass 及下列依赖；没有 mpv、Qt、Chromium、OpenSSL 或 QUIC 运行库。可选 libopus 静态编码/解码见下节。外部播放器/办公应用由设备用户安装，它们的能力和许可证由应用本身负责。
 
 ## 构建工具
 
@@ -24,12 +24,42 @@
 - Microsoft Build of OpenJDK 17：GPLv2 with Classpath Exception；工作目录仅用于构建，JDK 不随产品发布。下载通过官方 SHA-256 校验。
 - Gradle/Android Gradle Plugin：Gradle Apache-2.0，Android Gradle Plugin Apache-2.0；提供固定版本配置。此次 Android 构建也支持独立 SDK 工具路径，具体实测见报告。
 
-## 可选媒体包（未纳入本版）
+## v0.3 optional static media
 
-后续若加入 FFmpeg、mpv、libass、msquic，需要锁定具体版本和编译配置，生成真实 SBOM。FFmpeg 的 LGPL/GPL 状态随选项与链接库改变；mpv 与 libass 要分别核查具体版本许可证。不得在未核查配置时笼统声明整个媒体包为 LGPL，亦不得混入有额外限制的组件后遗漏告知。
+| Component | Version | License selected for distribution |
+|---|---|---|
+| FFmpeg | 7.1.2 | LGPL-2.1-or-later; GPL/nonfree/version3 disabled |
+| libass | 0.17.5 | ISC |
+| FriBidi | 1.0.16 | LGPL-2.1-or-later |
+| HarfBuzz | 14.2.1 | MIT-style notices in the supplied copyright file |
+| FreeType | 2.14.3 | FreeType Project License option (not its alternative GPL option) |
+| libpng | 1.6.58 | libpng-2.0 |
+| zlib | 1.3.2 | Zlib |
+| bzip2 | 1.0.8 | bzip2 license |
+| Brotli | 1.2.0 | MIT |
+| nv-codec-headers | 13.0.19.0 | MIT; build headers, no NVIDIA runtime bundled |
 
-本阶段使用 scratch 中的 ffmpeg 7.1 工具独立解码硬件探测码流；它仅是验证工具，不随源码/Windows 包/APK 分发。
+Full notices are in [licenses/media](licenses/media). Exact source archive hashes,
+the vcpkg baseline, configure flags and build/relink instructions are in
+[MEDIA-BUILD.md](docs/MEDIA-BUILD.md) and tools/media/sources.lock.json. Do not
+confuse libass (ISC) with FriBidi/FFmpeg (LGPL). The main NVENC desktop header
+version listed above remains separately vendored.
 
+The host uses real in-process static libraries; it ships no ffmpeg.exe and does
+not download a conversion component at runtime. Android uses system decoders
+and contains no FFmpeg. Windows adapted movie playback is not exposed this round.
+
+Static LGPL delivery uses the section 6(a) source/object route: distribute the
+corresponding library sources and applied patches, application link objects,
+static archives and the relink recipe alongside every binary. Recipients can
+modify the LGPL libraries and relink with the supplied MIT application objects.
+Reverse engineering to debug those modifications is permitted. This does not
+relicense the MIT Lantern source. The repository recipe alone is insufficient:
+the matching generated source/object delivery must accompany the binary.
+See [FFmpeg's guidance](https://ffmpeg.org/legal.html) and the full included LGPL
+text. Release UI attribution and links to notices remain Claude's integration
+work; no backend result implies that public distribution requirements are all
+satisfied before that integration and source/object delivery are present.
 
 ## libopus 1.5.2（可选内置 Windows 编码/解码器）
 

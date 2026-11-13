@@ -12,7 +12,7 @@
 
 Host 构造和 CLI 的默认绑定改为 `0.0.0.0:47443`；这会监听所有 IPv4 接口。身份创建不会自动启动主机，也不会自动请求提权。前端已有的显式或持久化回环设置不会被后端覆盖，前端应显式接入新默认值。扫码不经 UDP 发现获得信任，二维码必须来自用户认可的电脑屏幕。
 
-防火墙辅助只由明确调用的 CLI / `request_firewall_allow` 执行，添加或更新两条确定名称的入站规则：`Lantern 主机`（目标程序 + 指定 TCP 端口）和 `Lantern 主机（发现）`（同一目标程序 + UDP47442）。仅 `NET_FW_PROFILE2_PRIVATE`，来源限本地子网，关闭 edge traversal；不启用 Public/Domain，不关闭防火墙，不修改当前网络类别。使用专用网络是因为家庭可信 LAN 可由用户认可，公共 Wi-Fi 上不应暴露远程文件/控制入口。
+防火墙辅助只由明确调用的 CLI / `request_firewall_allow` 执行，添加或更新三条确定名称的入站规则：`Lantern 主机`（目标程序 + 指定 TCP 端口）、`Lantern 主机（发现）`（同一目标程序 + UDP47442）和 `Lantern 主机（媒体 UDP）`（同一程序 + 指定媒体 UDP 端口）。仅 `NET_FW_PROFILE2_PRIVATE`，来源限本地子网，关闭 edge traversal；不启用 Public/Domain，不关闭防火墙，不修改当前网络类别。使用专用网络是因为家庭可信 LAN 可由用户认可，公共 Wi-Fi 上不应暴露远程文件/控制入口。
 
 只读 `firewall_state` 是 Private-profile TCP 策略检查，显式 block 优先；遇到服务/接口/地址限制、组策略覆盖或 COM 失败时保守返回 unknown。它不证明当前 Wi-Fi 的网络类别、路由可达性、第三方防火墙或 UDP 发现可用；规则添加成功也不等于网络连通已验证。UAC 拒绝、工具缺失、子进程失败或超时返回 false，前端应保留手动操作入口。
 
@@ -40,7 +40,7 @@ HELLO 凭据或权限校验失败会按来源增加退避：250 ms、500 ms、1 
 
 一次性邀请默认只允许本地来源兑换，是为了降低二维码被拍摄/转发后在外网盗用的风险。只有明确选择 `allow_remote` 的邀请才允许外网兑换；熵、哈希、常量时间比较、10 分钟默认 TTL、单次原子消费和 5 次失败作废保持不变。不能把已生成的邀请码当作可恢复的账号密码。
 
-公网防火墙规则名为“Lantern 主机（公网）”，绑定程序、入站 TCP 和指定监听端口、RemoteAddresses=`*`，**只作用于 Private 配置文件**，不放行 UDP、不打开 Edge Traversal。LAN 规则仍是 Private + LocalSubnet。理由是公网入口应只在用户信任的家庭网络中运行；连接到酒店等公用网络时不应隐式暴露。若 Windows 当前分类为 Public，前端须提示规则在该网络不生效，并引导用户自行确认网络是否可信；不得自动改网络类别或加入 Public 配置文件。规则增删仅由用户按钮调用 runas CLI；关闭公网后界面应显式请求删除公网规则。
+公网防火墙规则名为“Lantern 主机（公网）”，绑定程序、入站 TCP 和指定监听端口、RemoteAddresses=`*`，**只作用于 Private 配置文件**，同时支持同端口的专用 UDP 媒体规则（显式调用时），不打开 Edge Traversal。LAN 规则仍是 Private + LocalSubnet。理由是公网入口应只在用户信任的家庭网络中运行；连接到酒店等公用网络时不应隐式暴露。若 Windows 当前分类为 Public，前端须提示规则在该网络不生效，并引导用户自行确认网络是否可信；不得自动改网络类别或加入 Public 配置文件。规则增删仅由用户按钮调用 runas CLI；关闭公网后界面应显式请求删除公网规则。
 
 UPnP 仅在用户请求 map 后向 LAN 发 SSDP 和 SOAP，使用有租期的 TCP 映射/IPv6 pinhole，运行中续期，正常停止时删除；进程崩溃时依靠租期兜底。拒绝外部 SSDP 目标、非数字或非本地控制地址、与 SSDP 响应来源不同的 HTTP 主机、HTTP 重定向、代理、自动认证和 XML DTD。响应有长度/深度上限。网关是未认证的 LAN 设备，恶意 LAN 设备仍可能伪造发现；路由器返回成功只能证明操作被受理。CGNAT/私有 WAN 地址不被误报为公网 IPv4，也不会尝试访问外部“查 IP”站点。
 
@@ -71,3 +71,7 @@ Windows 应用在当前交互会话运行。不能通过 SendInput 控制高完�
 硬件提供者只从 System32 加载 NVIDIA 编码驱动，验证 API 版本；不从工作目录加载同名 DLL。H264 码流有尺寸、长度、序列与时间戳界限，但未对系统 GPU/解码驱动做独立安全审计。持续 TCP 桌面最多两路；GPU 采集错误、授权撤销或积压会关闭流，不宣称安全桌面仍可控制。
 
 Android控制开启需单独HELLO授权成功；输入队列32项、后台独立连接。op35一次完整点击消息由服务器合批注入，并尽力释放部分注入的左键。消息确认丢失不会无限重试。离开前台/切换设备取消旧输入。
+
+## v0.3 AV and media security
+
+See [V03-SECURITY.md](V03-SECURITY.md) for authenticated UDP, anti-reflection/replay bounds, explicit UDP public rules, reliable input and loopback HLS threat boundaries.

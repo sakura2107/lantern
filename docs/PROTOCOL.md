@@ -9,7 +9,7 @@
 大端序；UTF-8；无压缩。每个 TLS application frame：
 
 ```
-u32 payload_length                 // 4..4,194,304
+u32 payload_length                 // normally 4..4,194,304; Op33 permits 16,777,216
 u16 protocol_version = 1
 u16 operation
 ... body
@@ -17,7 +17,7 @@ u16 operation
 
 blob/string：`u32 byte_length; byte[byte_length]`。普通字符串最大 65,536 字节，密钥最大 128，文件分块最大 262,144。解析必须消费全部输入；多余字段失败，版本 1 不支持忽略任意扩展字段。版本不兼容明确拒绝，下一大版本通过新 HELLO 协商后采用新 schema。
 
-响应头为 `u16 version,u16 operation,u32 error`，成功后接该操作的结果；失败接 UTF-8 错误字符串。握手/HELLO 错误可能直接关闭连接；客户端必须处理这一失败，不显示已配对。普通 RPC 连接一次最多一个请求，因此当前版本无需请求 ID。硬件桌面使用专用连接及以下 stream-v1 扩展，旧客户端可继续使用 op21。异步多路复用将在下一版本加入 stream/request ID，不改变 v1 的顺序语义。
+响应头为 `u16 version,u16 operation,u32 error`，成功后接该操作的结果；失败接 UTF-8 错误字符串。握手/HELLO 错误可能直接关闭连接；客户端必须处理这一失败，不显示已配对。文件块允许最多四个有序请求在途，响应严格按请求顺序消费，不按请求 ID 乱序复用。其他 RPC 保持串行。硬件桌面使用专用连接及以下扩展，旧客户端可继续使用 op21。
 
 错误：0 ok、1 invalid、2 unauthorized、3 not_found、4 conflict、5 io、6 unsupported、7 cancelled、8 busy、9 integrity、10 source_changed。客户端不得对写入失败无限自动重试；恢复从服务确认的 offset 开始。
 
@@ -208,3 +208,8 @@ lantern://pair?v=1&n=<percent-encoded UTF-8 hostname>&a=<IPv4,IPv4>&p=<port>&f=<
 所有 7 个字段必须且只能出现一次；拒绝未知字段、fragment、非预期 scheme/authority、损坏 percent/UTF-8、空/超长主机名、非规范 IPv4、重复地址、DNS 名称、IPv6、0.0.0.0、组播、非法端口、非十六进制指纹/码和过期链接。最多 8 个地址、总长 2048 字节。指纹允许输入大写并归一为小写，码使用小写；不把 `+` 当空格。客户端和主机都独立校验有效期，时钟错误需要用户校正。
 
 主机配置写入版本升为 3，保留 v1/v2 读取。v2 字段后附加 `u32 invite_count`（<=32），每项为 `str id(32),str label(64),str code_hash(64),u32 scopes,u64 expires_at,u32 failed_attempts`；全部在 DPAPI 中。邀请的明文码不可从存储恢复。过期项在邀请操作时清理，已消费项立即删除。旧版主机/管理程序不能读取 v3，主机与管理程序应一起升级；旧客户端可继续连接新版主机。
+
+
+## v0.3 additions
+
+See [V03-PROTOCOL.md](V03-PROTOCOL.md) for desktop v3-v5, paired decoder capabilities, Op57-61/70-71, reliable input, AES-GCM UDP and fMP4 HLS.
