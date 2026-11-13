@@ -388,7 +388,8 @@ final class FilesPage {
         String remote = a.browser.resolve(e.name), name = Ui.baseName(e.name);
         String meta = Ui.size(e.size) + (e.modified > 0 ? "，" + String.format(Locale.ROOT, S.MODIFIED_AT, Ui.fullDate(e.modified)) : "");
         Sheet sheet = new Sheet(a, name, meta);
-        sheet.item(Glyph.OPEN, S.OPEN_WITH_APP, S.OPEN_WITH_APP_DETAIL, () -> a.openRemote(e, remote, 0));
+        if (MainActivity.isVideo(name)) a.movieOptions(sheet, e, remote);
+        else sheet.item(Glyph.OPEN, S.OPEN_WITH_APP, S.OPEN_WITH_APP_DETAIL, () -> a.openRemote(e, remote, 0));
         sheet.item(Glyph.DOWNLOAD, S.DOWNLOAD_OPEN, S.DOWNLOAD_OPEN_DETAIL, () -> a.openRemote(e, remote, 1));
         sheet.item(Glyph.TRANSFER, S.QUEUE_DOWNLOAD, S.QUEUE_DOWNLOAD_DETAIL, () -> a.openRemote(e, remote, 2));
         manage(sheet, e, remote);

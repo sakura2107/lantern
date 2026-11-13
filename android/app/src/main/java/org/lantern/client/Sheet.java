@@ -168,7 +168,9 @@ final class Sheet {
         return this;
     }
     Sheet onDismiss(Runnable r) { dismissed = r; return this; }
+    static Sheet current; // the most recently shown sheet (tests dismiss it)
     Sheet show() {
+        current = this;
         if (!activity.isFinishing() && !activity.isDestroyed()) dialog.show();
         return this;
     }

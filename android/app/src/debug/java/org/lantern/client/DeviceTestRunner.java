@@ -19,7 +19,7 @@ import org.json.*;
 public final class DeviceTestRunner extends Instrumentation {
     final JSONObject report = new JSONObject();
     int assertions;
-    boolean desktopOnly, videoOnly, controlOnly, interactionOnly, audioOnly, filesMediaOnly,toolsOnly,safOnly,v03Only,v03MediaOnly,v03AvcOnly,v03TransportOnly;
+    boolean desktopOnly, videoOnly, controlOnly, interactionOnly, audioOnly, filesMediaOnly,toolsOnly,safOnly,v03Only,v03MediaOnly,v03AvcOnly,v03TransportOnly,v03UiTour;
     JSONObject inputFixture;
     String externalApp;
     boolean reliabilityOnly;
@@ -688,6 +688,7 @@ public final class DeviceTestRunner extends Instrumentation {
         v03TransportOnly=args!=null&&"true".equals(args.getString("v03_transport_only"));
         if(v03TransportOnly)v03Only=true;
         v03MediaOnly=args!=null&&"true".equals(args.getString("v03_media_only"));
+        v03UiTour=args!=null&&"true".equals(args.getString("v03_ui_tour"));
         desktopOnly = args != null && "true".equals(args.getString("desktop_only"));
         videoOnly = args != null && "true".equals(args.getString("video_only"));
         controlOnly = args != null && "true".equals(args.getString("control_only"));
@@ -772,7 +773,7 @@ public final class DeviceTestRunner extends Instrumentation {
                 peer.getOutputStream().flush();
             }
             long began = System.nanoTime();
-            if (!v03MediaOnly && !v03Only && !desktopOnly && !videoOnly && !controlOnly && !interactionOnly && !audioOnly && !filesMediaOnly && !reliabilityOnly && !deviceTrustOnly && !toolsOnly && !safOnly) {
+            if (!v03MediaOnly && !v03UiTour && !v03Only && !desktopOnly && !videoOnly && !controlOnly && !interactionOnly && !audioOnly && !filesMediaOnly && !reliabilityOnly && !deviceTrustOnly && !toolsOnly && !safOnly) {
                 phase("TLS and independent file list");
                 try (Remote remote = new Remote(credentials, 3, 3)) {
                     report.put("tls_auth_ms", elapsed(began) * 1000);
@@ -837,7 +838,9 @@ public final class DeviceTestRunner extends Instrumentation {
                             resumed[0] = n;
                     });
                     double uploadSeconds = elapsed(began);
-                    check(resumed[0] == 1024 * 1024, "upload resume offset");
+                    // Pipelined upload: blocks already on the wire when cancelled are committed, so resume starts
+                    // at or after the cancel point, always on a block boundary.
+                    check(resumed[0] >= 1024 * 1024 && resumed[0] % Remote.CHUNK == 0, "upload resume offset");
                     check(remote.stat(upload, true).hash.equals(info.hash), "upload sha256");
                     report.put("upload_resume_offset", resumed[0]);
                     report.put("upload_remaining_31MiB_with_hash_s", uploadSeconds);
@@ -910,8 +913,9 @@ public final class DeviceTestRunner extends Instrumentation {
                 try(Remote probe=new Remote(credentials,1,0)){report.put("pairing_direct_file_probe_entries",probe.list("",0).size());}
             }
             check(listed[0], "actual UI pairing and file list");
-            if (!v03MediaOnly && !v03Only && !audioOnly && !filesMediaOnly && !reliabilityOnly && !deviceTrustOnly && !toolsOnly && !safOnly) click(activity, "订阅桌面");
+            if (!v03MediaOnly && !v03UiTour && !v03Only && !audioOnly && !filesMediaOnly && !reliabilityOnly && !deviceTrustOnly && !toolsOnly && !safOnly) click(activity, "订阅桌面");
             if(v03TransportOnly){V03TransportValidation.run(this,credentials);
+            }else if(v03UiTour){V03UiTour.run(this,activity,credentials);
             }else if(v03MediaOnly){V03MediaValidation.run(this,activity,credentials);V03HlsDecoderValidation.run(this,activity,credentials);
             }else if(v03Only){V03Validation.run(this,activity,credentials);
             }else if(safOnly){SafValidation.run(this,activity,credentials);

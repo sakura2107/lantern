@@ -229,9 +229,9 @@ final class DesktopLayout {
     }
 
     int linkInsetTop;
-    /** Below the fullscreen toolbar when it is open, otherwise at the top edge. */
+    /** Below the fullscreen toolbar when it is open; in the page card, below the stats line and full-screen button. */
     void placeLink() {
-        int top = gap + (fullscreen ? linkInsetTop : 0);
+        int top = fullscreen ? gap + linkInsetTop : gap * 2 + Theme.dp(40);
         if (fullscreen && toolbar.getVisibility() == View.VISIBLE && toolbar.getHeight() > 0)
             top = toolbar.getBottom() + gap;
         margins(link, gap, top, gap, gap);

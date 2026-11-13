@@ -160,6 +160,15 @@ final class S {
     static final String UPLOAD_FOLDER = "选择整个文件夹", UPLOAD_FOLDER_DETAIL = "保留目录结构，逐个文件提交";
     static final String MODIFIED_AT = "修改于 %s";
     static final String OPEN_WITH_APP = "用手机应用打开", OPEN_WITH_APP_DETAIL = "直接读取电脑上的原文件，不占用手机空间";
+    static final String MOVIE_ORIGINAL = "原画播放", MOVIE_ORIGINAL_DETAIL = "直接读取电脑上的原文件，画质和字幕都不变；适合局域网";
+    static final String MOVIE_ADAPTED = "适配本机屏幕", MOVIE_ADAPTED_DETAIL = "电脑实时转成本机屏幕大小，流量小、手机不费力；适合移动数据";
+    static final String MOVIE_DEFAULT = "（推荐）", MOVIE_QUERYING = "正在读取音轨和字幕…", MOVIE_PREPARING = "电脑正在准备适配画面…";
+    static final String MOVIE_TRACKS_SUBTITLE = "适配播放会把字幕直接画进画面，音轨转为立体声。";
+    static final String MOVIE_AUDIO = "音轨", MOVIE_SUBTITLE = "字幕", MOVIE_SUBTITLE_OFF = "不显示字幕";
+    static final String MOVIE_SUBTITLE_ASS_ONLY = "适配播放目前只支持 ASS 字幕，可改用原画播放", MOVIE_PLAY = "播放";
+    static final String MOVIE_HDR = "适配播放暂不支持 HDR 片源，请选择原画播放";
+    static final String MOVIE_CHOOSER = "选择播放器", MOVIE_NO_PLAYER = "没有能播放在线视频（HLS）的应用，请安装播放器或改用原画播放";
+    static final String MOVIE_ADAPTED_STARTED = "适配播放已开始；电脑会边播边转码，30 分钟没有播放请求会自动停止";
     static final String DOWNLOAD_OPEN = "下载后打开", DOWNLOAD_OPEN_DETAIL = "保存到应用缓存，校验完整后打开";
     static final String QUEUE_DOWNLOAD = "加入下载任务", QUEUE_DOWNLOAD_DETAIL = "在后台下载，可暂停和断点续传";
     static final String OPEN_FOLDER = "打开", DOWNLOAD_FOLDER = "下载整个文件夹", DOWNLOAD_FOLDER_DETAIL = "在后台逐个下载，可暂停";

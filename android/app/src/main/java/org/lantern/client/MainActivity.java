@@ -166,7 +166,9 @@ public final class MainActivity extends Activity {
                 if (!hardwareDesktop || !subscribed.get())
                     return;
                 screen.videoSize(w, h);
-                status("H264 桌面：" + w + "×" + h + "，" + (hardware ? "硬件解码" : "解码器硬件属性未知"));
+                String codec = decoder.toLowerCase(Locale.ROOT).contains("hevc") ? "HEVC" : "H264";
+                screen.codecLabel = codec;
+                status(codec + " 桌面：" + w + "×" + h + "，" + (hardware ? "硬件解码" : "解码器硬件属性未知"));
             }
             public void frame() {
                 if (!videoSeen && hardwareDesktop && subscribed.get()) { videoSeen = true; videoLink = null; loadQualityLimits(credentials); linkChanged(); }
@@ -1241,6 +1243,113 @@ public final class MainActivity extends Activity {
         } catch (ActivityNotFoundException e) {
             status("没有兼容的应用，请下载后用其他播放器或阅读器打开");
         }
+    }
+    // ---- Movies: "原画" (read the original) or "适配本机屏幕" (the computer transcodes to this screen).
+    // Over a public path adaptation is the default, on the LAN the original.
+    static boolean isVideo(String name) { return FilesProvider.mime(name).startsWith("video/"); }
+    boolean onMobileData() {
+        try {
+            android.net.ConnectivityManager m = getSystemService(android.net.ConnectivityManager.class);
+            android.net.NetworkCapabilities n = m.getNetworkCapabilities(m.getActiveNetwork());
+            return n != null && n.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) &&
+                   !n.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI);
+        } catch (RuntimeException unknown) { return false; }
+    }
+    /** Adds the two playback rows to a file sheet, the default first and marked. */
+    void movieOptions(Sheet sheet, Remote.Entry e, String remote) {
+        // The path to the computer decides: public (outside, mobile data) adapts, LAN plays the original.
+        // The phone's own default network can be cellular while it shares a hotspot with the computer.
+        ConnectionEndpoint path = via;
+        boolean adaptFirst = path != null ? path.publicPath() : onMobileData();
+        Runnable original = () -> openRemote(e, remote, 0), adapted = () -> chooseTracks(e, remote);
+        String o = S.MOVIE_ORIGINAL + (adaptFirst ? "" : S.MOVIE_DEFAULT), a = S.MOVIE_ADAPTED + (adaptFirst ? S.MOVIE_DEFAULT : "");
+        if (adaptFirst) { sheet.item(Glyph.PHONE, a, S.MOVIE_ADAPTED_DETAIL, adapted); sheet.item(Glyph.PLAY, o, S.MOVIE_ORIGINAL_DETAIL, original); }
+        else { sheet.item(Glyph.PLAY, o, S.MOVIE_ORIGINAL_DETAIL, original); sheet.item(Glyph.PHONE, a, S.MOVIE_ADAPTED_DETAIL, adapted); }
+    }
+    static boolean chinese(MediaPlayback.Track t) {
+        String l = t.language.toLowerCase(Locale.ROOT), title = t.title;
+        return l.startsWith("chi") || l.startsWith("zho") || l.startsWith("zh") || l.equals("chs") || l.equals("cht") ||
+               title.contains("中") || title.contains("简") || title.contains("繁") || title.toLowerCase(Locale.ROOT).contains("chs");
+    }
+    static String trackName(MediaPlayback.Track t, int n) {
+        String name = !t.title.isEmpty() ? t.title : !t.language.isEmpty() ? t.language : (t.kind == 1 ? S.MOVIE_AUDIO : S.MOVIE_SUBTITLE) + " " + n;
+        return name + " · " + t.codec.toUpperCase(Locale.ROOT);
+    }
+    /** Queries the tracks, then lets the user pick audio and an ASS subtitle (burnt in) before playing. */
+    void chooseTracks(Remote.Entry e, String remote) {
+        Remote.Credentials c = credentials;
+        if (c == null) { status(S.NEED_DEVICE); return; }
+        status(S.MOVIE_QUERYING);
+        job(() -> {
+            MediaPlayback.Tracks tracks = MediaPlayback.query(c, remote);
+            if (tracks.hdr) throw new IOException(S.MOVIE_HDR);
+            runOnUiThread(() -> {
+                List<MediaPlayback.Track> audio = new ArrayList<>(), subtitles = new ArrayList<>();
+                for (MediaPlayback.Track t : tracks.tracks) (t.kind == 1 ? audio : subtitles).add(t);
+                int[] chosenAudio = {audio.isEmpty() ? -2 : audio.get(0).index}, chosenSub = {-1};
+                for (MediaPlayback.Track t : subtitles) if (t.codec.equals("ass") && chinese(t)) { chosenSub[0] = t.index; break; }
+                if (audio.size() <= 1 && subtitles.isEmpty()) { playAdapted(c, e, remote, chosenAudio[0], -1); return; }
+                Sheet sheet = new Sheet(this, Ui.baseName(e.name), S.MOVIE_TRACKS_SUBTITLE);
+                if (audio.size() > 1) {
+                    sheet.section(S.MOVIE_AUDIO);
+                    List<ImageView> checks = new ArrayList<>();
+                    for (int i = 0; i < audio.size(); i++) {
+                        MediaPlayback.Track t = audio.get(i);
+                        checks.add(choiceRow(sheet, trackName(t, i + 1), null, t.index == chosenAudio[0], checks, () -> chosenAudio[0] = t.index));
+                    }
+                }
+                if (!subtitles.isEmpty()) {
+                    sheet.section(S.MOVIE_SUBTITLE);
+                    List<ImageView> checks = new ArrayList<>();
+                    checks.add(choiceRow(sheet, S.MOVIE_SUBTITLE_OFF, null, chosenSub[0] == -1, checks, () -> chosenSub[0] = -1));
+                    for (int i = 0; i < subtitles.size(); i++) {
+                        MediaPlayback.Track t = subtitles.get(i);
+                        if (t.codec.equals("ass")) checks.add(choiceRow(sheet, trackName(t, i + 1), null, t.index == chosenSub[0], checks, () -> chosenSub[0] = t.index));
+                        else sheet.unsupported(-1, trackName(t, i + 1), S.MOVIE_SUBTITLE_ASS_ONLY);
+                    }
+                }
+                sheet.buttons(S.CANCEL, S.MOVIE_PLAY, Ui.PRIMARY, () -> playAdapted(c, e, remote, chosenAudio[0], chosenSub[0])).show();
+            });
+        });
+    }
+    /** A single-choice row inside a group that stays open (the sheet's own options dismiss on tap). */
+    ImageView choiceRow(Sheet sheet, String title, String detail, boolean checked, List<ImageView> group, Runnable pick) {
+        ImageView check = new ImageView(this);
+        check.setImageDrawable(new Glyph(Glyph.CHECK, Theme.INK));
+        check.setVisibility(checked ? View.VISIBLE : View.INVISIBLE);
+        View row = sheet.row(-1, title, detail, Theme.INK, check);
+        Ui.role(row, RadioButton.class);
+        row.setSelected(checked);
+        row.setOnClickListener(v -> {
+            for (ImageView other : group) { other.setVisibility(View.INVISIBLE); ((View) other.getParent()).setSelected(false); }
+            check.setVisibility(View.VISIBLE); row.setSelected(true); pick.run();
+        });
+        return check;
+    }
+    /** Phone screen in landscape, within the adaptation bounds; the computer keeps the aspect ratio. */
+    int[] adaptedSize() {
+        android.util.DisplayMetrics m = new android.util.DisplayMetrics();
+        getWindowManager().getDefaultDisplay().getRealMetrics(m);
+        int longSide = Math.max(m.widthPixels, m.heightPixels), shortSide = Math.min(m.widthPixels, m.heightPixels);
+        return new int[]{Math.max(320, Math.min(2560, longSide)), Math.max(180, Math.min(2160, shortSide))};
+    }
+    void playAdapted(Remote.Credentials c, Remote.Entry e, String remote, int audio, int subtitle) {
+        int[] size = adaptedSize();
+        status(S.MOVIE_PREPARING);
+        job(() -> {
+            MediaPlayback.closeAll(); // one movie at a time; a previous adapted stream stops here
+            MediaPlayback.Adapted adapted = MediaPlayback.openAdapted(this, c, remote, size[0], size[1], audio, subtitle);
+            runOnUiThread(() -> {
+                try {
+                    Intent intent = new Intent(Intent.ACTION_VIEW).setDataAndType(adapted.uri, "application/vnd.apple.mpegurl");
+                    startActivity(Intent.createChooser(intent, S.MOVIE_CHOOSER));
+                    status(S.MOVIE_ADAPTED_STARTED);
+                } catch (ActivityNotFoundException none) {
+                    adapted.close();
+                    status(S.MOVIE_NO_PLAYER);
+                }
+            });
+        });
     }
     /** choice 0: stream the original through a read-only URI; 1: download, verify, then open; 2: queue a resumable download. */
     void openRemote(Remote.Entry e, String remote, int choice) {

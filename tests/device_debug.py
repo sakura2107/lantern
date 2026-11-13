@@ -19,6 +19,7 @@ p.add_argument('--v03-only',action='store_true')
 p.add_argument('--v03-avc-only',action='store_true')
 p.add_argument('--v03-transport-only',action='store_true')
 p.add_argument('--v03-media-only',action='store_true')
+p.add_argument('--v03-ui-tour',action='store_true')
 p.add_argument('--app-log',help='Capture only the Lantern app UID logcat, never other applications')
 p.add_argument('--skip-install',action='store_true',help='Use only after installing this same candidate APK')
 p.add_argument('--network-label',choices=['physical_wifi_lan','physical_usb_tether_lan','adb_reverse'],default='physical_wifi_lan')
@@ -39,7 +40,7 @@ block=bytes((i*179+i//313)%256 for i in range(1024*1024))
 with (share/'large.bin').open('wb') as f:
     for _ in range(32):f.write(block)
 (share/'readme.txt').write_text('Lantern physical-device test files only. No personal files shared.',encoding='utf-8')
-if a.v03_media_only:
+if a.v03_media_only or a.v03_ui_tour:
     import shutil
     if not a.media_fixture:raise RuntimeError('Generated MKV fixture required for v03 media test')
     shutil.copyfile(a.media_fixture,share/'movie.mkv')
@@ -119,6 +120,7 @@ try:
     adb('forward','tcp:47899','localabstract:lantern-device-validation')
     instrument=[a.adb,'-s',a.serial,'shell','am','instrument']
     if a.v03_media_only:instrument += ['-e','v03_media_only','true']
+    if a.v03_ui_tour:instrument += ['-e','v03_ui_tour','true']
     if a.v03_only:instrument += ['-e','v03_only','true']
     if a.v03_avc_only:instrument += ['-e','v03_avc_only','true']
     if a.v03_transport_only:instrument += ['-e','v03_transport_only','true']
