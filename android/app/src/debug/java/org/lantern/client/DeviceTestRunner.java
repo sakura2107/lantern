@@ -19,7 +19,7 @@ import org.json.*;
 public final class DeviceTestRunner extends Instrumentation {
     final JSONObject report = new JSONObject();
     int assertions;
-    boolean desktopOnly, videoOnly, controlOnly, interactionOnly, audioOnly, filesMediaOnly,toolsOnly,safOnly;
+    boolean desktopOnly, videoOnly, controlOnly, interactionOnly, audioOnly, filesMediaOnly,toolsOnly,safOnly,v03Only,v03MediaOnly,v03AvcOnly,v03TransportOnly;
     JSONObject inputFixture;
     String externalApp;
     boolean reliabilityOnly;
@@ -682,6 +682,12 @@ public final class DeviceTestRunner extends Instrumentation {
     @Override
     public void onCreate(Bundle args) {
         super.onCreate(args);
+        v03Only=args!=null&&"true".equals(args.getString("v03_only"));
+        v03AvcOnly=args!=null&&"true".equals(args.getString("v03_avc_only"));
+        if(v03AvcOnly)v03Only=true;
+        v03TransportOnly=args!=null&&"true".equals(args.getString("v03_transport_only"));
+        if(v03TransportOnly)v03Only=true;
+        v03MediaOnly=args!=null&&"true".equals(args.getString("v03_media_only"));
         desktopOnly = args != null && "true".equals(args.getString("desktop_only"));
         videoOnly = args != null && "true".equals(args.getString("video_only"));
         controlOnly = args != null && "true".equals(args.getString("control_only"));
@@ -766,7 +772,7 @@ public final class DeviceTestRunner extends Instrumentation {
                 peer.getOutputStream().flush();
             }
             long began = System.nanoTime();
-            if (!desktopOnly && !videoOnly && !controlOnly && !interactionOnly && !audioOnly && !filesMediaOnly && !reliabilityOnly && !deviceTrustOnly && !toolsOnly && !safOnly) {
+            if (!v03MediaOnly && !v03Only && !desktopOnly && !videoOnly && !controlOnly && !interactionOnly && !audioOnly && !filesMediaOnly && !reliabilityOnly && !deviceTrustOnly && !toolsOnly && !safOnly) {
                 phase("TLS and independent file list");
                 try (Remote remote = new Remote(credentials, 3, 3)) {
                     report.put("tls_auth_ms", elapsed(began) * 1000);
@@ -884,7 +890,7 @@ public final class DeviceTestRunner extends Instrumentation {
                        .contains(credentials.token),
                   "no plaintext preference");
             runOnMainSync(() -> {
-                activity.hardwareDesktop = videoOnly || controlOnly || interactionOnly;
+                activity.hardwareDesktop = v03Only || videoOnly || controlOnly || interactionOnly;
                 activity.host.setText(credentials.host+(credentials.port==47443?"":":"+credentials.port));
                 activity.pin.setText(credentials.pin);
                 activity.secret.setText(credentials.token);
@@ -904,8 +910,11 @@ public final class DeviceTestRunner extends Instrumentation {
                 try(Remote probe=new Remote(credentials,1,0)){report.put("pairing_direct_file_probe_entries",probe.list("",0).size());}
             }
             check(listed[0], "actual UI pairing and file list");
-            if (!audioOnly && !filesMediaOnly && !reliabilityOnly && !deviceTrustOnly && !toolsOnly && !safOnly) click(activity, "订阅桌面");
-            if(safOnly){SafValidation.run(this,activity,credentials);
+            if (!v03MediaOnly && !v03Only && !audioOnly && !filesMediaOnly && !reliabilityOnly && !deviceTrustOnly && !toolsOnly && !safOnly) click(activity, "订阅桌面");
+            if(v03TransportOnly){V03TransportValidation.run(this,credentials);
+            }else if(v03MediaOnly){V03HlsDecoderValidation.run(this,activity,credentials);
+            }else if(v03Only){V03Validation.run(this,activity,credentials);
+            }else if(safOnly){SafValidation.run(this,activity,credentials);
             }else if(toolsOnly){desktopToolsChecks(activity,credentials);
             }else if(deviceTrustOnly){
                 deviceTrustChecks(activity,credentials);

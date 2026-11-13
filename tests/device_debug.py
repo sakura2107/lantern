@@ -1,5 +1,5 @@
 """Physical device validation; credentials cross authorized ADB only in memory. No personal files."""
-import argparse, pathlib, subprocess, socket, struct, json, time, uuid, base64, threading
+import argparse, pathlib, subprocess, socket, struct, json, time, uuid, base64, threading, re
 
 p=argparse.ArgumentParser()
 p.add_argument('--adb',required=True);p.add_argument('--serial',required=True);p.add_argument('--host-exe',required=True);p.add_argument('--apk',required=True);p.add_argument('--address',required=True);p.add_argument('--work',required=True);p.add_argument('--report',required=True);p.add_argument('--keep-host',action='store_true')
@@ -15,21 +15,34 @@ p.add_argument('--reliability-only',action='store_true')
 p.add_argument('--device-trust-only',action='store_true')
 p.add_argument('--saf-stream-only',action='store_true')
 p.add_argument('--tools-only',action='store_true')
+p.add_argument('--v03-only',action='store_true')
+p.add_argument('--v03-avc-only',action='store_true')
+p.add_argument('--v03-transport-only',action='store_true')
+p.add_argument('--v03-media-only',action='store_true')
+p.add_argument('--app-log',help='Capture only the Lantern app UID logcat, never other applications')
+p.add_argument('--skip-install',action='store_true',help='Use only after installing this same candidate APK')
+p.add_argument('--network-label',choices=['physical_wifi_lan','physical_usb_tether_lan','adb_reverse'],default='physical_wifi_lan')
 p.add_argument('--isolated-host')
 p.add_argument('--audio-only', action='store_true')
 p.add_argument('--audio-tone')
 p.add_argument('--audio-duration',type=int,default=15,choices=range(5,61))
 p.add_argument('--input-target')
 a=p.parse_args()
+if a.v03_avc_only:a.v03_only=True
+if pathlib.Path(a.host_exe).name.lower()=='lantern-host.exe':p.error('--host-exe needs the lantern.exe CLI, not the GUI host')
 if a.external_app and '/' not in a.external_app:p.error('--external-app requires package/activity, not a package alone')
 root=pathlib.Path(a.work).resolve()/('phone-'+uuid.uuid4().hex[:8]);root.mkdir(parents=True);share=root/'share';share.mkdir();state=root/'state';state.mkdir()
 flags=subprocess.CREATE_NO_WINDOW
 def adb(*args,**kw):return subprocess.run([a.adb,'-s',a.serial,*args],capture_output=True,check=True,creationflags=flags,**kw)
-def command(*args):return subprocess.run(list(map(str,args)),capture_output=True,text=True,check=True,creationflags=flags)
+def command(*args):return subprocess.run(list(map(str,args)),capture_output=True,text=True,encoding='utf-8',errors='replace',check=True,creationflags=flags,timeout=30)
 block=bytes((i*179+i//313)%256 for i in range(1024*1024))
 with (share/'large.bin').open('wb') as f:
     for _ in range(32):f.write(block)
 (share/'readme.txt').write_text('Lantern physical-device test files only. No personal files shared.',encoding='utf-8')
+if a.v03_media_only:
+    import shutil
+    if not a.media_fixture:raise RuntimeError('Generated MKV fixture required for v03 media test')
+    shutil.copyfile(a.media_fixture,share/'movie.mkv')
 if a.files_media_only:
     import shutil
     fixture=share/'fixture';(fixture/'nested').mkdir(parents=True)
@@ -38,7 +51,7 @@ if a.files_media_only:
     bmp=bytearray(58);bmp[0:2]=b'BM';bmp[2]=58;bmp[10]=54;bmp[14]=40;bmp[18]=1;bmp[22]=1;bmp[26]=1;bmp[28]=24;bmp[34]=4;bmp[56]=255
     (fixture/'image.bmp').write_bytes(bmp)
     shutil.copyfile(a.media_fixture,share/'movie.mp4')
-initialized=command(a.host_exe,'init',state,share,'31' if (a.saf_stream_only or a.tools_only or a.audio_only or a.files_media_only or a.reliability_only or a.device_trust_only) else '15').stdout.splitlines()
+initialized=command(a.host_exe,'init',state,share,'31' if (a.v03_only or a.v03_transport_only or a.saf_stream_only or a.tools_only or a.audio_only or a.files_media_only or a.reliability_only or a.device_trust_only) else '15').stdout.splitlines()
 pin=initialized[0].split()[1];token=initialized[1].split()[-1]
 phone_id=None;other_secret=None
 if a.device_trust_only:
@@ -62,14 +75,20 @@ if a.tools_only:
     if not a.isolated_host:raise RuntimeError('Isolated clipboard host helper required')
     host_args=[a.isolated_host,'--host-lan',str(root),str(a.port)]
 host=subprocess.Popen(host_args,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=flags)
-test=None;success=False;watcher=None;watcher_stop=threading.Event();restarted=False;restart_errors=[]
+test=None;success=False;watcher=None;watcher_stop=threading.Event();restarted=False;restart_errors=[];app_log=None;app_log_file=None
 trust_applied=[]
 try:
-    if a.audio_only:
+    if a.audio_only or a.v03_only:
         if not a.audio_tone:raise RuntimeError('Generated audio tone helper is required')
         tone_report=root/'tone-source.json'
         tone_process=subprocess.Popen([a.audio_tone,str(share/'tone-start.bin'),str(tone_report),str(a.audio_duration)],creationflags=flags)
-    adb('install','-r',a.apk)
+    if not a.skip_install:adb('install','-r',a.apk)
+    if a.app_log:
+        uid_text=adb('shell','cmd','package','list','packages','-U','org.lantern.client').stdout.decode('utf-8','replace')
+        uid=re.search(r'package:org\.lantern\.client uid:(\d+)',uid_text)
+        if not uid:raise RuntimeError('Lantern UID unavailable; refusing broad logcat capture')
+        app_log_file=open(a.app_log,'wb')
+        app_log=subprocess.Popen([a.adb,'-s',a.serial,'logcat','--uid='+uid[1],'-T','1','-v','threadtime'],stdout=app_log_file,stderr=subprocess.STDOUT,creationflags=flags)
     if a.device_trust_only:
         adb('shell','run-as','org.lantern.client','rm','-f','files/device-trust.request','files/device-trust.ack')
         def edit_device_trust():
@@ -99,6 +118,10 @@ try:
     if a.address=='127.0.0.1':adb('reverse',f'tcp:{a.port}',f'tcp:{a.port}')
     adb('forward','tcp:47899','localabstract:lantern-device-validation')
     instrument=[a.adb,'-s',a.serial,'shell','am','instrument']
+    if a.v03_media_only:instrument += ['-e','v03_media_only','true']
+    if a.v03_only:instrument += ['-e','v03_only','true']
+    if a.v03_avc_only:instrument += ['-e','v03_avc_only','true']
+    if a.v03_transport_only:instrument += ['-e','v03_transport_only','true']
     if a.saf_stream_only:instrument += ['-e','saf_stream_only','true']
     if a.tools_only:instrument += ['-e','tools_only','true']
     if a.desktop_only:instrument += ['-e','desktop_only','true']
@@ -132,6 +155,7 @@ try:
     reports=[line.split('INSTRUMENTATION_RESULT: report=',1)[1] for line in text.splitlines() if line.startswith('INSTRUMENTATION_RESULT: report=')]
     if not reports:raise RuntimeError('No device result: '+text[-1000:])
     result=json.loads(reports[-1]);success=result.get('success',False);result['test_fixture_directory']=str(share)
+    result['network_path']=a.network_label
     result['owned_host_exit_code_during_test']=host.poll()
     if 'INSTRUMENTATION_RESULT: restore_error=' in text:success=False;result['success']=False;result['user_state_restore_failed']=True
     if a.reliability_only:
@@ -184,6 +208,8 @@ try:
         (root/'host-process.json').write_text(json.dumps({'pid':host.pid,'state':str(state),'share':str(share)}),encoding='utf-8')
         print('Test-only host remains running, PID '+str(host.pid),flush=True)
 finally:
+    if app_log is not None:app_log.terminate();app_log.wait(timeout=10)
+    if app_log_file is not None:app_log_file.close()
     watcher_stop.set()
     if watcher is not None:watcher.join(timeout=15)
     if test is not None and test.poll() is None:test.terminate();test.wait(timeout=10)

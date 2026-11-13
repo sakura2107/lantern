@@ -26,7 +26,11 @@ public final class TransferService extends Service {
         shared=queue;
         context.startForegroundService(new Intent(context,TransferService.class));
     }
+    static void ensureMedia(Context context){
+        if(active==null)context.startForegroundService(new Intent(context,TransferService.class));
+    }
     static void shutdown(Context context){
+        MediaPlayback.closeAll();
         TransferQueue queue; synchronized(TransferService.class){queue=shared;}
         if(queue!=null)queue.close();
         context.stopService(new Intent(context,TransferService.class));
@@ -40,8 +44,8 @@ public final class TransferService extends Service {
         PendingIntent content=PendingIntent.getActivity(this,0,open,PendingIntent.FLAG_IMMUTABLE|PendingIntent.FLAG_UPDATE_CURRENT);
         PendingIntent pause=PendingIntent.getService(this,1,new Intent(this,TransferService.class).setAction(PAUSE),PendingIntent.FLAG_IMMUTABLE|PendingIntent.FLAG_UPDATE_CURRENT);
         TransferQueue q=shared;TransferQueue.Task task=q==null?null:q.running;
-        String title=task==null?"Lantern 文件传输":(task.kind==0?"下载 · ":"上传 · ")+task.name;
-        String detail=q==null?"准备传输":q.notificationText();
+        String title=task==null&&MediaPlayback.active()?"Lantern 远程媒体访问":task==null?"Lantern 文件传输":(task.kind==0?"下载 · ":"上传 · ")+task.name;
+        String detail=task==null&&MediaPlayback.active()?"正在供外部播放器读取；暂停全部可结束访问":q==null?"准备传输":q.notificationText();
         Notification.Builder builder=new Notification.Builder(this,CHANNEL).setSmallIcon(android.R.drawable.stat_sys_download).setContentTitle(title).setContentText(detail).setContentIntent(content).setOngoing(true).setOnlyAlertOnce(true).setVisibility(Notification.VISIBILITY_PRIVATE).setCategory(Notification.CATEGORY_PROGRESS).addAction(new Notification.Action.Builder(null,"暂停全部",pause).build());
         if(task!=null){builder.setProgress(1000,task.total==0?0:(int)Math.min(1000,task.current*1000.0/task.total),task.total==0);}
         return builder.build();
@@ -57,18 +61,18 @@ public final class TransferService extends Service {
     }
     final Runnable tick=new Runnable(){public void run(){
         TransferQueue q=shared;
-        if(q==null||q.closed||!q.hasPending()){
+        if(!MediaPlayback.active()&&(q==null||q.closed||!q.hasPending())){
             if(wake!=null&&wake.isHeld())wake.release();stopForeground(STOP_FOREGROUND_REMOVE);stopSelf();return;
         }
-        if(q.running!=null){if(!wake.isHeld())wake.acquire(60_000);}else if(wake.isHeld())wake.release();
+        if(MediaPlayback.active()||(q!=null&&q.running!=null)){if(!wake.isHeld())wake.acquire(60_000);}else if(wake.isHeld())wake.release();
         getSystemService(NotificationManager.class).notify(NOTIFICATION,notification());main.postDelayed(this,1000);
     }};
     @Override public int onStartCommand(Intent intent,int flags,int id){
-        if(intent!=null&&PAUSE.equals(intent.getAction())){TransferQueue q=shared;if(q!=null)q.pauseAll("已从通知暂停");}
+        if(intent!=null&&PAUSE.equals(intent.getAction())){MediaPlayback.closeAll();TransferQueue q=shared;if(q!=null)q.pauseAll("已从通知暂停");}
         main.removeCallbacks(tick);main.post(tick);return START_NOT_STICKY;
     }
     // Android 15+ limits dataSync services; preserve all partial files rather than silently lose work.
-    @Override public void onTimeout(int startId,int foregroundServiceType){TransferQueue q=shared;if(q!=null)q.pauseAll("系统后台传输时限已到，请回到应用继续");stopForeground(STOP_FOREGROUND_REMOVE);stopSelf();}
+    @Override public void onTimeout(int startId,int foregroundServiceType){MediaPlayback.closeAll();TransferQueue q=shared;if(q!=null)q.pauseAll("系统后台传输时限已到，请回到应用继续");stopForeground(STOP_FOREGROUND_REMOVE);stopSelf();}
     @Override public void onDestroy(){main.removeCallbacks(tick);if(watching)connectivity.unregisterNetworkCallback(networkCallback);if(wake!=null&&wake.isHeld())wake.release();if(active==this)active=null;super.onDestroy();}
     @Override public IBinder onBind(Intent intent){return null;}
 }

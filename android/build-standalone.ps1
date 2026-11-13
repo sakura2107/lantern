@@ -31,12 +31,15 @@ foreach ($Target in @(@{Abi='arm64-v8a';Triple='aarch64-linux-android26'},@{Abi=
 $Manifest=Get-Content "$PSScriptRoot\app\src\main\AndroidManifest.xml" -Raw
 $Manifest=$Manifest.Replace('<manifest ', '<manifest package="org.lantern.client" ')
 $Manifest=$Manifest.Replace('<application ', '<application android:debuggable="true" ')
+$Manifest=$Manifest.Replace('<application ', '<application android:networkSecurityConfig="@xml/lantern_test_network" ')
 $Manifest=$Manifest.Replace('</application>', '<provider android:name=".TestDocuments" android:authorities="org.lantern.client.testdocs" android:exported="true" android:permission="android.permission.MANAGE_DOCUMENTS" android:grantUriPermissions="true" /></application>')
 $Manifest=$Manifest.Replace('</manifest>', '<instrumentation android:name="org.lantern.client.DeviceTestRunner" android:targetPackage="org.lantern.client" android:label="Lantern device validation" /></manifest>')
 Set-Content "$ScratchDir\AndroidManifest.xml" $Manifest -Encoding utf8
 & "$BuildTools\aapt2.exe" compile --dir "$PSScriptRoot\app\src\main\res" -o "$ScratchDir\res.zip"
 Check-Exit 'Launcher icon resources'
-& "$BuildTools\aapt2.exe" link -I $AndroidJar --manifest "$ScratchDir\AndroidManifest.xml" -R "$ScratchDir\res.zip" --min-sdk-version 26 --target-sdk-version 35 --version-code 1 --version-name 0.1.0 -o "$ScratchDir\unsigned.apk"
+& "$BuildTools\aapt2.exe" compile --dir "$PSScriptRoot\app\src\debug\res" -o "$ScratchDir\debug-res.zip"
+Check-Exit 'Debug loopback-only media validation policy'
+& "$BuildTools\aapt2.exe" link -I $AndroidJar --manifest "$ScratchDir\AndroidManifest.xml" -R "$ScratchDir\res.zip" -R "$ScratchDir\debug-res.zip" --min-sdk-version 26 --target-sdk-version 35 --version-code 1 --version-name 0.1.0 -o "$ScratchDir\unsigned.apk"
 Check-Exit 'Android resources'
 & $Jar uf "$ScratchDir\unsigned.apk" -C "$ScratchDir\dex" classes.dex -C $ScratchDir lib
 Check-Exit 'APK assembly'

@@ -8,7 +8,9 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /** Independent, bounded PCM loopback receiver. Owns network and AudioTrack on one worker. */
 final class SystemAudio {
-    interface Events { void started(int rate); void failed(String reason); void reconnecting(String reason); }
+    interface Events { void started(int rate); void failed(String reason); void reconnecting(String reason); default void connectionState(ConnectionStatus.Snapshot state){} }
+    final ConnectionStatus connection=new ConnectionStatus();
+    ConnectionStatus.Snapshot connectionState(){return connection.snapshot();}
     java.util.function.Supplier<MediaTimeline> timelineSource=MediaTimeline::new;
     final Context context; final Events events;
     final Handler main=new Handler(Looper.getMainLooper());
@@ -18,6 +20,8 @@ final class SystemAudio {
     volatile Request readyRequest;
     volatile Request failedRequest;
     volatile Remote active;
+    volatile AudioSession activeSession;
+    volatile String path="tcp";
     volatile java.net.Socket opening;
     volatile boolean closed;
     volatile String failure="";
@@ -32,10 +36,11 @@ final class SystemAudio {
     final AtomicLong packets=new AtomicLong(), pcmBytes=new AtomicLong(), nonZeroSamples=new AtomicLong();
     final AtomicLong squaredSamples=new AtomicLong(), sampleCount=new AtomicLong();
     SystemAudio(Context c, Events e) { context=c; events=e; worker=new Thread(this::loop,"Lantern system audio"); worker.start(); }
-    synchronized void start(Remote.Credentials c) { if(closed || (desired!=null && desired.credentials==c)) return; desired=new Request(c);desired.timeline=timelineSource.get();failedRequest=null; failure=""; abort(); notifyAll(); }
+    synchronized void start(Remote.Credentials c) { if(closed || (desired!=null && desired.credentials==c)) return; connection.failure(false);desired=new Request(c);desired.timeline=timelineSource.get();failedRequest=null; failure=""; abort(); notifyAll(); }
     synchronized void stop() { desired=null;failedRequest=null; abort(); notifyAll(); }
     synchronized void networkChanged(){if(desired!=null)desired.retryAt=0;abort();notifyAll();}
     void abort() {
+        AudioSession session=activeSession;if(session!=null)session.close();
         java.net.Socket socket=opening; if(socket!=null) try{socket.close();}catch(IOException ignored){}
         Remote remote=active; if(remote!=null) try{remote.abort();}catch(IOException ignored){}
     }
@@ -50,7 +55,8 @@ final class SystemAudio {
                 synchronized(this) {
                     if(current(request)) {
                         failure=error.getMessage()==null?error.getClass().getSimpleName():error.getMessage();String reason=failure;
-                        if(RetryPolicy.transientFailure(error)&&request.attempts<RetryPolicy.MAX_ATTEMPTS){request.attempts++;request.retryAt=SystemClock.elapsedRealtime()+RetryPolicy.delayMillis(request.attempts);reconnects.incrementAndGet();main.post(()->{if(current(request))events.reconnecting(reason);});}
+                        connection.failure(!RetryPolicy.transientFailure(error));main.post(()->{if(current(request))events.connectionState(connection.snapshot());});
+                        if(RetryPolicy.transientFailure(error)){request.attempts=Math.min(1000,request.attempts+1);request.retryAt=SystemClock.elapsedRealtime()+Math.min(2000,RetryPolicy.delayMillis(request.attempts));reconnects.incrementAndGet();main.post(()->{if(current(request))events.reconnecting(reason);});}
                         else{desired=null;failedRequest=request;main.post(()->{if(!closed&&desired==null&&failedRequest==request)events.failed(reason);});}
                     }
                 }
@@ -70,16 +76,15 @@ final class SystemAudio {
                 }
             },main).build();
         boolean focused=false;
-        try(Remote remote=new Remote(c,16,4,socket -> {opening=socket; if(!current(request)) socket.close();})) {
+        try(Remote remote=new Remote(new Remote.Credentials(c.host,c.port,c.pin,c.token,c.endpoints),16,4,socket -> {opening=socket; if(!current(request)) socket.close();})) {
             active=remote; if(!current(request)) return;
-            DataInputStream config=Remote.reader(remote.call(41,Remote.body(o -> {o.writeInt(2);o.writeInt(OpusAudioDecoder.available()?1:0);})));
-            if(config.readInt()!=2) throw new IOException("音频协议版本不兼容");
-            int rate=config.readInt(), channels=config.readInt(), bits=config.readInt();
-            String provider=Remote.str(config);
-            int codec=config.readInt(),lookahead=config.readInt();
+            AudioSession session=new AudioSession(remote,OpusAudioDecoder.available());activeSession=session;
+            int rate=session.rate,channels=session.channels,bits=session.bits;
+            String provider=session.provider;
+            int codec=session.codec,lookahead=session.lookahead;
             if(codec<0||codec>1||lookahead<0||lookahead>5760||codec==1&&rate!=48000)throw new IOException("音频编码协商失败");
             if(codec==1)decoder=new OpusAudioDecoder(lookahead);encoding=codec==1?"Opus 96 kbps":"PCM16LE";wireBytes.set(0);
-            if(rate<8000 || rate>96000 || rate%100!=0 || channels!=2 || bits!=16 || !provider.equals("wasapi-loopback") || config.available()!=0)
+            if(rate<8000 || rate>96000 || rate%100!=0 || channels!=2 || bits!=16 || !provider.equals("wasapi-loopback"))
                 throw new IOException("音频格式不兼容");
             int minimum=AudioTrack.getMinBufferSize(rate,AudioFormat.CHANNEL_OUT_STEREO,AudioFormat.ENCODING_PCM_16BIT);
             if(minimum<=0 || minimum>rate) throw new IOException("手机音频缓冲要求超过250ms");
@@ -98,14 +103,18 @@ final class SystemAudio {
             tonePowerSum=0; analyzedPackets=0;
             boolean playing=false;long playStartedNs=0; AudioTimestamp timestamp=new AudioTimestamp();
             main.post(() -> { if(current(request)) events.started(rate); });
-            remote.sendOnly(43,Remote.body(o -> o.writeInt(1)));
+            session.ready();path=session.usingUdp?"udp":"tcp";
             long sequence=-1,lastPts=-1,basePts=0,baseClock=0,behindSince=0; boolean resync=false;
             while(current(request)) {
-                DataInputStream packet=Remote.reader(remote.receive(42));
+                DataInputStream packet=Remote.reader(session.packet());
                 long next=packet.readLong(), pts=packet.readLong(); int flags=packet.readInt(); byte[] pcm=Remote.blob(packet,codec==1?1275:rate*4/100);
-                if(next!=sequence+1 || pts<0 || pts<=lastPts || pts>Long.MAX_VALUE/1000 || (flags & ~3)!=0 || (codec==0 && pcm.length%4!=0) || ((flags&2)!=0)!= (pcm.length==0) || packet.available()!=0)
+                boolean lost=next!=sequence+1;
+                if((session.version<3&&lost) || next<=sequence || pts<0 || pts<=lastPts || pts>Long.MAX_VALUE/1000 || (flags & ~3)!=0 || (codec==0 && pcm.length%4!=0) || ((flags&2)!=0)!= (pcm.length==0) || packet.available()!=0)
                     throw new IOException("音频序号、时间戳或长度错误");
+                if(lost){flags|=1;resync=true;}
+                path=session.usingUdp?"udp":"tcp";
                 sequence=next; lastPts=pts; packets.incrementAndGet();
+                if(connection.snapshot().phase!=ConnectionStatus.Phase.NORMAL){connection.normal();main.post(()->{if(current(request))events.connectionState(connection.snapshot());});}
                 if(sequence>=100)request.attempts=0;
                 if(pcm.length==0) {
                     baseClock=0;
@@ -160,7 +169,7 @@ final class SystemAudio {
             try { if(track!=null) {try{track.pause();track.flush();}finally{track.release();}} }
             finally {
                 try {if(focused) manager.abandonAudioFocusRequest(focus);}
-                finally {active=null; opening=null; readyRequest=null;}
+                finally {if(activeSession!=null)activeSession.close();activeSession=null;active=null; opening=null; readyRequest=null;}
             }
         }
     }

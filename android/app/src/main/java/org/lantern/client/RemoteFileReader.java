@@ -20,12 +20,15 @@ final class RemoteFileReader implements AutoCloseable {
     final Set<Long> loading = new HashSet<>();                                       // under lock
     final ArrayDeque<Long> queue = new ArrayDeque<>();                                // under lock
     final List<Thread> workers = new ArrayList<>();
-    final List<Remote> extra = Collections.synchronizedList(new ArrayList<>());
+    final Set<Remote> extra = new HashSet<>(); // all live connections, under lock
+    final Map<Thread,java.net.Socket> openings = new HashMap<>();
+    final Map<Thread,Remote> prefetch = new HashMap<>();
     volatile boolean closed;
     volatile Remote connection;
     volatile java.net.Socket opening;
     volatile long transferred, requests, hits, reconnects;
     long lastBlock = -2; // foreground thread only
+    long generation; // under lock; seek invalidates in-flight read-ahead
     RemoteFileReader(Remote.Credentials c, String p) throws Exception {
         credentials = c;
         path = p;
@@ -33,33 +36,40 @@ final class RemoteFileReader implements AutoCloseable {
         try {
             info = connection.stat(path, false);
         } catch (Exception error) {
-            connection.abort();
+            release(connection);
             throw error;
         }
     }
     Remote open() throws Exception {
-        return new Remote(credentials, 1, 2, s -> {
-            opening = s;
-            if (closed)
-                s.close();
-        });
+        Thread owner=Thread.currentThread();
+        try {
+            Remote remote=new Remote(credentials, 1, 2, s -> {
+                synchronized(lock){openings.put(owner,s);if(closed)s.close();}
+            });
+            synchronized(lock){if(closed){remote.abort();throw new IOException("播放已结束");}extra.add(remote);}
+            return remote;
+        } finally {synchronized(lock){openings.remove(owner);}}
     }
+    void release(Remote remote){if(remote==null)return;try{remote.abort();}catch(IOException ignored){}synchronized(lock){extra.remove(remote);}}
     int length(long position) {
         return (int)Math.min(Remote.CHUNK, info.size - position);
     }
     /** One block over the given connection holder, with the original two quiet retries. */
-    byte[] fetch(long position, Remote[] holder) throws Exception {
+    byte[] fetch(long position, Remote[] holder, long epoch) throws Exception {
         for (int attempt = 0;; attempt++) {
             if (closed)
                 throw new IOException("播放已结束");
+            synchronized(lock){if(epoch>=0&&epoch!=generation)throw new IOException("Read-ahead seek cancelled");}
             try {
                 if (holder[0] == null) {
                     holder[0] = open();
+                    synchronized(lock){if(epoch>=0)prefetch.put(Thread.currentThread(),holder[0]);}
                     Remote.Info current = holder[0].stat(path, false);
                     if (!current.version.equals(info.version) || current.size != info.size)
                         throw new Remote.RemoteError(10, "媒体源文件已变化，请重新打开");
                     reconnects++;
                 }
+                synchronized(lock){if(epoch>=0&&epoch!=generation)throw new IOException("Read-ahead seek cancelled");}
                 byte[] bytes = holder[0].read(path, info.version, position, length(position));
                 requests++;
                 transferred += bytes.length;
@@ -69,11 +79,7 @@ final class RemoteFileReader implements AutoCloseable {
             } catch (Remote.RemoteError | javax.net.ssl.SSLException error) {
                 throw error;
             } catch (IOException error) {
-                if (holder[0] != null)
-                    try {
-                        holder[0].abort();
-                    } catch (Exception ignored) {
-                    }
+                release(holder[0]);
                 holder[0] = null;
                 if (attempt >= 2 || closed)
                     throw error;
@@ -81,10 +87,10 @@ final class RemoteFileReader implements AutoCloseable {
             }
         }
     }
-    void store(long position, byte[] bytes) {
+    void store(long position, byte[] bytes, long epoch) {
         synchronized (lock) {
             loading.remove(position);
-            if (bytes != null) {
+            if (bytes != null && (epoch<0||epoch==generation)) {
                 while (cache.size() >= KEEP)
                     cache.remove(cache.keySet().iterator().next());
                 cache.put(position, bytes);
@@ -114,13 +120,13 @@ final class RemoteFileReader implements AutoCloseable {
         try {
             Remote[] holder = {connection};
             try {
-                bytes = fetch(position, holder);
+                bytes = fetch(position, holder, -1);
             } finally {
                 connection = holder[0];
             }
             return bytes;
         } finally {
-            store(position, bytes);
+            store(position, bytes, -1);
         }
     }
     /** Queues the next AHEAD blocks; a jump elsewhere first drops what was queued for the old place. */
@@ -129,8 +135,13 @@ final class RemoteFileReader implements AutoCloseable {
         lastBlock = block;
         long last = (info.size - 1) / Remote.CHUNK;
         synchronized (lock) {
-            if (!sequential)
+            if (!sequential) {
+                ++generation;
                 queue.clear();
+                // Abort only obsolete prefetch requests; the foreground connection stays reusable.
+                for(Remote remote:prefetch.values())try{remote.abort();}catch(IOException ignored){}
+                for(Thread worker:workers){java.net.Socket socket=openings.get(worker);if(socket!=null)try{socket.close();}catch(IOException ignored){}}
+            }
             for (long b = block + 1; b <= Math.min(last, block + AHEAD); b++) {
                 long position = b * Remote.CHUNK;
                 if (!cache.containsKey(position) && !loading.contains(position) && !queue.contains(position))
@@ -151,34 +162,31 @@ final class RemoteFileReader implements AutoCloseable {
         Remote[] holder = {null};
         try {
             while (!closed) {
-                long position;
+                long position,epoch;
                 synchronized (lock) {
                     while (queue.isEmpty() && !closed)
                         lock.wait(1000);
                     if (closed)
                         return;
                     position = queue.pollFirst();
+                    epoch=generation;
                     loading.add(position);
+                    if(holder[0]!=null)prefetch.put(Thread.currentThread(),holder[0]);
                 }
                 byte[] bytes = null;
                 try {
-                    Remote before = holder[0];
-                    bytes = fetch(position, holder);
-                    if (holder[0] != before)
-                        extra.add(holder[0]);
+                    bytes = fetch(position, holder, epoch);
                 } catch (Exception failed) {
                     // Read-ahead is optional: the foreground read fetches this block itself if needed.
+                    release(holder[0]);holder[0]=null;
                 } finally {
-                    store(position, bytes);
+                    synchronized(lock){prefetch.remove(Thread.currentThread());}
+                    store(position, bytes, epoch);
                 }
             }
         } catch (InterruptedException stop) {
         } finally {
-            if (holder[0] != null)
-                try {
-                    holder[0].abort();
-                } catch (Exception ignored) {
-                }
+            release(holder[0]);
         }
     }
     public synchronized int readAt(long position, byte[] buffer, int offset, int size) throws IOException {
@@ -220,12 +228,14 @@ final class RemoteFileReader implements AutoCloseable {
                 connection.abort();
         } catch (IOException ignored) {
         }
-        synchronized (extra) {
+        synchronized (lock) {
+            for(java.net.Socket socket:openings.values())try{socket.close();}catch(IOException ignored){}
             for (Remote r : extra)
                 try {
                     r.abort();
                 } catch (IOException ignored) {
                 }
+            extra.clear();
         }
     }
 }

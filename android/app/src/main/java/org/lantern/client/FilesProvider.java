@@ -15,6 +15,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public final class FilesProvider extends ContentProvider {
     static final class Source {
+        volatile boolean closed;
+        final Set<RemoteFileReader> readers=Collections.synchronizedSet(new HashSet<>());
         final File file;
         final Remote.Credentials credentials;
         final String path, name;
@@ -39,6 +41,10 @@ public final class FilesProvider extends ContentProvider {
     }
     static final ConcurrentHashMap<String, Source> sources = new ConcurrentHashMap<>();
     static final AtomicInteger activeProxies = new AtomicInteger();
+    static void revoke(Uri uri){
+        List<String> path=uri.getPathSegments();if(path.isEmpty())return;Source source=sources.remove(path.get(0));
+        if(source!=null){List<RemoteFileReader> readers;synchronized(source){source.closed=true;synchronized(source.readers){readers=new ArrayList<>(source.readers);source.readers.clear();}}for(RemoteFileReader reader:readers)reader.close();}
+    }
     static Uri share(Source source) throws IOException {
         if (sources.size() >= 32)
             throw new IOException("共享句柄已达上限，请重启应用结束旧共享");
@@ -56,7 +62,7 @@ public final class FilesProvider extends ContentProvider {
         if (p.size() != 2)
             throw new FileNotFoundException("Invalid URI");
         Source s = sources.get(p.get(0));
-        if (s == null || !p.get(1).equals(s.name))
+        if (s == null || s.closed || !p.get(1).equals(s.name))
             throw new FileNotFoundException("共享已结束，请重新打开");
         return s;
     }
@@ -128,9 +134,10 @@ public final class FilesProvider extends ContentProvider {
                     @Override
                     public int onRead(long offset, int size, byte[] data) throws ErrnoException {
                         try {
-                            if (offset < 0 || size < 0)
+                            if (s.closed || offset < 0 || size < 0)
                                 throw new IOException("Range");
-                            if(reader==null){reader=new RemoteFileReader(s.credentials,s.path);if(reader.info.size!=s.info.size||!reader.info.version.equals(s.info.version)){reader.close();reader=null;throw new IOException("Source changed");}}
+                            if(reader==null){reader=new RemoteFileReader(s.credentials,s.path);if(reader.info.size!=s.info.size||!reader.info.version.equals(s.info.version)){reader.close();reader=null;throw new IOException("Source changed");}
+                                synchronized(s){if(s.closed){reader.close();throw new IOException("Share ended");}s.readers.add(reader);}}
                             int total=(int)Math.min(Math.min(size,data.length),Math.max(0,s.info.size-offset)),done=0;
                             while(done<total){int count=reader.readAt(offset+done,data,done,total-done);if(count<0)break;if(count==0)throw new IOException("Read made no progress");done+=count;}
                             return done;
@@ -141,15 +148,15 @@ public final class FilesProvider extends ContentProvider {
                     @Override
                     public void onRelease() {
                         try {
-                            if (reader != null)reader.close();
+                            if (reader != null){s.readers.remove(reader);reader.close();}
                         } catch (Exception ignored) {
                         }
-                        TransferPacer.SHARED.movie=activeProxies.decrementAndGet()>0;
+                        TransferPacer.SHARED.movie=activeProxies.decrementAndGet()>0||MediaPlayback.active();
                         thread.quitSafely();
                     }
                 }, new Handler(thread.getLooper()));
         } catch (IOException e) {
-            TransferPacer.SHARED.movie=activeProxies.decrementAndGet()>0;
+            TransferPacer.SHARED.movie=activeProxies.decrementAndGet()>0||MediaPlayback.active();
             thread.quitSafely();
             throw new FileNotFoundException("系统不支持可寻址读取，请下载后打开：" + e.getMessage());
         }
