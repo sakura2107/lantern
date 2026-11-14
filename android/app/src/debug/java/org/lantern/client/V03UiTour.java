@@ -81,27 +81,35 @@ final class V03UiTour {
         org.json.JSONArray rates = new org.json.JSONArray();
         // Real UI path, picture fullscreen; q[2] = inject real touch swipes during the measurement.
         // presented_fps is read from the compositor (what the screen actually showed).
+        // arrival_* = gaps between frames reaching the phone, capture_* = gaps on the host capture clock.
         for (int[] q : new int[][]{{1280, 120, 0}, {1920, 120, 0}, {2560, 120, 0}, {1920, 60, 0}, {1280, 120, 1}}) {
             t.runOnMainSync(() -> { a.qualityAuto = false; a.qualityWidth = q[0]; a.qualityFps = q[1]; a.applyQuality("tour"); a.desktopLayout.setFullscreen(true); });
             java.util.concurrent.atomic.AtomicBoolean touching = new java.util.concurrent.atomic.AtomicBoolean(q[2] == 1);
             Thread toucher = new Thread(() -> { while (touching.get()) try { swipe(t, a); } catch (Exception stop) { return; } });
             toucher.start();
             Thread.sleep(3000);
+            a.video.resetArrivals();
             long before = a.avcView.updateCount(), packets = a.video.received.get(), began = System.nanoTime();
             Thread.sleep(3000);
             double seconds = (System.nanoTime() - began) / 1e9;
             long received = a.video.received.get() - packets, shown = a.avcView.updateCount() - before;
             double appPeriodMs = a.video.vsync.period() / 1e6;
+            double[] jitter = a.video.arrivalJitter(1000.0 / q[1]);
             double presented = presentedFps(t, a);
             Thread.sleep(1500); presented += presentedFps(t, a);
             Thread.sleep(1500); presented += presentedFps(t, a);
             presented /= 3;
             touching.set(false); toucher.join(3000);
             // Untouched, the app must keep the 120 Hz cadence (ColorOS would drop it to 60 Hz) and show
-            // well above 60 fps at 120 (84-95 measured); 60 fps must stay near full (55-58 measured).
-            t.check(appPeriodMs < 10 && presented > (q[1] == 120 ? 75 : 50), "picture presented at " + presented + " fps for " + q[0] + "@" + q[1]);
+            // close to full rate: 102-115 at 120 and 60 at 60 measured with the host paced.
+            t.check(appPeriodMs < 10 && presented > (q[1] == 120 ? 90 : 55), "picture presented at " + presented + " fps for " + q[0] + "@" + q[1] + " (app refresh " + appPeriodMs + " ms, received " + received / seconds + " fps)");
+            // Host pacing, independent of the network: captures must not come in back-to-back pairs
+            // (before the high-resolution timer 12-30 % did, and the phone dropped one of each pair).
+            t.check(jitter[4] >= 0 && jitter[4] < 0.05, "host capture bunched " + jitter[4] + " for " + q[0] + "@" + q[1]);
             DesktopSession.Status st = a.liveQuality;
             rates.put(new org.json.JSONObject().put("chosen", q[0] + "@" + q[1] + (q[2] == 1 ? " touch" : " no-touch"))
+                .put("arrival_bunched", jitter[0]).put("arrival_late", jitter[1]).put("arrival_mean_ms", jitter[2]).put("arrival_sd_ms", jitter[3])
+                .put("capture_bunched", jitter[4]).put("capture_late", jitter[5]).put("capture_sd_ms", jitter[6])
                 .put("sent", st == null ? "none" : st.width + "x" + st.height + "@" + st.fps + " " + st.codec + " " + st.path + (st.constrained ? " constrained" : "") + (st.dropping ? " dropping" : ""))
                 .put("received_fps", received / seconds)
                 .put("shown_fps", shown / seconds)

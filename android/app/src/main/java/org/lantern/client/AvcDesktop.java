@@ -75,6 +75,25 @@ final class AvcDesktop implements AutoCloseable {
     final AtomicLong streamEpoch=new AtomicLong();
     final long[] renderTimes = new long[768];
     long rendered, firstFrameNs, startedNs;
+    final long[] arrivalTimes = new long[512], captureTimes = new long[512];
+    long arrivals;
+    synchronized void arrived(long now,long ptsNs){int k=(int)(arrivals++%arrivalTimes.length);arrivalTimes[k]=now;captureTimes[k]=ptsNs;}
+    synchronized void resetArrivals(){arrivals=0;}
+    /** Frame gaps over the last ~4 s, phone arrival then host capture clock:
+     *  {bunched, late, mean ms, sd ms, capture bunched, capture late, capture sd ms}; bunched = under half a period, late = over 1.5. */
+    synchronized double[] arrivalJitter(double periodMs){
+        int n=(int)Math.min(arrivals,arrivalTimes.length);if(n<3)return new double[]{-1,-1,-1,-1,-1,-1,-1};
+        double[] a=gaps(arrivalTimes,n,periodMs),c=gaps(captureTimes,n,periodMs);
+        return new double[]{a[0],a[1],a[2],a[3],c[0],c[1],c[3]};
+    }
+    private double[] gaps(long[] times,int n,double periodMs){
+        int bunched=0,late=0;double sum=0,sq=0;
+        for(int i=1;i<n;i++){
+            double g=(times[(int)((arrivals-n+i)%times.length)]-times[(int)((arrivals-n+i-1)%times.length)])/1e6;
+            if(g<periodMs/2)bunched++;if(g>periodMs*1.5)late++;sum+=g;sq+=g*g;
+        }
+        double m=sum/(n-1);return new double[]{bunched/(double)(n-1),late/(double)(n-1),m,Math.sqrt(Math.max(0,sq/(n-1)-m*m))};
+    }
     AvcDesktop(AvcView v, Events e) {
         view = v;
         events = e;
@@ -250,6 +269,7 @@ void consume(Request request, AvcView.Target target) throws Exception {
             if(sequence>=request.profile.fps)request.attempts=0;
             lastPts = pts;
             long now = System.nanoTime();
+            arrived(now,pts*1000);
             if (clock == 0)
                 clock = now - pts * 1000;
             if (now - (clock + pts * 1000) > 300_000_000L+(request.absolute?request.timeline.videoDelayBudget(now):0)) {
@@ -352,8 +372,12 @@ MediaCodec createDecoder(Request request,AvcView.Target target,long epoch,Deskto
 }
 // While a picture decodes, a frame callback runs every refresh. ColorOS otherwise drops an app that
 // has not been touched for a few seconds to 60 Hz on a 120 Hz panel (measured on the compositor:
-// a 120 fps picture showed 57 fps untouched); with the callback it stays at 120 Hz (85-97 shown).
+// a 120 fps picture showed 57 fps untouched); with the callback it stays at 120 Hz.
 // Pacing releases to that cadence was tried and gave no measurable gain over releasing at once.
+// The remaining gap (85-97 shown) came from the host, which overslept on the Windows timer tick and
+// then sent frames back to back; with the host paced by a high-resolution timer 102-115 are shown.
+// A Wi-Fi low-latency lock was tried: it made frame arrival no smoother (A/B after the host fix) and
+// did not prevent ColorOS dropping a warm phone's app to 60 Hz, so the radio keeps its power saving.
 final VsyncClock vsync=new VsyncClock();
 void drain(MediaCodec codec, MediaCodec.BufferInfo info, AvcView.Target target,Request request) {
     for (int i = 0; i < 32; i++) {

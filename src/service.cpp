@@ -15,7 +15,35 @@
 #include <deque>
 #include <thread>
 #include <ws2tcpip.h>
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 namespace lantern {
+namespace {
+// An ordinary sleep wakes on the system timer tick (up to 15.6 ms late). At 120 fps the desktop
+// loop overslept 4-16 ms (median 3.7 ms) and then sent the next frames back to back; two frames
+// that land in one display refresh show as one on the phone. A high-resolution waitable timer
+// (Windows 10 1803+) wakes within about half a millisecond; older systems fall back to sleep_until.
+void pace_until(std::chrono::steady_clock::time_point target) {
+    struct Timer {
+        HANDLE h = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        ~Timer() { if (h) CloseHandle(h); }
+    };
+    thread_local Timer timer;
+    for (;;) {
+        auto left = target - std::chrono::steady_clock::now();
+        if (left <= std::chrono::steady_clock::duration::zero())
+            return;
+        LARGE_INTEGER due;
+        due.QuadPart = -std::max<long long>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(left).count() / 100);
+        if (!timer.h || !SetWaitableTimer(timer.h, &due, 0, nullptr, nullptr, FALSE) ||
+            WaitForSingleObject(timer.h, INFINITE) != WAIT_OBJECT_0) {
+            std::this_thread::sleep_until(target);
+            return;
+        }
+    }
+}
+} // namespace
 struct Host::Impl {
     fs::path state;
     Identity identity;
@@ -1071,7 +1099,10 @@ struct Host::Impl {
                 auto now = std::chrono::steady_clock::now();
                 if (next_frame + frame_period < now)
                     next_frame = now;
-                std::this_thread::sleep_until(next_frame);
+                // A late frame is not chased with one right behind it: captures stay at least 3/4 of a
+                // period apart, so a hiccup costs one slightly late frame instead of a doubled refresh.
+                next_frame = std::max(next_frame, began + frame_period * 3 / 4);
+                pace_until(next_frame);
             }
         } catch (const Error& error) {
             try {
