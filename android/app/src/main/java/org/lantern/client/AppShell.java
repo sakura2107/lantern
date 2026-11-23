@@ -4,6 +4,8 @@ import android.content.res.Configuration;
 import android.os.Build;
 import android.text.TextUtils;
 import android.view.*;
+import android.view.animation.DecelerateInterpolator;
+import android.view.animation.OvershootInterpolator;
 import android.widget.*;
 import java.util.*;
 
@@ -23,11 +25,14 @@ final class AppShell {
     final View[] nav = new View[4];
     final TextView title, connection, status;
     final View connectionDot, snackbar;
+    final LinearLayout connectionChip;
     final TextView[] navLabel = new TextView[4];
     final Glyph[] navGlyph = new Glyph[4];
     final View[] navPill = new View[4];
     final TextView transferBadge;
     LinearLayout navigation;
+    int lastBadge = -1;
+    boolean ready;
 
     final DevicePage device;
     final DesktopPage desktop;
@@ -71,30 +76,34 @@ final class AppShell {
             return i;
         });
 
-        // App bar: page title on the left, live connection chip on the right.
+        // App bar: page title on the left, live connection pill on the right.
         LinearLayout bar = Ui.row(a);
-        bar.setPadding(Theme.dp(20), Theme.dp(10), Theme.dp(16), Theme.dp(6));
-        bar.setMinimumHeight(Theme.dp(60));
+        bar.setPadding(Theme.dp(20), Theme.dp(12), Theme.dp(16), Theme.dp(8));
+        bar.setMinimumHeight(Theme.dp(62));
         title = Ui.medium(a, S.APP_NAME, 26, Theme.INK);
+        title.setLetterSpacing(-0.02f);
         Ui.oneLine(title);
         title.setAccessibilityHeading(true);
         bar.addView(title, Ui.weight(1));
         LinearLayout chip = Ui.row(a);
-        chip.setPadding(Theme.dp(10), 0, Theme.dp(12), 0);
+        chip.setPadding(Theme.dp(11), 0, Theme.dp(13), 0);
         chip.setMinimumHeight(Theme.dp(36));
-        chip.setBackground(Ui.press(Ui.outline(Theme.SURFACE, Theme.LINE, 18), 18));
+        chip.setBackground(Ui.press(Ui.outline(Theme.SURFACE, Theme.RIM, 1f, 50), 50));
+        chip.setElevation(Theme.dp(1));
         connectionDot = new View(a);
         chip.addView(connectionDot, Ui.lp(Theme.dp(8), Theme.dp(8)));
-        connection = Ui.medium(a, S.STATE_UNPAIRED, 13, Theme.INK);
+        connection = Ui.medium(a, S.STATE_UNPAIRED, 12.5f, Theme.INK);
         Ui.oneLine(connection);
         connection.setMaxWidth(Theme.dp(170));
         LinearLayout.LayoutParams cp = Ui.lp(-2, -2);
-        cp.setMarginStart(Theme.dp(8));
+        cp.setMarginStart(Theme.dp(7));
         chip.addView(connection, cp);
         chip.setOnClickListener(v -> select(DEVICE));
         chip.setFocusable(true);
         Ui.role(chip, Button.class);
+        Ui.bounce(chip, 0.96f);
         Ui.id(chip, "shell.connection");
+        connectionChip = chip;
         bar.addView(chip, Ui.lp(-2, -2));
         root.addView(bar, Ui.lp(-1, -2));
 
@@ -118,27 +127,35 @@ final class AppShell {
 
         // Transient message bar above the navigation. Errors stay longer; tap dismisses.
         LinearLayout bubble = Ui.row(a);
-        bubble.setPadding(Theme.dp(16), Theme.dp(12), Theme.dp(16), Theme.dp(12));
-        bubble.setBackground(Ui.round(Theme.INK, 16));
-        status = Ui.text(a, "", 14, Theme.ON_INK);
+        bubble.setPadding(Theme.dp(15), Theme.dp(12), Theme.dp(16), Theme.dp(12));
+        bubble.setBackground(Theme.dark ? Ui.outline(Theme.SURFACE_RAISED, Theme.RIM, 1f, 18) : Ui.round(Theme.INK, 18));
+        View snackDot = new View(a);
+        snackDot.setBackground(Ui.round(Theme.LAMP, 4));
+        LinearLayout.LayoutParams sdp = Ui.lp(Theme.dp(7), Theme.dp(7));
+        sdp.setMarginEnd(Theme.dp(10));
+        bubble.addView(snackDot, sdp);
+        status = Ui.text(a, "", 13.5f, Theme.dark ? Theme.INK : Theme.ON_INK);
         status.setMaxLines(3);
         status.setEllipsize(TextUtils.TruncateAt.END);
         status.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         bubble.addView(status, Ui.weight(1));
         FrameLayout.LayoutParams sp = new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM);
-        sp.setMargins(Theme.dp(12), 0, Theme.dp(12), Theme.dp(12));
+        sp.setMargins(Theme.dp(14), 0, Theme.dp(14), Theme.dp(12));
         pages.addView(bubble, sp);
         bubble.setVisibility(View.GONE);
-        bubble.setElevation(Theme.dp(6));
+        bubble.setElevation(Theme.dp(8));
         snackbar = bubble;
-        hideSnackbar = () -> snackbar.animate().alpha(0).setDuration(180).withEndAction(() -> snackbar.setVisibility(View.GONE));
+        hideSnackbar = () -> snackbar.animate().alpha(0f).translationY(Theme.dp(10)).setDuration(160)
+            .withEndAction(() -> snackbar.setVisibility(View.GONE)).start();
         bubble.setOnClickListener(v -> { v.removeCallbacks(hideSnackbar); hideSnackbar.run(); });
 
         // Bottom navigation.
-        root.addView(Ui.hairline(a), Ui.lp(-1, Math.max(1, Theme.dp(0.5f))));
+        View navBorder = new View(a);
+        navBorder.setBackgroundColor(Theme.dark ? Theme.RIM : Theme.LINE);
+        root.addView(navBorder, Ui.lp(-1, Math.max(1, Theme.dp(0.75f))));
         navigation = Ui.row(a);
         navigation.setBackgroundColor(Theme.SURFACE);
-        navigation.setPadding(Theme.dp(6), Theme.dp(6), Theme.dp(6), Theme.dp(4));
+        navigation.setPadding(Theme.dp(8), Theme.dp(6), Theme.dp(8), Theme.dp(4));
         String[] labels = {S.TAB_DEVICE, S.TAB_DESKTOP, S.TAB_FILES, S.TAB_TRANSFERS};
         int[] glyphs = {Glyph.PHONE, Glyph.DESKTOP, Glyph.FOLDER, Glyph.TRANSFER};
         String[] ids = {"nav.device", "nav.desktop", "nav.files", "nav.transfers"};
@@ -147,27 +164,29 @@ final class AppShell {
             final int tab = i;
             LinearLayout item = Ui.column(a);
             item.setGravity(Gravity.CENTER_HORIZONTAL);
-            item.setPadding(0, Theme.dp(4), 0, Theme.dp(2));
+            item.setPadding(0, Theme.dp(5), 0, Theme.dp(3));
             FrameLayout iconBox = new FrameLayout(a);
             View pill = new View(a);
-            iconBox.addView(pill, new FrameLayout.LayoutParams(Theme.dp(56), Theme.dp(30), Gravity.CENTER));
+            pill.setBackground(Ui.outline(Theme.NAV_PILL, Theme.alpha(Theme.LAMP, 0.28f), 1f, 16));
+            pill.setAlpha(0f);
+            iconBox.addView(pill, new FrameLayout.LayoutParams(Theme.dp(58), Theme.dp(32), Gravity.CENTER));
             ImageView icon = new ImageView(a);
-            navGlyph[i] = new Glyph(glyphs[i], Theme.MUTED);
+            navGlyph[i] = new Glyph(glyphs[i], Theme.MUTED, Theme.dp(21));
             icon.setImageDrawable(navGlyph[i]);
-            iconBox.addView(icon, new FrameLayout.LayoutParams(Theme.dp(22), Theme.dp(22), Gravity.CENTER));
+            iconBox.addView(icon, new FrameLayout.LayoutParams(Theme.dp(21), Theme.dp(21), Gravity.CENTER));
             if (i == TRANSFERS) {
-                badge = Ui.medium(a, "", 10, 0xff1b2430);
+                badge = Ui.numeric(Ui.medium(a, "", 10, Theme.ON_LAMP));
                 badge.setGravity(Gravity.CENTER);
-                badge.setMinWidth(Theme.dp(16));
+                badge.setMinWidth(Theme.dp(17));
                 badge.setPadding(Theme.dp(4), 0, Theme.dp(4), 0);
-                badge.setBackground(Ui.round(Theme.LAMP, 8));
+                badge.setBackground(Ui.outline(Theme.LAMP, Theme.SURFACE, 1.5f, 9));
                 badge.setVisibility(View.GONE);
-                iconBox.addView(badge, new FrameLayout.LayoutParams(-2, Theme.dp(16), Gravity.CENTER));
-                badge.setTranslationX(Theme.dp(13));
+                iconBox.addView(badge, new FrameLayout.LayoutParams(-2, Theme.dp(17), Gravity.CENTER));
+                badge.setTranslationX(Theme.dp(14));
                 badge.setTranslationY(-Theme.dp(9));
             }
             item.addView(iconBox, Ui.lp(-1, Theme.dp(32)));
-            TextView label = Ui.medium(a, labels[i], 12, Theme.MUTED);
+            TextView label = Ui.medium(a, labels[i], 11.5f, Theme.MUTED);
             label.setPadding(0, Theme.dp(4), 0, 0);
             label.setGravity(Gravity.CENTER_HORIZONTAL);
             item.addView(label, Ui.lp(-1, -2));
@@ -184,20 +203,60 @@ final class AppShell {
         root.addView(navigation, Ui.lp(-1, -2));
         setConnection(UNPAIRED, "");
         select(DEVICE);
+        ready = true;
         root.requestFocus(); // keep the soft keyboard closed until a field is tapped
     }
 
     void select(int tab) {
+        int previous = selected;
         if (tab != DESKTOP) {
             if (a.screen != null) a.screen.cancelDrag();
             if (a.keyboard != null) a.keyboard.close();
         }
         selected = tab;
+        boolean animate = ready && tab != previous;
+        int activeGlyphColor = Theme.dark ? Theme.LAMP : Theme.LAMP_TEXT;
         for (int i = 0; i < 4; i++) {
             boolean on = i == tab;
-            page[i].setVisibility(on ? View.VISIBLE : View.GONE);
-            navPill[i].setBackground(on ? Ui.round(Theme.INSET, 15) : null);
-            navGlyph[i].setColor(on ? Theme.INK : Theme.MUTED);
+            View p = page[i];
+            p.animate().cancel();
+            if (on) {
+                p.setVisibility(View.VISIBLE);
+                if (animate) {
+                    p.setAlpha(0f);
+                    p.setTranslationY(Theme.dp(8));
+                    p.animate().alpha(1f).translationY(0f).setDuration(145)
+                        .setInterpolator(new DecelerateInterpolator(1.8f)).start();
+                } else {
+                    p.setAlpha(1f);
+                    p.setTranslationY(0f);
+                }
+            } else {
+                p.setAlpha(1f);
+                p.setTranslationY(0f);
+                p.setVisibility(View.GONE);
+            }
+            View pill = navPill[i];
+            pill.animate().cancel();
+            if (on) {
+                if (animate) {
+                    pill.setScaleX(0.68f);
+                    pill.setAlpha(0f);
+                    pill.animate().scaleX(1f).alpha(1f).setDuration(180)
+                        .setInterpolator(new OvershootInterpolator(1.3f)).start();
+                } else {
+                    pill.setScaleX(1f);
+                    pill.setAlpha(1f);
+                }
+            } else {
+                if (animate && pill.getAlpha() > 0f) {
+                    pill.animate().alpha(0f).scaleX(0.75f).setDuration(110).start();
+                } else {
+                    pill.setAlpha(0f);
+                    pill.setScaleX(0.75f);
+                }
+            }
+            navGlyph[i].setColor(on ? activeGlyphColor : Theme.MUTED);
             navLabel[i].setTextColor(on ? Theme.INK : Theme.MUTED);
             nav[i].setSelected(on);
         }
@@ -212,8 +271,17 @@ final class AppShell {
         status.setText(text);
         snackbar.removeCallbacks(hideSnackbar);
         snackbar.animate().cancel();
-        snackbar.setAlpha(1);
+        boolean wasHidden = snackbar.getVisibility() != View.VISIBLE;
         snackbar.setVisibility(View.VISIBLE);
+        if (wasHidden) {
+            snackbar.setAlpha(0f);
+            snackbar.setTranslationY(Theme.dp(12));
+            snackbar.animate().alpha(1f).translationY(0f).setDuration(180)
+                .setInterpolator(new DecelerateInterpolator(1.8f)).start();
+        } else {
+            snackbar.setAlpha(1f);
+            snackbar.setTranslationY(0f);
+        }
         snackbar.postDelayed(hideSnackbar, Math.min(7000, 3200 + text.length() * 45L));
     }
 
@@ -225,6 +293,14 @@ final class AppShell {
         int dot = state == CONNECTED ? Theme.LAMP : state == CONNECTING ? Theme.LAMP_SOFT
                   : state == FAILED || state == INVALID ? Theme.DANGER : Theme.FAINT;
         connectionDot.setBackground(Ui.round(dot, 4));
+        int chipFill = state == CONNECTED ? (Theme.dark ? 0xff1c1c18 : 0xfffff8eb)
+                       : state == FAILED || state == INVALID ? Theme.DANGER_SOFT : Theme.SURFACE;
+        int chipStroke = state == CONNECTED ? Theme.LAMP_GLOW
+                         : state == CONNECTING ? Theme.alpha(Theme.LAMP, 0.35f)
+                         : state == FAILED || state == INVALID ? Theme.alpha(Theme.DANGER, 0.35f) : Theme.RIM;
+        connectionChip.setBackground(Ui.press(Ui.outline(chipFill, chipStroke, 1f, 50), 50));
+        connection.setTextColor(state == CONNECTED ? Theme.LAMP_TEXT
+                                : state == FAILED || state == INVALID ? Theme.DANGER : Theme.INK);
         device.setConnection(state, address);
         desktop.connectionChanged();
         files.updateEmpty();
@@ -236,8 +312,10 @@ final class AppShell {
     void renderFiles(List<Remote.Entry> items, boolean selecting) { files.render(items, selecting); }
 
     void transferBadge(int active) {
+        if (active == lastBadge) return;
+        lastBadge = active;
         transferBadge.setVisibility(active > 0 ? View.VISIBLE : View.GONE);
-        transferBadge.setText(active > 9 ? "9+" : String.valueOf(active));
+        if (active > 0) transferBadge.setText(active > 9 ? "9+" : String.valueOf(active));
         nav[TRANSFERS].setContentDescription(active > 0 ? S.TAB_TRANSFERS + "，" + String.format(Locale.ROOT, S.ACTIVE_COUNT, active) : S.TAB_TRANSFERS);
     }
 

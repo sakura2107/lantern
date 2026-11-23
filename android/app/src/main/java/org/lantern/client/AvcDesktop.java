@@ -52,14 +52,109 @@ final class AvcDesktop implements AutoCloseable {
     final Thread worker;
     final AtomicBoolean framePosted = new AtomicBoolean();
     final AtomicBoolean render = new AtomicBoolean(true);
+
+    /**
+     * WP-PERF-02: deduplicates steady-state quality snapshots and coalesces bursts into a single
+     * pending main-thread slot, guaranteeing first-frame delivery per epoch with zero lost updates.
+     */
+    static final class QualityPublisher {
+        interface Poster { void post(Runnable r); }
+        interface Sink { void accept(long epoch, Object context, DesktopSession.Status status); }
+        private final Poster poster;
+        private final Sink sink;
+        private long lastEpoch = -1, pendingEpoch = -1;
+        private DesktopSession.Status lastSent, pendingStatus;
+        private Object pendingContext;
+        private boolean scheduled;
+        long postedCount;
+
+        QualityPublisher(Poster poster, Sink sink) {
+            this.poster = poster;
+            this.sink = sink;
+        }
+
+        boolean publish(long epoch, Object context, DesktopSession.Status status) {
+            if (status == null) return false;
+            boolean needPost;
+            synchronized (this) {
+                if (epoch == lastEpoch && status.sameAs(lastSent)) return false;
+                lastEpoch = epoch;
+                lastSent = status;
+                pendingEpoch = epoch;
+                pendingContext = context;
+                pendingStatus = status;
+                needPost = !scheduled;
+                if (needPost) {
+                    scheduled = true;
+                    postedCount++;
+                }
+            }
+            if (needPost) poster.post(this::drain);
+            return needPost;
+        }
+
+        synchronized void clearEpoch(long epoch) {
+            if (pendingEpoch == epoch) {
+                pendingStatus = null;
+                pendingContext = null;
+                pendingEpoch = -1;
+            }
+        }
+
+        private void drain() {
+            while (true) {
+                long epoch;
+                Object ctx;
+                DesktopSession.Status status;
+                synchronized (this) {
+                    status = pendingStatus;
+                    epoch = pendingEpoch;
+                    ctx = pendingContext;
+                    pendingStatus = null;
+                    pendingContext = null;
+                    pendingEpoch = -1;
+                    if (status == null) {
+                        scheduled = false;
+                        return;
+                    }
+                }
+                sink.accept(epoch, ctx, status);
+            }
+        }
+    }
+
+    final QualityPublisher qualityPublisher;
     volatile Remote active;
     volatile DesktopSession activeSession;
-    final java.util.concurrent.ThreadPoolExecutor controls=new java.util.concurrent.ThreadPoolExecutor(
-        1,1,0,java.util.concurrent.TimeUnit.MILLISECONDS,new java.util.concurrent.ArrayBlockingQueue<Runnable>(1),
-        r->new Thread(r,"Lantern desktop settings"),new java.util.concurrent.ThreadPoolExecutor.DiscardOldestPolicy());
-    void changeQuality(DesktopSession session,Profile profile,boolean idr){
-        controls.execute(()->{try{if(activeSession==session)session.setQuality(profile,idr);}catch(Exception error){
-            failure="画质调整失败："+error.getClass().getSimpleName();}});
+    final java.util.concurrent.ExecutorService controls=java.util.concurrent.Executors.newSingleThreadExecutor(
+        r->new Thread(r,"Lantern desktop settings"));
+    private DesktopSession pendingSession;
+    private Profile pendingProfile;
+    private boolean pendingIdr, controlRunning;
+
+    synchronized void changeQuality(DesktopSession session,Request request,boolean idr){
+        if(closed||activeSession!=session||desired!=request||session==null)return;
+        pendingIdr=idr||(pendingSession==session&&pendingIdr);
+        pendingSession=session;
+        pendingProfile=request.profile;
+        if(!controlRunning){
+            controlRunning=true;
+            controls.execute(this::sendControls);
+        }
+    }
+    private void sendControls(){
+        while(true){
+            DesktopSession session;
+            Profile profile;
+            boolean idr;
+            synchronized(this){
+                if(closed||pendingSession==null){controlRunning=false;return;}
+                session=pendingSession;profile=pendingProfile;idr=pendingIdr;
+                pendingSession=null;pendingProfile=null;pendingIdr=false;
+            }
+            try{if(activeSession==session)session.setQuality(profile,idr);}
+            catch(Exception error){if(activeSession==session)failure="画质调整失败："+error.getClass().getSimpleName();}
+        }
     }
     volatile java.net.Socket openingSocket;
     volatile Request desired;
@@ -97,6 +192,12 @@ final class AvcDesktop implements AutoCloseable {
     AvcDesktop(AvcView v, Events e) {
         view = v;
         events = e;
+        qualityPublisher = new QualityPublisher(main::post, (epoch, ctx, status) -> {
+            Object[] pair = (Object[])ctx;
+            Request req = (Request)pair[0];
+            AvcView.Target tgt = (AvcView.Target)pair[1];
+            if (current(req, tgt) && streamEpoch.get() == epoch) events.quality(status);
+        });
         notifications.start();
         codecEvents = new Handler(notifications.getLooper());
         worker = new Thread(this::loop, "Lantern H264 desktop");
@@ -110,7 +211,7 @@ synchronized void start(Remote.Credentials c, Profile p) {
         (failed != null && failed.credentials == c && failed.profile == p))
         return;
     if(desired!=null&&desired.credentials==c&&desired.profile.monitor==p.monitor&&activeSession!=null&&activeSession.version>=3){
-        desired.profile=p;changeQuality(activeSession,p,false);return;
+        desired.profile=p;changeQuality(activeSession,desired,false);return;
     }
     desired = new Request(c, p);desired.timeline=timelineSource.get();
     connection.failure(false);
@@ -243,6 +344,7 @@ void consume(Request request, AvcView.Target target) throws Exception {
         activeSession=session;request.absolute=session.version>=2;
         vsync.start();
         DesktopSession.Status format=session.status;
+        final Object qualityContext = new Object[] {request, target};
         codec=createDecoder(request,target,epoch,format,session.headers);
         failure="";
         session.ready();
@@ -250,21 +352,23 @@ void consume(Request request, AvcView.Target target) throws Exception {
         boolean waitingKeyframe=false;
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
         while (current(request, target)) {
+            // The first TCP packet after UDP fallback can bridge losses on the previous path.
+            boolean allowGap=session.allowsSequenceGap();
             DataInputStream packet = Remote.reader(session.packet());
             long next = packet.readLong(), pts = packet.readLong();
             int flags = packet.readInt();
-            DesktopSession.Status updated=session.metadata(packet);
-            byte[] data = Remote.blob(packet, session.version>=3?16*1024*1024-512:Remote.MAX-256);
+            boolean gap=next!=sequence+1;
+            if ((!allowGap&&gap) || next<=sequence || pts < 0 || pts > Long.MAX_VALUE / 1000 || pts <= lastPts ||
+                (flags & ~3) != 0)
+                throw new IOException("Desktop sequence, timestamp or flags invalid");
+            byte[] data=session.readFrameData(packet);
+            DesktopSession.Status updated=session.status;
+            if(gap&&!waitingKeyframe){changeQuality(session,request,true);waitingKeyframe=true;}
             if(updated.width!=format.width||updated.height!=format.height||updated.fps!=format.fps){
                 target.detach(codec);codec.stop();codec.release();codec=null;
                 codec=createDecoder(request,target,epoch,updated,session.headers);format=updated;
             }
-            if(session.version>=3)main.post(()->{if(current(request,target))events.quality(updated);});
-            boolean gap=next!=sequence+1;
-            if(session.version==4&&gap&&!waitingKeyframe){changeQuality(session,request.profile,true);waitingKeyframe=true;}
-            if ((session.version<4&&gap) || next<=sequence || pts < 0 || pts > Long.MAX_VALUE / 1000 || pts <= lastPts ||
-                (flags & ~3) != 0 || data.length == 0 || packet.available() != 0)
-                throw new IOException("Desktop sequence, timestamp or payload invalid");
+            if(session.version>=3)qualityPublisher.publish(epoch,qualityContext,updated);
             sequence = next;
             if(sequence>=request.profile.fps)request.attempts=0;
             lastPts = pts;
@@ -274,7 +378,7 @@ void consume(Request request, AvcView.Target target) throws Exception {
                 clock = now - pts * 1000;
             if (now - (clock + pts * 1000) > 300_000_000L+(request.absolute?request.timeline.videoDelayBudget(now):0)) {
                 clock=now-pts*1000;
-                if(!waitingKeyframe&&session.version>=3)changeQuality(session,request.profile,true);
+                if(!waitingKeyframe&&session.version>=3)changeQuality(session,request,true);
                 waitingKeyframe=true;
             }
             if(waitingKeyframe){if((flags&1)==0)continue;codec.flush();waitingKeyframe=false;}
@@ -292,7 +396,7 @@ void consume(Request request, AvcView.Target target) throws Exception {
                 break;
             if (input < 0){
                 codec.flush();waitingKeyframe=true;
-                if(session.version>=3)changeQuality(session,request.profile,true);
+                if(session.version>=3)changeQuality(session,request,true);
                 continue;
             }
             ByteBuffer buffer = codec.getInputBuffer(input);
@@ -305,6 +409,7 @@ void consume(Request request, AvcView.Target target) throws Exception {
         }
     } finally {
         vsync.stop();
+        qualityPublisher.clearEpoch(epoch);
         streamEpoch.compareAndSet(epoch,epoch+1);
         if (codec != null) {
             target.detach(codec);

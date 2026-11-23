@@ -97,17 +97,25 @@ final class MediaPlayback {
         }
         static String line(InputStream input,int[] budget)throws IOException{
             ByteArrayOutputStream bytes=new ByteArrayOutputStream();int previous=-1;
-            while(budget[0]-->0){int c=input.read();if(c<0)throw new EOFException();if(previous==13&&c==10){byte[] data=bytes.toByteArray();return new String(data,0,data.length-1,StandardCharsets.US_ASCII);}bytes.write(c);previous=c;}
+            while(budget[0]-->0){int c=input.read();if(c<0)throw new EOFException();if(previous==13&&c==10){byte[] data=bytes.toByteArray();return new String(data,0,data.length-1,StandardCharsets.US_ASCII);}if((c<32&&c!=9&&c!=13)||c==127||previous==13)throw new IOException("HTTP line");bytes.write(c);previous=c;}
             throw new IOException("HTTP header bound");
         }
         void serve(Socket peer){try(Socket socket=peer){
             int[] budget={8192};InputStream input=socket.getInputStream();String[] request=line(input,budget).split(" ");
             if(request.length!=3||(!request[0].equals("GET")&&!request[0].equals("HEAD"))||!request[2].startsWith("HTTP/1.")){reply(socket,400,"text/plain",new byte[0],false,0,0);return;}
-            String host=null,range=null;for(int n=0;n<64;n++){String header=line(input,budget);if(header.isEmpty())break;int colon=header.indexOf(':');if(colon<1)throw new IOException("HTTP header");
-                String name=header.substring(0,colon).trim().toLowerCase(Locale.ROOT),value=header.substring(colon+1).trim();if(name.equals("host"))host=value;if(name.equals("range"))range=value;}
-            // The random path token is the access check; players differ in how they spell the host.
-            String port=":"+server.getLocalPort();
-            if(host!=null&&!host.equals("127.0.0.1"+port)&&!host.equals("localhost"+port)&&!host.equals("127.0.0.1")&&!host.equals("localhost")||!request[1].startsWith("/"+token+"/")){reply(socket,404,"text/plain",new byte[0],false,0,0);return;}
+            String host=null,range=null;
+            while(true){
+                String header=line(input,budget);if(header.isEmpty())break;
+                int colon=header.indexOf(':');
+                if(colon<1||!header.substring(0,colon).matches("[a-zA-Z0-9!#$%&'*+.^_`|~\\-]+"))throw new IOException("HTTP field");
+                String name=header.substring(0,colon),value=header.substring(colon+1).trim();
+                if(name.equalsIgnoreCase("Host")){
+                    if(host!=null){reply(socket,400,"text/plain",new byte[0],false,0,0);return;}
+                    host=value;
+                }
+                if(name.equalsIgnoreCase("Range"))range=value;
+            }
+            if(!("127.0.0.1:"+server.getLocalPort()).equals(host)||!request[1].startsWith("/"+token+"/")){reply(socket,404,"text/plain",new byte[0],false,0,0);return;}
             String file=request[1].substring(token.length()+2);byte[] bytes;String mime;
             if(file.equals("index.m3u8")){bytes=playlist();mime="application/vnd.apple.mpegurl";}
             else if(file.matches("seg/[0-9]{1,5}\\.ts")){

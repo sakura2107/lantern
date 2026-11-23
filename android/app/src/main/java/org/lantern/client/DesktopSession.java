@@ -7,6 +7,13 @@ final class DesktopSession {
         final int width,height,fps,bitrate,selectedWidth;final String codec,path;
         final boolean constrained,dropping;
         Status(int w,int h,int f,int b,String c,String p,int selected,boolean limited,boolean drop){width=w;height=h;fps=f;bitrate=b;codec=c;path=p;selectedWidth=selected;constrained=limited;dropping=drop;}
+        boolean sameAs(Status o) {
+            return o != null && width == o.width && height == o.height && fps == o.fps && bitrate == o.bitrate &&
+                   selectedWidth == o.selectedWidth && constrained == o.constrained && dropping == o.dropping &&
+                   Objects.equals(codec, o.codec) && Objects.equals(path, o.path);
+        }
+        @Override public boolean equals(Object obj) { return obj == this || (obj instanceof Status && sameAs((Status)obj)); }
+        @Override public int hashCode() { return Objects.hash(width, height, fps, bitrate, selectedWidth, codec, path, constrained, dropping); }
     }
     static final class Display {
         final int index,width,height,refresh;final String name;final boolean avc,hevc;
@@ -65,14 +72,24 @@ final class DesktopSession {
     static void validate(int w,int h,int f,int b)throws IOException {
         if(w<160||w>3840||h<1||h>2160||f<1||f>120||b<250000||b>160000000)throw new IOException("Desktop codec bounds");
     }
-    /** Reads v3 metadata before the encoded frame. Caller reconfigures decoder on dimensions changing. */
-    Status metadata(DataInputStream packet)throws IOException {
-        if(version<3)return status;
-        int w=packet.readInt(),h=packet.readInt(),f=packet.readInt(),b=packet.readInt();String c=Remote.str(packet);
-        byte[] csd=Remote.blob(packet,65536);int selected=packet.readInt(),limited=packet.readInt(),drop=packet.readInt();validate(w,h,f,b);
-        if(!c.equals(codec)||limited<0||limited>1||drop<0||drop>1)throw new IOException("Desktop metadata");
-        if(csd.length>0)headers=csd;
-        return status=new Status(w,h,f,b,c,usingUdp?"udp":"tcp",selected,limited==1,drop==1);
+    /** Commit decoder headers and the public quality snapshot only for a complete frame. */
+    byte[] readFrameData(DataInputStream packet)throws IOException {
+        Status updated=status;
+        byte[] csd=null;
+        if(version>=3){
+            int w=packet.readInt(),h=packet.readInt(),f=packet.readInt(),b=packet.readInt();
+            String c=Remote.str(packet);
+            csd=Remote.blob(packet,65536);
+            int selected=packet.readInt(),limited=packet.readInt(),drop=packet.readInt();
+            validate(w,h,f,b);
+            if(!c.equals(codec)||limited<0||limited>1||drop<0||drop>1)throw new IOException("Desktop metadata");
+            updated=new Status(w,h,f,b,c,usingUdp?"udp":"tcp",selected,limited==1,drop==1);
+        }
+        byte[] data=Remote.blob(packet,version>=3?16*1024*1024-512:Remote.MAX-256);
+        if(data.length==0||packet.available()!=0)throw new IOException("Desktop payload invalid");
+        if(csd!=null&&csd.length>0)headers=csd;
+        status=updated;
+        return data;
     }
     void ready()throws Exception {
         boolean requested=false;
@@ -82,9 +99,10 @@ final class DesktopSession {
         if(version>=4){DataInputStream path=Remote.reader(remote.receive(61));String value=Remote.str(path);
             if(path.available()!=0||(!value.equals("udp")&&!value.equals("tcp")))throw new IOException("Media path");usingUdp=value.equals("udp");}
     }
+    boolean allowsSequenceGap(){return version>=4&&usingUdp;}
     byte[] packet()throws Exception {
         if(usingUdp){
-            try{return Native.response(33,udp.receive());}
+            try{return Native.response(33,udp.receive(status.fps));}
             catch(java.net.SocketException|java.net.SocketTimeoutException unavailable){
                 udp.close();usingUdp=false;DataInputStream path=Remote.reader(remote.receive(61));
                 if(!Remote.str(path).equals("tcp")||path.available()!=0)throw new IOException("TCP fallback path");

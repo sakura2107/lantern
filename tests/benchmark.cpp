@@ -154,34 +154,104 @@ int wmain(int argc, wchar_t** argv) {
             std::rethrow_exception(transfer_error);
         double parallel_s = seconds(parallel_start);
         std::sort(parallel_latency.begin(), parallel_latency.end());
+        constexpr uint64_t large_file_bytes = 64ull * 1024 * 1024;
+        constexpr uint64_t small_file_count = 100;
+        constexpr uint64_t small_file_bytes = 4096;
+        constexpr uint64_t small_total_bytes = small_file_count * small_file_bytes;
+        constexpr uint64_t scheduler_aggregate_bytes_per_s = 40ull * 1024 * 1024;
+        constexpr uint64_t scheduler_burst_bytes = 32768;
+        constexpr uint64_t transfer_pipeline_blocks = 4;
+        constexpr uint64_t transfer_window_bytes = transfer_pipeline_blocks * uint64_t(chunk_size);
+        const uint64_t resume_remaining_bytes = resumed <= large_file_bytes ? large_file_bytes - resumed : 0;
+        const auto mib_per_s = [](uint64_t bytes, double s) {
+            return s > 0 ? (double(bytes) / (1024.0 * 1024.0)) / s : 0.0;
+        };
         PROCESS_MEMORY_COUNTERS memory{};
         GetProcessMemoryInfo(GetCurrentProcess(), &memory, sizeof(memory));
         std::ofstream report(argv[2]);
         report
             << std::fixed << std::setprecision(3)
-            << "{\n  \"kind\": \"measured\",\n  \"network\": \"Windows loopback, same machine, shared budget "
-               "40 MiB/s bulk share 25 percent\",\n  \"file_bytes\": 67108864,\n  \"connect_tls_auth_ms\": "
-            << connect_ms << ",\n  \"download_with_hash_flush_commit_s\": " << download_s
-            << ",\n  \"download_MiB_per_s\": " << 64 / download_s
+            << "{\n  \"kind\": \"measured\",\n"
+               "  \"network\": \"Windows loopback, same machine, LinkScheduler 40 MiB/s shared weighted aggregate\",\n"
+               "  \"scheduler\": {\n"
+               "    \"policy\": \"weighted_fair_aggregate\",\n"
+               "    \"aggregate_rate_bytes_per_s\": "
+            << scheduler_aggregate_bytes_per_s
+            << ",\n    \"burst_bytes\": " << scheduler_burst_bytes
+            << ",\n    \"weights\": {\"input\": 32, \"audio\": 16, \"desktop\": 8, \"media\": 4, \"bulk\": 1}\n"
+               "  },\n"
+               "  \"transfer_window\": {\n"
+               "    \"chunk_bytes\": "
+            << chunk_size
+            << ",\n    \"pipeline_blocks\": " << transfer_pipeline_blocks
+            << ",\n    \"in_flight_window_bytes\": " << transfer_window_bytes
+            << "\n  },\n"
+               "  \"workload\": {\n"
+               "    \"large_file_bytes\": "
+            << large_file_bytes
+            << ",\n    \"small_file_count\": " << small_file_count
+            << ",\n    \"small_file_bytes\": " << small_file_bytes
+            << ",\n    \"small_total_bytes\": " << small_total_bytes
+            << ",\n    \"desktop_frames_requested\": 60,\n"
+               "    \"desktop_path\": \"legacy_jpeg_pull_1920_q70\"\n"
+               "  },\n"
+               "  \"measurement_boundaries\": {\n"
+               "    \"download\": \"includes_tls_transfer_disk_write_batch_flush_sha256_verify_and_commit\",\n"
+               "    \"upload\": \"includes_source_sha256_tls_transfer_host_chunk_flush_host_sha256_verify_and_commit\",\n"
+               "    \"small_files\": \"includes_per_file_stat_download_flush_sha256_verify_and_commit\",\n"
+               "    \"resume\": \"includes_tls_reconnect_auth_remaining_download_flush_sha256_verify_and_commit\",\n"
+               "    \"parallel_download\": \"includes_tls_connect_auth_download_flush_sha256_commit_concurrent_with_jpeg_pull\"\n"
+               "  },\n"
+               "  \"payload_and_time\": {\n"
+               "    \"download\": {\"payload_bytes\": "
+            << large_file_bytes << ", \"seconds\": " << download_s
+            << ", \"MiB_per_s\": " << mib_per_s(large_file_bytes, download_s)
+            << ", \"includes_sha_flush_commit\": true},\n"
+               "    \"upload\": {\"payload_bytes\": "
+            << large_file_bytes << ", \"seconds\": " << upload_s
+            << ", \"MiB_per_s\": " << mib_per_s(large_file_bytes, upload_s)
+            << ", \"includes_sha_flush_commit\": true},\n"
+               "    \"small_files\": {\"files\": "
+            << small_file_count << ", \"payload_bytes\": " << small_total_bytes << ", \"seconds\": " << small_s
+            << ", \"MiB_per_s\": " << mib_per_s(small_total_bytes, small_s)
+            << ", \"includes_sha_flush_commit\": true},\n"
+               "    \"resume\": {\"resumed_from_bytes\": "
+            << resumed << ", \"payload_bytes\": " << resume_remaining_bytes << ", \"seconds\": " << resume_s
+            << ", \"MiB_per_s\": " << mib_per_s(resume_remaining_bytes, resume_s)
+            << ", \"includes_sha_flush_commit\": true},\n"
+               "    \"parallel_download\": {\"payload_bytes\": "
+            << large_file_bytes << ", \"seconds\": " << parallel_s
+            << ", \"MiB_per_s\": " << mib_per_s(large_file_bytes, parallel_s)
+            << ", \"includes_sha_flush_commit\": true},\n"
+               "    \"desktop_jpeg\": {\"frames\": "
+            << latency.size() << ", \"payload_bytes\": " << jpeg_bytes << ", \"seconds\": " << capture_s
+            << "}\n  },\n"
+               "  \"file_bytes\": "
+            << large_file_bytes << ",\n  \"connect_tls_auth_ms\": " << connect_ms
+            << ",\n  \"download_with_hash_flush_commit_s\": " << download_s
+            << ",\n  \"download_MiB_per_s\": " << mib_per_s(large_file_bytes, download_s)
             << ",\n  \"upload_with_hash_flush_commit_s\": " << upload_s
-            << ",\n  \"upload_MiB_per_s\": " << 64 / upload_s << ",\n  \"standalone_SHA256_s\": " << hash_s
+            << ",\n  \"upload_MiB_per_s\": " << mib_per_s(large_file_bytes, upload_s)
+            << ",\n  \"standalone_SHA256_s\": " << hash_s
             << ",\n  \"both_directions_verified\": " << (verified ? "true" : "false")
             << ",\n  \"small_100_x_4KiB_download_s\": " << small_s
             << ",\n  \"resume_offset_bytes\": " << resumed
+            << ",\n  \"resume_remaining_bytes\": " << resume_remaining_bytes
             << ",\n  \"reconnect_plus_resume_remaining_56MiB_s\": " << resume_s
             << ",\n  \"desktop_frames\": " << latency.size()
             << ",\n  \"desktop_request_capture_encode_tls_fps\": "
-            << (capture_s ? latency.size() / capture_s : 0)
-            << ",\n  \"desktop_request_ms_p50\": " << (latency.empty() ? 0 : latency[latency.size() / 2])
+            << (capture_s > 0 ? latency.size() / capture_s : 0.0)
+            << ",\n  \"desktop_request_ms_p50\": " << (latency.empty() ? 0.0 : latency[latency.size() / 2])
             << ",\n  \"desktop_request_ms_p95\": "
-            << (latency.empty() ? 0 : latency[size_t((latency.size() - 1) * .95)])
+            << (latency.empty() ? 0.0 : latency[size_t((latency.size() - 1) * .95)])
             << ",\n  \"desktop_total_jpeg_bytes\": " << jpeg_bytes
             << ",\n  \"desktop_available\": " << (desktop_error.empty() ? "true" : "false")
             << ",\n  \"parallel_64MiB_download_s\": " << parallel_s
             << ",\n  \"parallel_desktop_frames\": " << parallel_latency.size()
-            << ",\n  \"parallel_desktop_request_fps\": " << parallel_latency.size() / parallel_s
+            << ",\n  \"parallel_desktop_request_fps\": "
+            << (parallel_s > 0 ? parallel_latency.size() / parallel_s : 0.0)
             << ",\n  \"parallel_desktop_request_ms_p95\": "
-            << (parallel_latency.empty() ? 0 : parallel_latency[size_t((parallel_latency.size() - 1) * .95)])
+            << (parallel_latency.empty() ? 0.0 : parallel_latency[size_t((parallel_latency.size() - 1) * .95)])
             << ",\n  \"benchmark_combined_peak_working_set_bytes\": " << memory.PeakWorkingSetSize
             << ",\n  \"unmeasured\": [\"desktop presentation latency\",\"audio\",\"GPU "
                "utilization\",\"Android thermal\",\"4K decode/playback\",\"physical LAN\"]\n}\n";

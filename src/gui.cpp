@@ -126,9 +126,8 @@ QualityStatus live_quality;                     // under link_mutex
 bool live_quality_valid = false;                // under link_mutex
 std::vector<DisplayLimits> host_limits;         // under link_mutex
 std::shared_ptr<DesktopConnection> live_desktop; // under link_mutex: online quality changes go here
-std::chrono::steady_clock::time_point constrained_since{}; // UI thread
 std::wstring banner_text;                       // UI thread
-int banner_action = 0;                          // 1 reconnect, 2 one step lower
+int banner_action = 0;                          // 1 reconnect
 /** Control: one reliable channel per control session (UI thread). Full channel = ordered backlog. */
 struct PendingInput {
     Op op;
@@ -690,7 +689,6 @@ void apply_quality() {
         std::lock_guard lock(link_mutex);
         live = live_desktop;
     }
-    constrained_since = {};
     auto q = quality_settings();
     if (live && live->online_quality())
         enqueue([live, q] { live->set_quality(q, true); });
@@ -699,29 +697,6 @@ void apply_quality() {
         video_connection.interrupt();
     }
     status(L"画质已切换为 " + quality_name());
-}
-/** One step down from a fixed choice the network cannot carry; returns "" when already lowest. */
-std::wstring lower_quality_name() {
-    if (target_auto)
-        return L"";
-    for (int i = 0; i < 3; ++i)
-        if (target_width >= quality_widths[i])
-            return tier_name(quality_widths[i + 1]) + std::to_wstring(target_fps.load());
-    return target_fps > 30 ? tier_name(target_width) + std::to_wstring(target_fps == 120 ? 60 : 30) : L"";
-}
-void lower_quality() {
-    for (int i = 0; i < 3; ++i)
-        if (target_width >= quality_widths[i]) {
-            target_width = quality_widths[i + 1];
-            fill_quality_combos();
-            apply_quality();
-            return;
-        }
-    if (target_fps > 30) {
-        target_fps = target_fps == 120 ? 60 : 30;
-        fill_quality_combos();
-        apply_quality();
-    }
 }
 /** “重新连接”: restarts every channel that is switched on, with the same authorization. */
 void reconnect_links() {
@@ -751,8 +726,6 @@ void update_banner() {
     auto now = std::chrono::steady_clock::now();
     uint64_t worst = 0;
     bool lost = false, control_ended = false;
-    QualityStatus q;
-    bool quality_known = false;
     {
         std::lock_guard lock(link_mutex);
         bool on[3] = {subscribed.load(), audio_on.load(), control_on.load()};
@@ -767,8 +740,6 @@ void update_banner() {
             worst = std::max(worst, elapsed);
             lost |= l.phase == ConnectionPhase::disconnected || elapsed >= 30000;
         }
-        q = live_quality;
-        quality_known = live_quality_valid;
     }
     if (control_ended) {
         release_control();
@@ -777,13 +748,6 @@ void update_banner() {
         update_banner();
         return;
     }
-    bool short_ = false;
-    if (quality_known && subscribed && !target_auto && (q.constrained || q.dropping)) {
-        if (constrained_since == std::chrono::steady_clock::time_point{})
-            constrained_since = now;
-        short_ = now - constrained_since >= std::chrono::seconds(3);
-    } else
-        constrained_since = {};
     std::wstring text, button;
     int action = 0;
     if (lost) {
@@ -794,14 +758,6 @@ void update_banner() {
         text = L"网络波动，正在恢复… " + std::to_wstring(worst / 1000) + L" 秒";
     else if (worst >= 1000)
         text = L"网络波动，正在恢复…";
-    else if (short_) {
-        text = L"网络跑不满 " + quality_name();
-        auto lower = lower_quality_name();
-        if (!lower.empty()) {
-            button = L"降到 " + lower;
-            action = 2;
-        }
-    }
     if (text != banner_text || action != banner_action) {
         bool relayout = text.empty() != banner_text.empty() || (action == 0) != (banner_action == 0);
         banner_text = text;
@@ -813,7 +769,7 @@ void update_banner() {
         else
             InvalidateRect(ctl(134), nullptr, TRUE);
     }
-    if (worst > 0 || (constrained_since != std::chrono::steady_clock::time_point{} && !short_))
+    if (worst > 0)
         SetTimer(window, 7, 500, nullptr);
 }
 void refresh_state() {
@@ -1770,8 +1726,6 @@ void command(int id) {
     } else if (id == 134) {
         if (banner_action == 1)
             reconnect_links();
-        else if (banner_action == 2)
-            lower_quality();
         update_banner();
     } else if (id == 26) {
         zoom = 1;

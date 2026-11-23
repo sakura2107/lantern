@@ -1,4 +1,5 @@
 #include "lantern/win.hpp"
+#include "tls_test.hpp"
 #include <schannel.h>
 #include <security.h>
 #include <wincrypt.h>
@@ -216,12 +217,20 @@ struct Tls::Impl {
     CredHandle cred{};
     CtxtHandle context{};
     bool has_cred = false, has_context = false;
+    TlsFirstSendProbe* first_send_probe = nullptr;
     SecPkgContext_StreamSizes sizes{};
     Bytes encrypted, plain;
+    // Connection-private send scratch buffer; TLS send direction has a single writer per connection.
+    Bytes send_record;
     size_t plain_at = 0;
     ~Impl() {
-        if (has_context)
+        if (!send_record.empty())
+            SecureZeroMemory(send_record.data(), send_record.size());
+        if (has_context) {
             DeleteSecurityContext(&context);
+            if (first_send_probe)
+                ++first_send_probe->context_deletes;
+        }
         if (has_cred)
             FreeCredentialsHandle(&cred);
         if (socket != INVALID_SOCKET) {
@@ -272,38 +281,50 @@ struct Tls::Impl {
             SecBufferDesc in{SECBUFFER_VERSION, 2, ib};
             SecBuffer ob{0, SECBUFFER_TOKEN, nullptr};
             SecBufferDesc out{SECBUFFER_VERSION, 1, &ob};
+            CtxtHandle next_context = context;
+            if (first)
+                SecInvalidateHandle(&next_context);
             ULONG flags = 0;
             SECURITY_STATUS status;
             if (server)
                 status =
-                    AcceptSecurityContext(&cred, first ? nullptr : &context, &in,
+                    AcceptSecurityContext(&cred, first ? nullptr : &next_context, &in,
                                           ASC_REQ_STREAM | ASC_REQ_CONFIDENTIALITY | ASC_REQ_REPLAY_DETECT |
                                               ASC_REQ_SEQUENCE_DETECT | ASC_REQ_ALLOCATE_MEMORY,
-                                          SECURITY_NATIVE_DREP, &context, &out, &flags, &expiry);
+                                          SECURITY_NATIVE_DREP, &next_context, &out, &flags, &expiry);
             else
                 status = InitializeSecurityContextW(
-                    &cred, first ? nullptr : &context, const_cast<wchar_t*>(L"Lantern"),
+                    &cred, first ? nullptr : &next_context, const_cast<wchar_t*>(L"Lantern"),
                     ISC_REQ_STREAM | ISC_REQ_CONFIDENTIALITY | ISC_REQ_REPLAY_DETECT |
                         ISC_REQ_SEQUENCE_DETECT | ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_MANUAL_CRED_VALIDATION,
-                    0, SECURITY_NATIVE_DREP, first ? nullptr : &in, 0, &context, &out, &flags, &expiry);
-            if (ob.pvBuffer) {
-                if (ob.cbBuffer) {
-                    try {
-                        send_all(socket, {(uint8_t*)ob.pvBuffer, ob.cbBuffer});
-                    } catch (...) {
-                        FreeContextBuffer(ob.pvBuffer);
-                        throw;
-                    }
+                    0, SECURITY_NATIVE_DREP, first ? nullptr : &in, 0, &next_context, &out, &flags, &expiry);
+            const bool accepted = status == SEC_E_OK || status == SEC_I_CONTINUE_NEEDED;
+            if (accepted && SecIsValidHandle(&next_context)) {
+                context = next_context;
+                has_context = true;
+            }
+            {
+                auto free_token = [this](void* buffer) noexcept {
+                    FreeContextBuffer(buffer);
+                    if (first_send_probe)
+                        ++first_send_probe->buffer_frees;
+                };
+                std::unique_ptr<void, decltype(free_token)> token(ob.pvBuffer, free_token);
+                if (accepted && !SecIsValidHandle(&next_context))
+                    throw Error(Code::io, "TLS handshake returned no security context");
+                if (accepted && token && ob.cbBuffer) {
+                    std::span<const uint8_t> output{static_cast<const uint8_t*>(token.get()), ob.cbBuffer};
+                    if (first_send_probe && first)
+                        first_send_probe->output.assign(output.begin(), output.end());
+                    send_all(socket, output);
                 }
-                FreeContextBuffer(ob.pvBuffer);
             }
             if (status == SEC_E_INCOMPLETE_MESSAGE) {
                 pull();
                 continue;
             }
-            if (status != SEC_E_OK && status != SEC_I_CONTINUE_NEEDED)
+            if (!accepted)
                 security_check(status, "TLS handshake");
-            has_context = true;
             if (ib[1].BufferType == SECBUFFER_EXTRA) {
                 auto n = ib[1].cbBuffer;
                 encrypted = Bytes(encrypted.end() - n, encrypted.end());
@@ -328,22 +349,25 @@ struct Tls::Impl {
                 throw Error(Code::unauthorized, "Host certificate pin or validity mismatch");
         }
     }
+    void encrypt_and_send(size_t n) {
+        time_left();
+        SecBuffer b[4] = {{sizes.cbHeader, SECBUFFER_STREAM_HEADER, send_record.data()},
+                          {ULONG(n), SECBUFFER_DATA, send_record.data() + sizes.cbHeader},
+                          {sizes.cbTrailer, SECBUFFER_STREAM_TRAILER, send_record.data() + sizes.cbHeader + n},
+                          {0, SECBUFFER_EMPTY, nullptr}};
+        SecBufferDesc d{SECBUFFER_VERSION, 4, b};
+        security_check(EncryptMessage(&context, 0, &d, 0), "TLS encrypt");
+        size_t wire_size = size_t(b[0].cbBuffer + b[1].cbBuffer + b[2].cbBuffer);
+        if (send_gate)
+            send_gate(wire_size);
+        send_all(socket, {send_record.data(), wire_size});
+    }
     void write(std::span<const uint8_t> data) {
         for (size_t at = 0; at < data.size();) {
-            time_left();
             size_t n = std::min<size_t>(sizes.cbMaximumMessage, data.size() - at);
-            Bytes record(sizes.cbHeader + n + sizes.cbTrailer);
-            std::copy_n(data.data() + at, n, record.data() + sizes.cbHeader);
-            SecBuffer b[4] = {{sizes.cbHeader, SECBUFFER_STREAM_HEADER, record.data()},
-                              {ULONG(n), SECBUFFER_DATA, record.data() + sizes.cbHeader},
-                              {sizes.cbTrailer, SECBUFFER_STREAM_TRAILER, record.data() + sizes.cbHeader + n},
-                              {0, SECBUFFER_EMPTY, nullptr}};
-            SecBufferDesc d{SECBUFFER_VERSION, 4, b};
-            security_check(EncryptMessage(&context, 0, &d, 0), "TLS encrypt");
-            size_t wire_size = size_t(b[0].cbBuffer + b[1].cbBuffer + b[2].cbBuffer);
-            if (send_gate)
-                send_gate(wire_size);
-            send_all(socket, {record.data(), wire_size});
+            send_record.resize(sizes.cbHeader + n + sizes.cbTrailer);
+            std::copy_n(data.data() + at, n, send_record.data() + sizes.cbHeader);
+            encrypt_and_send(n);
             at += n;
         }
     }
@@ -379,6 +403,14 @@ struct Tls::Impl {
         return plain[plain_at++];
     }
 };
+void TlsFirstSendProbe::handshake(Identity* identity, std::span<const uint8_t> input) {
+    init_sockets();
+    Tls::Impl impl;
+    impl.first_send_probe = this;
+    impl.encrypted.assign(input.begin(), input.end());
+    // The default INVALID_SOCKET makes the first real send fail on either side.
+    impl.handshake(identity, std::string(64, 'a'));
+}
 Tls::Tls(SOCKET s, Identity* i, const std::string& pin, std::chrono::steady_clock::time_point deadline,
          std::function<void(bool)> before_close)
     : p_(std::make_unique<Impl>()) {
@@ -402,13 +434,21 @@ void Tls::interrupt() noexcept {
 void Tls::send(std::span<const uint8_t> b) {
     if (b.size() > max_video_frame)
         throw Error(Code::invalid, "Frame too big");
-    Writer w;
-    w.b.reserve(p_->sizes.cbMaximumMessage);
-    w.u32(uint32_t(b.size()));
+    if (p_->sizes.cbMaximumMessage < 4)
+        throw Error(Code::io, "TLS stream size bound");
     // Put the length and initial payload in one record; a four-byte-only record adds avoidable packets.
-    auto initial = std::min<size_t>(b.size(), p_->sizes.cbMaximumMessage - 4);
-    w.b.insert(w.b.end(), b.begin(), b.begin() + initial);
-    p_->write(w.b);
+    const size_t initial = std::min<size_t>(b.size(), size_t(p_->sizes.cbMaximumMessage) - 4);
+    const size_t first_n = 4 + initial;
+    p_->send_record.resize(p_->sizes.cbHeader + first_n + p_->sizes.cbTrailer);
+    uint8_t* dst = p_->send_record.data() + p_->sizes.cbHeader;
+    const uint32_t length = uint32_t(b.size());
+    dst[0] = uint8_t(length >> 24);
+    dst[1] = uint8_t(length >> 16);
+    dst[2] = uint8_t(length >> 8);
+    dst[3] = uint8_t(length);
+    if (initial)
+        std::copy_n(b.data(), initial, dst + 4);
+    p_->encrypt_and_send(first_n);
     if (initial < b.size())
         p_->write(b.subspan(initial));
 }

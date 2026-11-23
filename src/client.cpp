@@ -1,3 +1,4 @@
+#include "loopback_http.hpp"
 #include "lantern/win.hpp"
 #include <chrono>
 #include <deque>
@@ -239,9 +240,10 @@ void Client::download(const std::string& remote, const fs::path& local, Cancel& 
     if (!FlushFileBuffers(output))
         win_error("Flush local partial");
     cancel.check();
-    if (hash_file(output) != f.hash)
+    if (hash_file(output, cancel, {}) != f.hash)
         throw Error(Code::integrity, "Download SHA256 mismatch; partial retained");
     output = Handle();
+    cancel.check();
     if (!MoveFileExW(part.c_str(), local.c_str(), MOVEFILE_WRITE_THROUGH))
         win_error("Commit local download");
     DeleteFileW(journal.c_str());
@@ -360,7 +362,8 @@ void media_bridge(const std::string& address, uint16_t port, const std::string& 
     SOCKET listener = listen_socket("127.0.0.1", local_port);
     auto secret = random_token();
     std::string path = "/" + secret + "/media" + utf8(fs::path(wide(remote)).extension().wstring());
-    auto url = "http://127.0.0.1:" + std::to_string(local_port) + path;
+    auto authority = loopback_authority(listener);
+    auto url = "http://" + authority + path;
     if (launch) {
         auto result = ShellExecuteW(nullptr, L"open", wide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         if ((INT_PTR)result <= 32) {
@@ -381,14 +384,7 @@ void media_bridge(const std::string& address, uint16_t port, const std::string& 
             setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
             bool responded = false;
             try {
-                std::string header;
-                char buf[1024];
-                while (header.find("\r\n\r\n") == std::string::npos) {
-                    int n = recv(socket, buf, sizeof(buf), 0);
-                    if (n <= 0 || header.size() + n > 8192)
-                        throw Error(Code::invalid, "HTTP header bound");
-                    header.append(buf, n);
-                }
+                auto header = read_loopback_header(socket, authority);
                 bool head = header.starts_with("HEAD ");
                 if (!head && !header.starts_with("GET "))
                     throw Error(Code::invalid, "HTTP method");

@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <mutex>
 #include <vector>
@@ -7,11 +8,14 @@ namespace lantern {
 // Host timestamps are QPC microseconds; local timestamps are monotonic nanoseconds.
 // Audio hardware is the master. No audio anchor means video stays low latency.
 class AvTimeline {
+    static constexpr size_t max_samples = 512;
     mutable std::mutex mutex_;
     uint64_t owner_ = 0, host_ = 0, local_ = 0;
     bool active_ = false, anchored_ = false;
     bool synchronize_ = false;
-    std::vector<int64_t> skew_;
+    std::array<int64_t, max_samples> skew_{};
+    size_t skew_head_ = 0;
+    size_t skew_count_ = 0;
     uint64_t fallbacks_ = 0;
 
   public:
@@ -67,13 +71,19 @@ class AvTimeline {
         if (!active_ || !anchored_ || now < local_ || now - local_ > 500'000'000)
             return;
         auto d = int64_t(host) - int64_t(host_) - int64_t((now - local_) / 1000);
-        if (skew_.size() == 512)
-            skew_.erase(skew_.begin());
-        skew_.push_back(d);
+        skew_[skew_head_] = d;
+        skew_head_ = (skew_head_ + 1) % max_samples;
+        if (skew_count_ < max_samples)
+            ++skew_count_;
     }
     std::vector<int64_t> samples() const {
         std::lock_guard lock(mutex_);
-        return skew_;
+        std::vector<int64_t> out;
+        out.reserve(skew_count_);
+        size_t oldest = skew_count_ < max_samples ? 0 : skew_head_;
+        for (size_t i = 0; i < skew_count_; ++i)
+            out.push_back(skew_[(oldest + i) % max_samples]);
+        return out;
     }
     uint64_t fallbacks() const {
         std::lock_guard lock(mutex_);

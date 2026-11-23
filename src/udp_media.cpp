@@ -1,5 +1,6 @@
 #include "lantern/udp_media.hpp"
-#include <deque>
+#include "pace_until.hpp"
+#include <set>
 #include <bcrypt.h>
 #include <thread>
 #include <ws2tcpip.h>
@@ -23,83 +24,165 @@ SOCKET udp_socket(const std::string& host,uint16_t port,bool bind_socket,sockadd
         selected=s;address_size=int(a->ai_addrlen);memcpy(&address,a->ai_addr,a->ai_addrlen);break;
     }
     freeaddrinfo(list);if(selected==INVALID_SOCKET)throw Error(Code::io,"UDP socket unavailable");
-    timeout(selected,20);return selected;
+    timeout(selected,bind_socket?20:5);return selected;
 }
 }
 struct UdpMediaSession::Impl {
     mutable std::mutex mutex;
     UdpOffer offer;
     DatagramCipher outgoing,incoming;
-    std::function<void(std::span<const uint8_t>,const sockaddr_storage&,int)> transmit;
+    std::function<bool(std::span<const uint8_t>,const sockaddr_storage&,int)> transmit;
     std::function<bool()> cancelled;
     sockaddr_storage peer{},candidate{};int peer_size=0,candidate_size=0;
     Bytes challenge;
     bool verified=false;
     uint64_t last_feedback=0,last_challenge=0;
     uint64_t sent_frame=0,ack_frame=0,last_loss=0;
-    std::map<uint64_t,Bytes> frames;
-    std::deque<std::pair<uint64_t,uint32_t>> retransmit;
-    Impl(UdpOffer o,decltype(transmit) send,decltype(cancelled) stop):offer(std::move(o)),
-        outgoing(offer.send_key,offer.session,1),incoming(offer.receive_key,offer.session,2),transmit(std::move(send)),cancelled(std::move(stop)){}
+    struct CachedFrame { Bytes bytes; Clock::time_point deadline; };
+    std::map<uint64_t,CachedFrame> frames;
+    using Repair=std::pair<uint64_t,uint32_t>;
+    std::set<Repair> retransmit;
+    UdpMediaStats stats;
+    std::function<void(size_t)> gate;
+    Impl(UdpOffer o,decltype(transmit) send,decltype(cancelled) stop,decltype(gate) admit):offer(std::move(o)),
+        outgoing(offer.send_key,offer.session,1),incoming(offer.receive_key,offer.session,2),
+        transmit(std::move(send)),cancelled(std::move(stop)),gate(std::move(admit)){}
+    bool repairable(uint64_t id,Clock::time_point now)const {
+        auto it=frames.find(id);
+        // Feedback frame zero also denotes an idle receiver before its first delivery.
+        return it!=frames.end() && (!ack_frame || id>ack_frame) && now<it->second.deadline;
+    }
+    void prune(Clock::time_point now){
+        stats.expired_repairs+=std::erase_if(retransmit,[&](const Repair& r){return !repairable(r.first,now);});
+    }
+    void control(const Bytes& packet,const sockaddr_storage& address,int size){
+        gate(packet.size());
+        if(!transmit(packet,address,size))++stats.send_rejections;
+    }
     ~Impl(){SecureZeroMemory(offer.send_key.data(),offer.send_key.size());SecureZeroMemory(offer.receive_key.data(),offer.receive_key.size());}
     void received(std::span<const uint8_t> bytes,const sockaddr_storage& source,int size){
         std::lock_guard l(mutex);if(cancelled())return;
+        if(verified&&!same(source,size,peer,peer_size))return;
         auto decoded=incoming.open(bytes);if(!decoded)return;auto& packet=*decoded;
         auto now=milliseconds();
         if(packet.type==DatagramType::hello){
             if(packet.payload.size()!=32||now-last_challenge<250)return;
             // One small challenge only; no media until proof of return reachability (anti-amplification).
-            candidate=source;candidate_size=size;challenge=random_bytes(32);last_challenge=now;
-            auto reply=outgoing.seal({DatagramType::challenge,0,0,0,0,0,challenge});transmit(reply,source,size);return;
+            if(!verified){candidate=source;candidate_size=size;}
+            challenge=random_bytes(32);last_challenge=now;
+            auto reply=outgoing.seal({DatagramType::challenge,0,0,0,0,0,challenge});control(reply,source,size);return;
         }
         if(packet.type==DatagramType::proof&&packet.payload==challenge&&!challenge.empty()&&
             now-last_challenge<1500&&same(source,size,candidate,candidate_size)){
-            peer=source;peer_size=size;verified=true;last_feedback=now;challenge.clear();
-            auto reply=outgoing.seal({DatagramType::feedback,0,0,0,0,0,Bytes{1}});transmit(reply,peer,peer_size);return;
+            if(!verified){peer=source;peer_size=size;verified=true;}
+            last_feedback=now;challenge.clear();
+            auto reply=outgoing.seal({DatagramType::feedback,0,0,0,0,0,Bytes{1}});control(reply,peer,peer_size);return;
         }
         if(!verified||!same(source,size,peer,peer_size))return;
-        if(packet.type==DatagramType::feedback){last_feedback=now;if(packet.frame<=sent_frame)ack_frame=std::max(ack_frame,packet.frame);return;}
-        if(packet.type==DatagramType::nack){
+        if(packet.type==DatagramType::feedback){
             last_feedback=now;
-            last_loss=now;
-            try{Reader r{packet.payload};auto n=r.u32();if(n>128)return;
-                auto frame=frames.find(packet.frame);if(frame==frames.end())return;
-                auto count=(frame->second.size()+datagram_payload-1)/datagram_payload;
-                for(uint32_t i=0;i<n;i++){auto index=r.u32();if(index<count&&retransmit.size()<128)retransmit.emplace_back(packet.frame,index);}r.end();
-            }catch(const Error&){}
+            if(packet.frame>ack_frame && packet.frame<=sent_frame){ack_frame=packet.frame;prune(Clock::now());}
+            return;
+        }
+        if(packet.type==DatagramType::nack){
+            if(packet.payload.size()<4)return;
+            Reader r{packet.payload};
+            auto n=r.u32();
+            if(!n || n>128 || packet.payload.size()!=4+4*n)return;
+            last_feedback=now;
+            auto at=Clock::now();
+            prune(at);
+            if(!repairable(packet.frame,at)){stats.expired_repairs+=n;return;}
+            const auto count=(frames.at(packet.frame).bytes.size()+datagram_payload-1)/datagram_payload;
+            for(uint32_t i=0;i<n;++i){
+                Repair item{packet.frame,r.u32()};
+                if(item.second>=count)continue;
+                last_loss=now;
+                if(retransmit.contains(item))++stats.duplicate_repairs;
+                else if(retransmit.size()<128)retransmit.insert(item);
+            }
         }
     }
 };
-UdpMediaSession::UdpMediaSession(UdpOffer offer,decltype(Impl::transmit) send,std::function<bool()> stop):p_(std::make_unique<Impl>(std::move(offer),std::move(send),std::move(stop))){}
+UdpMediaSession::UdpMediaSession(UdpOffer offer,decltype(Impl::transmit) send,std::function<bool()> stop,std::function<void(size_t)> gate):p_(std::make_unique<Impl>(std::move(offer),std::move(send),std::move(stop),std::move(gate))){}
 UdpMediaSession::~UdpMediaSession()=default;
 UdpOffer UdpMediaSession::offer()const {return p_->offer;}
 bool UdpMediaSession::ready()const {std::lock_guard l(p_->mutex);return p_->verified&&!p_->cancelled();}
 bool UdpMediaSession::live()const {std::lock_guard l(p_->mutex);return p_->verified&&!p_->cancelled()&&milliseconds()-p_->last_feedback<1500;}
 bool UdpMediaSession::congested(uint32_t fps)const {std::lock_guard l(p_->mutex);return p_->sent_frame>p_->ack_frame+std::max(3u,fps/5)||milliseconds()-p_->last_loss<500;}
-void UdpMediaSession::send_frame(uint64_t id,std::span<const uint8_t> bytes){
+UdpMediaStats UdpMediaSession::stats()const {std::lock_guard l(p_->mutex);return p_->stats;}
+void UdpMediaSession::send_frame(uint64_t id,std::span<const uint8_t> bytes,std::chrono::microseconds period,bool video){
+    using namespace std::chrono;
+    if(bytes.empty()||bytes.size()>max_video_frame||period.count()<=0)throw Error(Code::invalid,"UDP frame bound");
     auto& p=*p_;
-    auto transmit=[&](Datagram d){
-        Bytes packet;sockaddr_storage address{};int size;
-        {std::lock_guard l(p.mutex);if(p.cancelled())throw Error(Code::cancelled,"UDP session ended");
-            packet=p.outgoing.seal(std::move(d));address=p.peer;size=p.peer_size;}
-        p.transmit(packet,address,size);
-    };
-    std::vector<Datagram> repeats;
+    const auto began=Clock::now();
+    const auto retention=std::min(period,microseconds(80000))*2;
+    std::vector<Impl::Repair> repairs;
     {
         std::lock_guard l(p.mutex);
+        if(!p.verified || p.cancelled())throw Error(Code::cancelled,"UDP endpoint unavailable");
         p.sent_frame=id;
-        for(size_t n=0;n<16&&!p.retransmit.empty();n++){
-            auto [frame,index]=p.retransmit.front();p.retransmit.pop_front();auto it=p.frames.find(frame);if(it==p.frames.end())continue;
-            auto offset=size_t(index)*datagram_payload;if(offset>=it->second.size())continue;
-            auto count=uint32_t((it->second.size()+datagram_payload-1)/datagram_payload);
-            auto end=std::min(it->second.size(),offset+datagram_payload);
-            repeats.push_back({DatagramType::data,0,frame,index,count,uint32_t(it->second.size()),Bytes(it->second.begin()+offset,it->second.begin()+end)});
-        }
-        p.frames[id]=Bytes(bytes.begin(),bytes.end());size_t total=0;for(auto& [_,frame]:p.frames)total+=frame.size();
-        while(p.frames.size()>2||total>max_video_frame){auto it=p.frames.begin();total-=it->second.size();p.frames.erase(it);}
+        // Evict before allocating the new frame or spending any repair slots.
+        while(!p.frames.empty() && (p.frames.size()>=2 ||
+              (id>p.frames.begin()->first && id-p.frames.begin()->first>=2) ||
+              p.frames.begin()->second.bytes.size()+bytes.size()>max_video_frame))
+            p.frames.erase(p.frames.begin());
+        p.frames.insert_or_assign(id,Impl::CachedFrame{Bytes(bytes.begin(),bytes.end()),began+retention});
+        p.prune(Clock::now());
+        for(auto item:p.retransmit){repairs.push_back(item);if(repairs.size()==16)break;}
     }
-    for(auto& packet:repeats)transmit(std::move(packet));
-    fragment_datagram(id,bytes,transmit);
+    Clock::time_point first_data{},last_data{};
+    auto transmit=[&](Datagram d,bool repair){
+        Bytes packet;
+        sockaddr_storage address;
+        int size;
+        const auto type=d.type;
+        const Impl::Repair item{d.frame,d.index};
+        {
+            std::lock_guard l(p.mutex);
+            if(p.cancelled())throw Error(Code::cancelled,"UDP session ended");
+            packet=p.outgoing.seal(std::move(d));address=p.peer;size=p.peer_size;
+        }
+        p.gate(packet.size());
+        if(repair){
+            std::lock_guard l(p.mutex);
+            if(!p.retransmit.erase(item))return;
+            if(!p.repairable(item.first,Clock::now())){++p.stats.expired_repairs;return;}
+        }
+        if(p.cancelled())throw Error(Code::cancelled,"UDP session ended");
+        bool accepted=p.transmit(packet,address,size);
+        if(accepted && !repair){
+            last_data=Clock::now();
+            if(first_data==Clock::time_point{})first_data=last_data;
+        }
+        std::lock_guard l(p.mutex);
+        if(!accepted)++p.stats.send_rejections;
+        else if(repair)p.stats.repair_bytes+=packet.size();
+        else if(type==DatagramType::data)p.stats.data_bytes+=packet.size();
+        else p.stats.parity_bytes+=packet.size();
+    };
+    for(auto [frame,index]:repairs){
+        Datagram d{DatagramType::data,0,frame,index};
+        {
+            std::lock_guard l(p.mutex);
+            if(!p.repairable(frame,Clock::now())){p.stats.expired_repairs+=p.retransmit.erase({frame,index});continue;}
+            const auto& data=p.frames.at(frame).bytes;
+            d.total=uint32_t(data.size());d.count=(d.total+datagram_payload-1)/datagram_payload;
+            auto offset=size_t(index)*datagram_payload;
+            d.payload.assign(data.begin()+offset,data.begin()+std::min(data.size(),offset+datagram_payload));
+        }
+        transmit(std::move(d),true);
+    }
+    const auto count=(bytes.size()+datagram_payload-1)/datagram_payload;
+    const auto groups=(count+7)/8;
+    const auto budget=std::min(period/2,microseconds(4000));
+    fragment_datagram(id,bytes,[&](Datagram d){
+        if(video && count>=16 && d.type==DatagramType::data && d.index && d.index%8==0)
+            pace_until(began+budget*int(d.index/8)/int(groups-1),true);
+        transmit(std::move(d),false);
+    });
+    std::lock_guard l(p.mutex);
+    p.stats.last_frame_span_us=duration_cast<microseconds>(last_data-first_data).count();
 }
 struct UdpMediaServer::Impl {
     SOCKET socket=INVALID_SOCKET;uint16_t port;std::atomic_bool stopped=false;
@@ -108,11 +191,13 @@ struct UdpMediaServer::Impl {
         size=sizeof(address);getsockname(socket,reinterpret_cast<sockaddr*>(&address),&size);port=ntohs(address.ss_family==AF_INET6?reinterpret_cast<sockaddr_in6*>(&address)->sin6_port:reinterpret_cast<sockaddr_in*>(&address)->sin_port);
         worker=std::thread([this]{run();});}
     ~Impl(){stopped=true;closesocket(socket);if(worker.joinable())worker.join();}
-    void send(std::span<const uint8_t> packet,const sockaddr_storage& address,int size){
+    bool send(std::span<const uint8_t> packet,const sockaddr_storage& address,int size){
         if(stopped)throw Error(Code::cancelled,"UDP listener stopped");
         if(sendto(socket,reinterpret_cast<const char*>(packet.data()),int(packet.size()),0,reinterpret_cast<const sockaddr*>(&address),size)<0){
             auto error=WSAGetLastError();if(error!=WSAEWOULDBLOCK&&error!=WSAENOBUFS)throw TransportError("UDP send failed",error);
+            return false;
         }
+        return true;
     }
     void run(){uint64_t window=milliseconds();uint32_t packets=0;
         while(!stopped){
@@ -129,7 +214,7 @@ UdpMediaServer::UdpMediaServer(const std::string& bind,uint16_t port):p_(std::ma
 UdpMediaServer::~UdpMediaServer()=default;
 std::shared_ptr<UdpMediaSession> UdpMediaServer::create(std::function<bool()> stop,std::function<void(size_t)> gate){
     UdpOffer offer{random_bytes(16),random_bytes(32),random_bytes(32),p_->port};
-    auto session=std::make_shared<UdpMediaSession>(offer,[this,gate=std::move(gate)](auto packet,const auto& address,int size){gate(packet.size());p_->send(packet,address,size);},std::move(stop));
+    auto session=std::make_shared<UdpMediaSession>(offer,[this](auto packet,const auto& address,int size){return p_->send(packet,address,size);},std::move(stop),std::move(gate));
     std::lock_guard l(p_->mutex);std::erase_if(p_->sessions,[](auto& e){return e.second.expired();});
     if(p_->sessions.size()>=4)throw Error(Code::busy,"UDP session capacity");p_->sessions[key(offer.session)]=session;return session;
 }
@@ -154,15 +239,23 @@ bool UdpMediaClient::handshake(std::chrono::milliseconds timeout){
         else if(packet->type==DatagramType::feedback&&packet->payload==Bytes{1})return true;
     }return false;
 }
-Bytes UdpMediaClient::receive(){
-    auto end=Clock::now()+std::chrono::milliseconds(1500);uint64_t current=0,last_nack=0;bool have=false;
+Bytes UdpMediaClient::receive(uint32_t fps){
+    const auto retention_ms=std::min(160u,2000/std::max(fps,1u));
+    auto end=Clock::now()+std::chrono::milliseconds(1500);uint64_t last_nack=0;
     while(!p_->stopped&&Clock::now()<end){
         auto packet=p_->read();auto now=milliseconds();
         if(now-p_->last_feedback>=100){p_->send({DatagramType::feedback,0,p_->last_delivered,0,0,0,Bytes{1}});p_->last_feedback=now;}
         if(packet&&(packet->type==DatagramType::data||packet->type==DatagramType::parity)){
-            current=packet->frame;have=true;auto frame=p_->frames.accept(*packet,now);if(frame){p_->last_delivered=current;p_->send({DatagramType::feedback,0,current,0,0,0,Bytes{1}});p_->last_feedback=now;return *frame;}
+            auto current=packet->frame;auto frame=p_->frames.accept(*packet,now);if(frame){p_->last_delivered=current;p_->send({DatagramType::feedback,0,current,0,0,0,Bytes{1}});p_->last_feedback=now;return *frame;}
         }
-        if(have&&now-last_nack>=20){auto missing=p_->frames.missing(current,now);if(!missing.empty()){Writer w;w.u32(uint32_t(missing.size()));for(auto index:missing)w.u32(index);p_->send({DatagramType::nack,0,current,0,0,0,std::move(w.b)});}last_nack=now;}
+        if(now-last_nack>=5){
+            if(auto request=p_->frames.nack(now,retention_ms)){
+                auto& [id,indices]=*request;
+                Writer w;w.u32(uint32_t(indices.size()));for(auto i:indices)w.u32(i);
+                p_->send({DatagramType::nack,0,id,0,0,0,std::move(w.b)});
+            }
+            last_nack=now;
+        }
     }
     throw TransportError("UDP media timed out");
 }

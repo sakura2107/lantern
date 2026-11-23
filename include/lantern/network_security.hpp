@@ -13,6 +13,8 @@ struct NetworkSecurityStats {
 };
 // Caller serializes access. Time injection is for deterministic policy tests.
 class AuthenticationGuard {
+    friend class ConnectionRegistry;
+    void release_bucket(const std::string& key) noexcept;
     struct Entry {
         uint32_t active = 0, failures = 0;
         uint64_t retry_at = 0, last = 0;

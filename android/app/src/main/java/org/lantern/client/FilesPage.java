@@ -41,26 +41,28 @@ final class FilesPage {
         view.addView(path);
 
         LinearLayout crumbRow = Ui.row(a);
-        crumbRow.setPadding(Theme.dp(12), 0, Theme.dp(8), 0);
+        crumbRow.setPadding(Theme.dp(14), Theme.dp(2), Theme.dp(10), Theme.dp(4));
         crumbScroll = new HorizontalScrollView(a);
         crumbScroll.setHorizontalScrollBarEnabled(false);
         crumbs = Ui.row(a);
         crumbScroll.addView(crumbs);
         crumbRow.addView(crumbScroll, Ui.weight(1));
         ImageView more = Ui.iconButton(a, Glyph.MORE, S.MORE, this::showMore);
+        Ui.bounce(more, 0.92f);
         Ui.id(more, "files.more");
-        crumbRow.addView(more, Ui.lp(Theme.dp(44), Theme.dp(44)));
+        crumbRow.addView(more, Ui.lp(Theme.dp(42), Theme.dp(42)));
         view.addView(crumbRow, Ui.lp(-1, -2));
 
         toolbar = Ui.row(a);
-        toolbar.setPadding(Theme.dp(16), Theme.dp(2), Theme.dp(10), Theme.dp(8));
+        toolbar.setPadding(Theme.dp(16), Theme.dp(2), Theme.dp(16), Theme.dp(10));
         LinearLayout search = Ui.row(a);
-        search.setPadding(Theme.dp(14), 0, Theme.dp(14), 0);
-        search.setBackground(Ui.press(Ui.round(Theme.INSET, 22), 22));
+        search.setPadding(Theme.dp(15), 0, Theme.dp(15), 0);
+        search.setBackground(Ui.press(Ui.outline(Theme.SURFACE, Theme.RIM, 1f, 24), 24));
+        search.setElevation(Theme.dp(1));
         ImageView searchIcon = new ImageView(a);
         searchIcon.setImageDrawable(new Glyph(Glyph.SEARCH, Theme.MUTED, Theme.dp(18)));
         search.addView(searchIcon, Ui.lp(Theme.dp(18), Theme.dp(18)));
-        TextView searchHint = Ui.text(a, S.SEARCH_HINT, 15, Theme.FAINT);
+        TextView searchHint = Ui.text(a, S.SEARCH_HINT, 14.5f, Theme.FAINT);
         Ui.oneLine(searchHint);
         searchHint.setPadding(Theme.dp(10), 0, 0, 0);
         search.addView(searchHint, Ui.weight(1));
@@ -68,46 +70,57 @@ final class FilesPage {
         search.setFocusable(true);
         search.setContentDescription(S.SEARCH);
         Ui.role(search, Button.class);
+        Ui.bounce(search, 0.98f);
         Ui.id(search, "files.search");
         toolbar.addView(search, new LinearLayout.LayoutParams(0, Theme.dp(44), 1));
         ImageView sort = Ui.iconButton(a, Glyph.SORT, S.SORT, this::showSort);
+        sort.setBackground(Ui.press(Ui.outline(Theme.SURFACE, Theme.RIM, 1f, 15), 15));
+        sort.setElevation(Theme.dp(1));
+        Ui.bounce(sort, 0.93f);
         Ui.id(sort, "files.sort");
         LinearLayout.LayoutParams ip = Ui.lp(Theme.dp(44), Theme.dp(44));
-        ip.setMarginStart(Theme.dp(4));
+        ip.setMarginStart(Theme.dp(8));
         toolbar.addView(sort, ip);
         ImageView select = Ui.iconButton(a, Glyph.SELECT, S.SELECT, () -> setSelecting(true));
+        select.setBackground(Ui.press(Ui.outline(Theme.SURFACE, Theme.RIM, 1f, 15), 15));
+        select.setElevation(Theme.dp(1));
+        Ui.bounce(select, 0.93f);
         Ui.id(select, "files.select");
-        toolbar.addView(select, Ui.lp(Theme.dp(44), Theme.dp(44)));
+        LinearLayout.LayoutParams sp2 = Ui.lp(Theme.dp(44), Theme.dp(44));
+        sp2.setMarginStart(Theme.dp(8));
+        toolbar.addView(select, sp2);
         view.addView(toolbar, Ui.lp(-1, -2));
 
         selectionBar = Ui.row(a);
-        selectionBar.setPadding(Theme.dp(8), Theme.dp(2), Theme.dp(12), Theme.dp(8));
-        selectionBar.setMinimumHeight(Theme.dp(52));
+        selectionBar.setPadding(Theme.dp(10), Theme.dp(2), Theme.dp(14), Theme.dp(8));
+        selectionBar.setMinimumHeight(Theme.dp(54));
         ImageView close = Ui.iconButton(a, Glyph.CLOSE, S.EXIT_SELECTION, () -> setSelecting(false));
         Ui.id(close, "files.select.exit");
         selectionBar.addView(close, Ui.lp(Theme.dp(44), Theme.dp(44)));
-        selectionCount = Ui.numeric(Ui.medium(a, "", 17, Theme.INK));
+        selectionCount = Ui.numeric(Ui.medium(a, "", 16.5f, Theme.INK));
         selectionCount.setPadding(Theme.dp(6), 0, 0, 0);
         selectionBar.addView(selectionCount, Ui.weight(1));
-        Button all = Ui.button(a, S.SELECT_ALL, Ui.GHOST, this::selectAll);
+        Button all = Ui.button(a, S.SELECT_ALL, Ui.SECONDARY, this::selectAll);
+        all.setTextSize(13.5f);
+        all.setPadding(Theme.dp(14), 0, Theme.dp(14), 0);
         Ui.id(all, "files.select.all");
-        selectionBar.addView(all, Ui.lp(-2, Theme.dp(40)));
+        selectionBar.addView(all, Ui.lp(-2, Theme.dp(38)));
         selectionBar.setVisibility(View.GONE);
         view.addView(selectionBar, Ui.lp(-1, -2));
 
         banner = Ui.row(a);
-        banner.setPadding(Theme.dp(14), Theme.dp(8), Theme.dp(8), Theme.dp(8));
-        banner.setBackground(Ui.round(Theme.LAMP_SOFT, 16));
+        banner.setPadding(Theme.dp(14), Theme.dp(9), Theme.dp(8), Theme.dp(9));
+        banner.setBackground(Ui.outline(Theme.LAMP_SOFT, Theme.LAMP_GLOW, 1f, 18));
         bannerSpinner = Ui.spinner(a, 18);
         banner.addView(bannerSpinner);
-        bannerText = Ui.numeric(Ui.text(a, "", 14, Theme.INK));
+        bannerText = Ui.numeric(Ui.text(a, "", 13.5f, Theme.INK));
         bannerText.setMaxLines(2);
         bannerText.setEllipsize(TextUtils.TruncateAt.END);
         bannerText.setPadding(Theme.dp(10), 0, Theme.dp(8), 0);
         banner.addView(bannerText, Ui.weight(1));
         Button cancel = Ui.button(a, S.CANCEL, Ui.GHOST, () -> { a.browser.cancel(); a.status(S.CANCEL_REQUESTED); });
         Ui.id(cancel, "files.cancel");
-        banner.addView(cancel, Ui.lp(-2, Theme.dp(40)));
+        banner.addView(cancel, Ui.lp(-2, Theme.dp(38)));
         banner.setVisibility(View.GONE);
         LinearLayout.LayoutParams bp = Ui.lp(-1, -2);
         bp.setMargins(Theme.dp(16), 0, Theme.dp(16), Theme.dp(8));
@@ -121,10 +134,11 @@ final class FilesPage {
 
         FrameLayout area = new FrameLayout(a);
         list = new ListView(a);
-        list.setDivider(null);
+        list.setDivider(new android.graphics.drawable.ColorDrawable(0));
+        list.setDividerHeight(Theme.dp(4));
         list.setSelector(new android.graphics.drawable.ColorDrawable(0));
         list.setClipToPadding(false);
-        list.setPadding(Theme.dp(10), Theme.dp(2), Theme.dp(10), Theme.dp(88));
+        list.setPadding(Theme.dp(12), Theme.dp(2), Theme.dp(12), Theme.dp(92));
         list.setScrollBarStyle(View.SCROLLBARS_OUTSIDE_OVERLAY);
         Ui.id(list, "files.list");
         area.addView(list, new FrameLayout.LayoutParams(-1, -1));
@@ -132,15 +146,16 @@ final class FilesPage {
         emptyView = Ui.column(a);
         emptyView.setGravity(Gravity.CENTER);
         emptyView.setPadding(Theme.dp(32), 0, Theme.dp(32), Theme.dp(60));
-        emptyIcon = Ui.glyphTile(a, Glyph.FOLDER, Theme.MUTED, Theme.INSET, 64, 22);
-        emptyView.addView(emptyIcon, Ui.lp(Theme.dp(64), Theme.dp(64)));
+        emptyIcon = Ui.glyphTile(a, Glyph.FOLDER, Theme.MUTED, Theme.INSET, 68, 24);
+        emptyIcon.setBackground(Ui.outline(Theme.INSET, Theme.RIM, 1f, 24));
+        emptyView.addView(emptyIcon, Ui.lp(Theme.dp(68), Theme.dp(68)));
         emptyTitle = Ui.medium(a, "", 17, Theme.INK);
         emptyTitle.setGravity(Gravity.CENTER);
-        emptyTitle.setPadding(0, Theme.dp(16), 0, Theme.dp(4));
+        emptyTitle.setPadding(0, Theme.dp(16), 0, Theme.dp(5));
         emptyView.addView(emptyTitle);
-        emptyDetail = Ui.text(a, "", 14, Theme.MUTED);
+        emptyDetail = Ui.text(a, "", 13.5f, Theme.MUTED);
         emptyDetail.setGravity(Gravity.CENTER);
-        emptyDetail.setLineSpacing(0, 1.15f);
+        emptyDetail.setLineSpacing(0, 1.22f);
         emptyView.addView(emptyDetail);
         emptyAction = Ui.button(a, "", Ui.PRIMARY, null);
         LinearLayout.LayoutParams eap = Ui.lp(-2, Theme.dp(44));
@@ -150,9 +165,11 @@ final class FilesPage {
         list.setEmptyView(emptyView);
 
         upload = Ui.button(a, S.UPLOAD, Ui.PRIMARY, this::showUpload);
+        upload.setTextColor(Theme.ON_LAMP);
+        upload.setBackground(Ui.press(Ui.round(Theme.LAMP, 28), 28));
         Ui.withIcon(upload, Glyph.UPLOAD);
-        upload.setElevation(Theme.dp(4));
-        upload.setPadding(Theme.dp(18), 0, Theme.dp(22), 0);
+        upload.setElevation(Theme.dp(6));
+        upload.setPadding(Theme.dp(20), 0, Theme.dp(24), 0);
         Ui.id(upload, "files.upload");
         FrameLayout.LayoutParams up = new FrameLayout.LayoutParams(-2, Theme.dp(52), Gravity.BOTTOM | Gravity.END);
         up.setMargins(0, 0, Theme.dp(16), Theme.dp(16));
@@ -175,13 +192,13 @@ final class FilesPage {
 
         selectionActions = Ui.row(a);
         selectionActions.setBackgroundColor(Theme.SURFACE);
-        selectionActions.setPadding(Theme.dp(6), Theme.dp(4), Theme.dp(6), Theme.dp(4));
+        selectionActions.setPadding(Theme.dp(8), Theme.dp(6), Theme.dp(8), Theme.dp(6));
         bulk(Glyph.DOWNLOAD, S.DOWNLOAD, this::downloadSelected, "files.bulk.download");
         bulk(Glyph.COPY, S.COPY_TO, () -> copyOrMove(false), "files.bulk.copy");
         bulk(Glyph.MOVE, S.MOVE_TO, () -> copyOrMove(true), "files.bulk.move");
         bulk(Glyph.TRASH, S.DELETE, this::deleteSelected, "files.bulk.delete");
         selectionActions.setVisibility(View.GONE);
-        view.addView(Ui.hairline(a), Ui.lp(-1, 0));
+        view.addView(Ui.hairline(a), Ui.lp(-1, Math.max(1, Theme.dp(0.5f))));
         view.addView(selectionActions, Ui.lp(-1, -2));
 
         path.addTextChangedListener(new TextWatcher() {
@@ -256,28 +273,32 @@ final class FilesPage {
     }
 
     void crumb(String label, String target, boolean current, boolean home) {
-        TextView t = Ui.text(a, label, 15, current ? Theme.INK : Theme.MUTED);
+        TextView t = Ui.text(a, label, 13.5f, current ? Theme.INK : Theme.MUTED);
         if (current) t.setTypeface(Theme.MEDIUM);
         Ui.oneLine(t);
         t.setMaxWidth(Theme.dp(180));
         t.setGravity(Gravity.CENTER_VERTICAL);
-        t.setMinHeight(Theme.dp(44));
-        t.setPadding(Theme.dp(8), 0, Theme.dp(8), 0);
+        t.setMinHeight(Theme.dp(34));
+        t.setPadding(Theme.dp(10), Theme.dp(5), Theme.dp(10), Theme.dp(5));
         if (home) {
-            Glyph g = new Glyph(Glyph.HOME, current ? Theme.INK : Theme.MUTED, Theme.dp(18));
+            Glyph g = new Glyph(Glyph.HOME, current ? (Theme.dark ? Theme.LAMP : Theme.LAMP_TEXT) : Theme.MUTED, Theme.dp(16));
             g.setBounds(0, 0, g.size, g.size);
             t.setCompoundDrawablesRelative(g, null, null, null);
-            t.setCompoundDrawablePadding(Theme.dp(6));
+            t.setCompoundDrawablePadding(Theme.dp(5));
         }
         if (!current) {
-            t.setBackground(Ui.press(Ui.round(0, 12), 12));
+            t.setBackground(Ui.press(Ui.round(0, 50), 50));
             t.setOnClickListener(v -> navigate(target));
             Ui.role(t, Button.class);
-        } else if (!home) {
-            t.setContentDescription(String.format(Locale.ROOT, S.CURRENT_FOLDER, label));
+        } else {
+            t.setBackground(Ui.outline(Theme.SURFACE, Theme.RIM, 1f, 50));
+            if (!home) t.setContentDescription(String.format(Locale.ROOT, S.CURRENT_FOLDER, label));
         }
         Ui.id(t, home ? "files.crumb.root" : "files.crumb");
-        crumbs.addView(t);
+        LinearLayout.LayoutParams lp = Ui.lp(-2, -2);
+        lp.topMargin = Theme.dp(2);
+        lp.bottomMargin = Theme.dp(2);
+        crumbs.addView(t, lp);
     }
 
     // ---------- list ----------
@@ -521,6 +542,29 @@ final class FilesPage {
         }
     }
 
+    static int iconTint(int glyph) {
+        switch (glyph) {
+        case Glyph.FOLDER: return Theme.dark ? Theme.LAMP : Theme.LAMP_TEXT;
+        case Glyph.VIDEO: return Theme.dark ? 0xffb49aff : 0xff6d28d9;
+        case Glyph.IMAGE: return Theme.POSITIVE;
+        case Glyph.AUDIO: return Theme.dark ? 0xff56ccf2 : 0xff0369a1;
+        case Glyph.ARCHIVE: return Theme.WARN;
+        case Glyph.DOC: return Theme.dark ? 0xff7cb3ff : 0xff1d4ed8;
+        default: return Theme.MUTED;
+        }
+    }
+    static int iconBg(int glyph) {
+        switch (glyph) {
+        case Glyph.FOLDER: return Theme.LAMP_SOFT;
+        case Glyph.VIDEO: return Theme.dark ? 0x249d7aff : 0x1a7c3aed;
+        case Glyph.IMAGE: return Theme.POSITIVE_SOFT;
+        case Glyph.AUDIO: return Theme.dark ? 0x2438bdf8 : 0x1a0284c7;
+        case Glyph.ARCHIVE: return Theme.WARN_SOFT;
+        case Glyph.DOC: return Theme.dark ? 0x2460a5fa : 0x1a2563eb;
+        default: return Theme.INSET;
+        }
+    }
+
     final class Row extends LinearLayout implements Checkable {
         final ImageView icon, trailing;
         final TextView name, meta;
@@ -529,36 +573,38 @@ final class FilesPage {
         Row() {
             super(a);
             setGravity(Gravity.CENTER_VERTICAL);
-            setPadding(Theme.dp(10), Theme.dp(8), Theme.dp(4), Theme.dp(8));
-            setMinimumHeight(Theme.dp(64));
-            icon = Ui.glyphTile(a, Glyph.FILE, Theme.INK, Theme.INSET, 44, 14);
-            addView(icon, Ui.lp(Theme.dp(44), Theme.dp(44)));
+            setPadding(Theme.dp(12), Theme.dp(10), Theme.dp(6), Theme.dp(10));
+            setMinimumHeight(Theme.dp(68));
+            icon = Ui.glyphTile(a, Glyph.FILE, Theme.INK, Theme.INSET, 46, 15);
+            addView(icon, Ui.lp(Theme.dp(46), Theme.dp(46)));
             LinearLayout lines = Ui.column(a);
             LinearLayout.LayoutParams p = Ui.weight(1);
             p.setMarginStart(Theme.dp(14));
             p.setMarginEnd(Theme.dp(4));
             addView(lines, p);
-            name = Ui.text(a, "", 16, Theme.INK);
+            name = Ui.medium(a, "", 15.5f, Theme.INK);
             name.setMaxLines(2);
             name.setEllipsize(TextUtils.TruncateAt.MIDDLE);
             lines.addView(name);
-            meta = Ui.numeric(Ui.text(a, "", 13, Theme.MUTED));
+            meta = Ui.numeric(Ui.text(a, "", 12.5f, Theme.MUTED));
             Ui.oneLine(meta);
-            meta.setPadding(0, Theme.dp(2), 0, 0);
+            meta.setPadding(0, Theme.dp(3), 0, 0);
             lines.addView(meta);
             trailing = Ui.iconButton(a, Glyph.MORE, S.MORE_ACTIONS, null);
             trailing.setOnClickListener(v -> { if (entry != null && !a.browser.selecting) showActions(entry); });
             trailing.setFocusable(false); // a focusable child would swallow ListView item clicks
-            addView(trailing, Ui.lp(Theme.dp(44), Theme.dp(44)));
-            setBackground(Ui.press(Ui.round(0, 16), 16));
+            addView(trailing, Ui.lp(Theme.dp(42), Theme.dp(42)));
+            setBackground(Ui.press(Ui.card(18), 18));
         }
         void bind(Remote.Entry e, int index) {
             entry = e;
             name.setText(e.name);
-            icon.setImageDrawable(new Glyph(Glyph.forFile(e.name, e.directory), Theme.INK));
+            int kind = Glyph.forFile(e.name, e.directory);
+            icon.setImageDrawable(new Glyph(kind, iconTint(kind), Theme.dp(21)));
+            icon.setBackground(Ui.round(iconBg(kind), 15));
             String date = Ui.shortDate(e.modified);
-            meta.setText(e.directory ? (date.isEmpty() ? S.FOLDER : S.FOLDER + "    " + date)
-                                     : (date.isEmpty() ? Ui.size(e.size) : Ui.size(e.size) + "    " + date));
+            meta.setText(e.directory ? (date.isEmpty() ? S.FOLDER : S.FOLDER + " · " + date)
+                                     : (date.isEmpty() ? Ui.size(e.size) : Ui.size(e.size) + " · " + date));
             setContentDescription((e.directory ? S.FOLDER : S.FILE) + "，" + e.name);
             setChecked(list.isItemChecked(index));
         }
@@ -568,17 +614,17 @@ final class FilesPage {
             checked = value;
             boolean selecting = a.browser != null && a.browser.selecting;
             if (selecting) {
-                trailing.setImageDrawable(new Glyph(value ? Glyph.CHECK : Glyph.SELECT, value ? Theme.ON_INK : Theme.FAINT));
-                trailing.setBackground(value ? Ui.round(Theme.INK, 22) : null);
+                trailing.setImageDrawable(new Glyph(value ? Glyph.CHECK : Glyph.SELECT, value ? Theme.ON_LAMP : Theme.FAINT, Theme.dp(20)));
+                trailing.setBackground(value ? Ui.round(Theme.LAMP, 21) : null);
                 trailing.setClickable(false);
                 trailing.setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
-                setBackground(Ui.press(Ui.round(value ? Theme.INSET : 0, 16), 16));
+                setBackground(Ui.press(value ? Ui.outline(Theme.LAMP_SOFT, Theme.LAMP_GLOW, 1.2f, 18) : Ui.card(18), 18));
             } else {
-                trailing.setImageDrawable(new Glyph(Glyph.MORE, Theme.MUTED));
+                trailing.setImageDrawable(new Glyph(Glyph.MORE, Theme.MUTED, Theme.dp(20)));
                 trailing.setBackground(Ui.pressOval(0));
                 trailing.setClickable(true);
                 trailing.setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_AUTO);
-                setBackground(Ui.press(Ui.round(0, 16), 16));
+                setBackground(Ui.press(Ui.card(18), 18));
             }
         }
     }

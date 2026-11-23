@@ -140,6 +140,7 @@ final class S {
     static final String Q_BALANCED = "均衡", Q_BALANCED_DETAIL = "宽 1280 像素，质量 65";
     static final String Q_SHARP = "清晰", Q_SHARP_DETAIL = "宽 1920 像素，质量 75";
     static final String FULL_EXIT = "退出", FULL_ROTATE = "横竖屏", FULL_COLLAPSE = "收起", FULL_TOOLS = "显示工具栏",
+                        FULL_DRAG = "拖动工具栏",
                         FULL_CONTROL_ON = "控制中", FULL_RIGHT = "右键", FULL_RIGHT_ARMED = "点按处右键",
                         RIGHT_ARMED = "下一次点按将发送右键；也可以双指轻点", RIGHT_NEED_CONTROL = "请先开启控制，再使用右键";
 

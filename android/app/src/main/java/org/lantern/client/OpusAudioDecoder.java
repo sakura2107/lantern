@@ -3,9 +3,11 @@ import android.media.*;
 import java.io.*;
 import java.nio.*;
 
-/** Platform codec owns its buffers; output is bounded to one 10ms stereo frame per input. */
+/** Platform codec owns its buffers; output is bounded to one 10ms stereo frame per input. Single owner. */
 final class OpusAudioDecoder implements AutoCloseable {
+    static final int MAX_OUTPUT_CHUNK = 1920, MAX_OUTPUT_BYTES = 3840;
     final MediaCodec codec;
+    final MediaCodec.BufferInfo outputInfo = new MediaCodec.BufferInfo();
     long hostOrigin=-1,decodedFrames,outputHostPts;
     static boolean available() {
         try {
@@ -41,8 +43,26 @@ final class OpusAudioDecoder implements AutoCloseable {
         b.putLong(value).flip();
         return b;
     }
-    byte[] decode(byte[] encoded, long pts) throws IOException {
-        if(hostOrigin<0)hostOrigin=pts;outputHostPts=hostOrigin+decodedFrames*1_000_000L/48000;
+    static int appendOutput(ByteBuffer out, int offset, int size, byte[] scratch, int validBytes)
+        throws IOException {
+        if (scratch == null || scratch.length < MAX_OUTPUT_BYTES)
+            throw new IOException("Opus 解码缓冲不足");
+        if (size < 0 || size > MAX_OUTPUT_CHUNK || validBytes < 0 || validBytes + size > MAX_OUTPUT_BYTES)
+            throw new IOException("Opus 输出缓冲超限");
+        if (size == 0)
+            return validBytes;
+        if (out == null || offset < 0)
+            throw new IOException("Opus 输出缓冲异常");
+        out.position(offset);
+        out.get(scratch, validBytes, size);
+        return validBytes + size;
+    }
+    int decodeInto(byte[] encoded, long pts, byte[] scratch) throws IOException {
+        if (scratch == null || scratch.length < MAX_OUTPUT_BYTES)
+            throw new IOException("Opus 解码缓冲不足");
+        if (hostOrigin < 0)
+            hostOrigin = pts;
+        outputHostPts = hostOrigin + decodedFrames * 1_000_000L / 48000;
         int input = codec.dequeueInputBuffer(20000);
         if (input < 0)
             throw new IOException("Opus 输入缓冲超时");
@@ -50,10 +70,9 @@ final class OpusAudioDecoder implements AutoCloseable {
         buffer.clear();
         buffer.put(encoded);
         codec.queueInputBuffer(input, 0, encoded.length, pts, 0);
-        ByteArrayOutputStream pcm = new ByteArrayOutputStream(1920);
-        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+        int validBytes = 0;
         for (int i = 0; i < 5; i++) {
-            int output = codec.dequeueOutputBuffer(info, i == 0 ? 20000 : 0);
+            int output = codec.dequeueOutputBuffer(outputInfo, i == 0 ? 20000 : 0);
             if (output == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 MediaFormat format = codec.getOutputFormat();
                 if (format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) != 2 ||
@@ -64,18 +83,14 @@ final class OpusAudioDecoder implements AutoCloseable {
             if (output < 0)
                 break;
             try {
-                if (info.size < 0 || info.size > 1920 || pcm.size() + info.size > 3840)
-                    throw new IOException("Opus 输出缓冲超限");
-                ByteBuffer out = codec.getOutputBuffer(output);
-                out.position(info.offset);
-                byte[] bytes = new byte[info.size];
-                out.get(bytes);
-                pcm.write(bytes, 0, bytes.length);
+                ByteBuffer out = outputInfo.size > 0 ? codec.getOutputBuffer(output) : null;
+                validBytes = appendOutput(out, outputInfo.offset, outputInfo.size, scratch, validBytes);
             } finally {
                 codec.releaseOutputBuffer(output, false);
             }
         }
-        byte[] result=pcm.toByteArray();decodedFrames+=result.length/4;return result;
+        decodedFrames += validBytes / 4;
+        return validBytes;
     }
     public void close() {
         try {

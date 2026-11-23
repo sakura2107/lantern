@@ -33,7 +33,7 @@ final class DesktopPage {
                 // Portrait: a 16:9 frame, never shorter than the empty state needs.
                 if (!landscape) {
                     int width = MeasureSpec.getSize(w);
-                    h = MeasureSpec.makeMeasureSpec(Math.max(width * 9 / 16, Theme.dp(220)), MeasureSpec.EXACTLY);
+                    h = MeasureSpec.makeMeasureSpec(Math.max(width * 9 / 16, Theme.dp(206)), MeasureSpec.EXACTLY);
                 }
                 super.onMeasure(w, h);
             }
@@ -43,24 +43,29 @@ final class DesktopPage {
                 post(() -> emptyIcon.setVisibility(h < Theme.dp(210) ? View.GONE : View.VISIBLE));
             }
         };
-        preview.setBackground(Ui.round(Theme.dark ? 0xff05080b : 0xff121820, 22));
+        preview.setBackground(Ui.gradient(Theme.dark ? 0xff0a0f17 : 0xff161f2c, Theme.dark ? 0xff05080d : 0xff0d131c,
+                                          Theme.dark ? Theme.RIM : 0x26ffffff, 1f, 24));
+        preview.setElevation(Theme.dp(4));
         empty = Ui.column(a);
         empty.setGravity(Gravity.CENTER);
-        empty.setPadding(Theme.dp(24), Theme.dp(16), Theme.dp(24), Theme.dp(16));
+        empty.setPadding(Theme.dp(26), Theme.dp(18), Theme.dp(26), Theme.dp(18));
         emptyIcon = new ImageView(a);
-        emptyIcon.setImageDrawable(new Glyph(Glyph.DESKTOP, 0x99ffffff, Theme.dp(36)));
-        empty.addView(emptyIcon, Ui.lp(Theme.dp(36), Theme.dp(36)));
+        emptyIcon.setScaleType(ImageView.ScaleType.CENTER);
+        emptyIcon.setImageDrawable(new Glyph(Glyph.DESKTOP, 0xd9ffffff, Theme.dp(28)));
+        emptyIcon.setBackground(Ui.outline(0x1affffff, 0x26ffffff, 1f, 32));
+        empty.addView(emptyIcon, Ui.lp(Theme.dp(56), Theme.dp(56)));
         emptyTitle = Ui.medium(a, S.PREVIEW_OFF, 17, 0xffffffff);
         emptyTitle.setGravity(Gravity.CENTER);
         emptyTitle.setPadding(0, Theme.dp(12), 0, Theme.dp(4));
         empty.addView(emptyTitle);
-        emptyDetail = Ui.text(a, S.PREVIEW_OFF_DETAIL, 13, 0x99ffffff);
+        emptyDetail = Ui.text(a, S.PREVIEW_OFF_DETAIL, 13, 0xa8ffffff);
         emptyDetail.setGravity(Gravity.CENTER);
-        emptyDetail.setLineSpacing(0, 1.15f);
+        emptyDetail.setLineSpacing(0, 1.2f);
         empty.addView(emptyDetail);
-        emptyAction = Ui.button(a, S.START_PICTURE, Ui.SECONDARY, a::toggleDesktop);
-        emptyAction.setTextColor(0xff1b2430);
-        emptyAction.setBackground(Ui.press(Ui.round(0xffffffff, 24), 24));
+        emptyAction = Ui.button(a, S.START_PICTURE, Ui.PRIMARY, a::toggleDesktop);
+        emptyAction.setTextColor(0xff12171e);
+        emptyAction.setBackground(Ui.press(Ui.round(Theme.LAMP, 24), 24));
+        emptyAction.setPadding(Theme.dp(24), 0, Theme.dp(24), 0);
         Ui.id(emptyAction, "desktop.subscribe.empty");
         LinearLayout.LayoutParams ep = Ui.lp(-2, Theme.dp(44));
         ep.topMargin = Theme.dp(16);
@@ -68,7 +73,7 @@ final class DesktopPage {
         preview.addView(empty, new FrameLayout.LayoutParams(-1, -1));
 
         controls = Ui.column(a);
-        controls.setPadding(0, Theme.dp(12), 0, Theme.dp(16));
+        controls.setPadding(0, Theme.dp(12), 0, Theme.dp(18));
         LinearLayout grid1 = Ui.row(a), grid2 = Ui.row(a);
         picture = new Tile(a, Glyph.DESKTOP, S.TILE_PICTURE, a::toggleDesktop);
         control = new Tile(a, Glyph.POINTER, S.TILE_CONTROL, a::toggleControl);
@@ -85,9 +90,12 @@ final class DesktopPage {
         g2.topMargin = Theme.dp(10);
         controls.addView(grid2, g2);
 
+        LinearLayout toolCard = Ui.column(a);
+        toolCard.setBackground(Ui.card(22));
+        toolCard.setElevation(Theme.dp(1));
+        toolCard.setPadding(Theme.dp(8), Theme.dp(8), Theme.dp(8), Theme.dp(8));
         LinearLayout tools1 = Ui.row(a), tools2 = Ui.row(a);
-        tools1.setPadding(0, Theme.dp(14), 0, 0);
-        tools2.setPadding(0, Theme.dp(6), 0, 0);
+        tools2.setPadding(0, Theme.dp(4), 0, 0);
         tool(tools1, Glyph.EXPAND, S.TOOL_FULLSCREEN, null, () -> {
             if (a.desktopLayout != null && a.desktopLayout.visible) a.desktopLayout.setFullscreen(true);
             else a.status(S.NEED_PICTURE);
@@ -100,43 +108,49 @@ final class DesktopPage {
         timingValue = tool(tools2, Glyph.CLOCK, S.TOOL_TIMING, "", a::showTiming, "desktop.timing");
         TextView privacy = tool(tools2, Glyph.SHIELD, S.TOOL_PRIVACY, S.UNSUPPORTED, () ->
             Sheet.info(a, S.PRIVACY_TITLE, S.PRIVACY_EXPLAIN), "desktop.privacy");
-        ((View)privacy.getParent()).setAlpha(0.6f);
-        controls.addView(tools1, Ui.lp(-1, -2));
-        controls.addView(tools2, Ui.lp(-1, -2));
+        ((View)privacy.getParent()).setAlpha(0.55f);
+        toolCard.addView(tools1, Ui.lp(-1, -2));
+        toolCard.addView(tools2, Ui.lp(-1, -2));
+        LinearLayout.LayoutParams tcp = Ui.lp(-1, -2);
+        tcp.topMargin = Theme.dp(12);
+        controls.addView(toolCard, tcp);
 
         controlScroll = new ScrollView(a);
+        controlScroll.setOverScrollMode(View.OVER_SCROLL_IF_CONTENT_SCROLLS);
         controlScroll.addView(controls);
         orientation(a.getResources().getConfiguration().orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE);
     }
 
     void addTile(LinearLayout row, Tile tile, boolean gap) {
         LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, -2, 1);
-        if (gap) p.setMarginStart(Theme.dp(10));
+        if (gap) p.setMarginStart(Theme.dp(12));
         row.addView(tile, p);
     }
 
     TextView tool(LinearLayout row, int glyph, String label, String value, Runnable action, String id) {
         LinearLayout t = Ui.column(a);
         t.setGravity(Gravity.CENTER_HORIZONTAL);
-        t.setPadding(0, Theme.dp(8), 0, Theme.dp(6));
-        ImageView icon = Ui.glyphTile(a, glyph, Theme.INK, Theme.INSET, 48, 16);
-        t.addView(icon, Ui.lp(Theme.dp(48), Theme.dp(48)));
-        TextView name = Ui.text(a, label, 12, Theme.INK);
+        t.setPadding(Theme.dp(2), Theme.dp(8), Theme.dp(2), Theme.dp(6));
+        ImageView icon = Ui.glyphTile(a, glyph, Theme.INK, Theme.INSET, 46, 15);
+        icon.setBackground(Ui.outline(Theme.INSET, Theme.RIM, 1f, 15));
+        t.addView(icon, Ui.lp(Theme.dp(46), Theme.dp(46)));
+        TextView name = Ui.medium(a, label, 12, Theme.INK);
         name.setGravity(Gravity.CENTER);
-        name.setPadding(0, Theme.dp(6), 0, 0);
+        name.setPadding(0, Theme.dp(7), 0, 0);
         Ui.oneLine(name);
         t.addView(name);
-        TextView sub = Ui.numeric(Ui.text(a, value == null ? "" : value, 11, Theme.MUTED));
+        TextView sub = Ui.numeric(Ui.text(a, value == null ? " " : value, 10.5f, Theme.MUTED));
         sub.setGravity(Gravity.CENTER);
+        sub.setPadding(0, Theme.dp(1), 0, 0);
         Ui.oneLine(sub);
-        // Values stay off the grid so every tool lines up; the sheet behind each tool shows them.
-        sub.setVisibility(View.GONE);
+        sub.setVisibility(value == null ? View.INVISIBLE : View.VISIBLE);
         t.addView(sub);
         t.setBackground(Ui.press(Ui.round(0, 16), 16));
         t.setOnClickListener(v -> action.run());
         t.setFocusable(true);
         t.setContentDescription(label);
         Ui.role(t, Button.class);
+        Ui.bounce(t, 0.94f);
         Ui.id(t, id);
         row.addView(t, new LinearLayout.LayoutParams(0, -2, 1));
         return sub;
@@ -184,13 +198,13 @@ final class DesktopPage {
         boolean showVideo = subscribed && display;
         empty.setVisibility(showVideo ? View.GONE : View.VISIBLE);
         if (!subscribed) {
-            emptyIcon.setImageDrawable(new Glyph(Glyph.DESKTOP, 0x99ffffff, Theme.dp(36)));
+            emptyIcon.setImageDrawable(new Glyph(Glyph.DESKTOP, 0xd9ffffff, Theme.dp(28)));
             emptyTitle.setText(S.PREVIEW_OFF);
             emptyDetail.setText(shell.connected || a.credentials != null ? S.PREVIEW_OFF_DETAIL : S.PREVIEW_NEED_DEVICE);
             emptyAction.setText(S.START_PICTURE);
             emptyAction.setOnClickListener(v -> a.toggleDesktop());
         } else if (!display) {
-            emptyIcon.setImageDrawable(new Glyph(Glyph.EYE_OFF, 0x99ffffff, Theme.dp(36)));
+            emptyIcon.setImageDrawable(new Glyph(Glyph.EYE_OFF, Theme.LAMP, Theme.dp(28)));
             emptyTitle.setText(S.PREVIEW_HIDDEN);
             emptyDetail.setText(S.PREVIEW_HIDDEN_DETAIL);
             emptyAction.setText(S.SHOW_PICTURE);

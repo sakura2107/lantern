@@ -331,7 +331,7 @@ void transfer_tree(Client& c, const TransferTask& task, const fs::path& manifest
                 throw Error(Code::source_changed, "Remote file changed since snapshot");
             if (fs::exists(local)) {
                 auto info = c.stat(remote, true, &cancel);
-                if (hash_file(local) != info.hash)
+                if (hash_file(local, cancel) != info.hash)
                     throw Error(Code::integrity, "Completed staged file hash differs");
                 n.hash = info.hash;
             } else {

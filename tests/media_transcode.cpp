@@ -1,4 +1,6 @@
+#include "lantern/media_frame_guard.hpp"
 #include "lantern/media_transcode.hpp"
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -92,10 +94,33 @@ static Timeline timeline(const fs::path& path){AVFormatContext* format=nullptr;A
         cleanup();return t;
     }catch(...){cleanup();throw;}
 }
+static void check_audio_frame_guard(){
+    AudioInputFormat expected{};
+    expected.sample_rate=48000;expected.sample_format=int(AV_SAMPLE_FMT_FLTP);expected.channels=2;
+    expected.layout_order=int(AV_CHANNEL_ORDER_NATIVE);expected.channel_mask=AV_CH_LAYOUT_STEREO;
+    expected.planar=true;expected.required_planes=2;expected.bytes_per_sample=av_get_bytes_per_sample(AV_SAMPLE_FMT_FLTP);
+    std::uint8_t plane0[16]{},plane1[16]{};
+    const std::uint8_t* valid_planes[2]{plane0,plane1};
+    check(valid_audio_frame(expected,expected,valid_planes,1024,0),"audio guard accepts matching FLTP stereo frame");
+    check(valid_audio_frame(expected,expected,valid_planes,1024,1024),"audio guard accepts skip == nb_samples");
+    check(valid_audio_frame(expected,expected,valid_planes,1<<20,0),"audio guard accepts max nb_samples");
+    AudioInputFormat changed_layout=expected;changed_layout.channels=6;changed_layout.channel_mask=AV_CH_LAYOUT_5POINT1;changed_layout.required_planes=6;
+    check(!valid_audio_frame(expected,changed_layout,valid_planes,1024,0),"audio guard rejects channel layout change");
+    AudioInputFormat custom_layout=expected;custom_layout.layout_order=int(AV_CHANNEL_ORDER_CUSTOM);custom_layout.custom_channels[0]=int(AV_CHAN_FRONT_LEFT);
+    check(!valid_audio_frame(expected,custom_layout,valid_planes,1024,0),"audio guard rejects custom channel order change");
+    const std::uint8_t* short_planes[1]{plane0};
+    check(!valid_audio_frame(expected,expected,short_planes,1024,0),"audio guard rejects insufficient planes");
+    const std::uint8_t* null_planes[2]{plane0,nullptr};
+    check(!valid_audio_frame(expected,expected,null_planes,1024,0),"audio guard rejects null plane pointer");
+    for(int rate:{0,7999,192001}){AudioInputFormat bad=expected;bad.sample_rate=rate;check(!valid_audio_frame(bad,bad,valid_planes,1024,0),"audio guard rejects invalid sample rate");}
+    check(!valid_audio_frame(expected,expected,valid_planes,(1<<20)+1,0),"audio guard rejects nb_samples over 1<<20");
+    check(!valid_audio_frame(expected,expected,valid_planes,1024,-1),"audio guard rejects negative skip");
+    check(!valid_audio_frame(expected,expected,valid_planes,1024,1025),"audio guard rejects skip > nb_samples");
+}
 int wmain(int argc,wchar_t** argv){try{
     if(argc==3){int seconds=std::stoi(argv[2]);if(seconds<4||seconds>30)throw std::runtime_error("Generated fixture duration bound");
         fs::path root(argv[1]);fs::create_directories(root);fixture(root/L"source.mp4",seconds);mkv(root/L"source.mp4",root/L"source.mkv");std::cout<<"Generated fixture seconds: "<<seconds<<'\n';return 0;}
-    if(argc<2)return 2;auto root=fs::absolute(argv[1])/wide(random_token().substr(0,12));fs::create_directories(root);auto start=std::chrono::steady_clock::now();fixture(root/L"source.mp4",5);mkv(root/L"source.mp4",root/L"source.mkv");
+    if(argc<2)return 2;check_audio_frame_guard();auto root=fs::absolute(argv[1])/wide(random_token().substr(0,12));fs::create_directories(root);auto start=std::chrono::steady_clock::now();fixture(root/L"source.mp4",5);mkv(root/L"source.mp4",root/L"source.mkv");
     FileService files(root);auto tracks=media_tracks(files.media_source("source.mkv"),[]{return false;});check(tracks.width==3840&&tracks.height==2160&&!tracks.hdr,"4K HEVC SDR source inspected");
     check(tracks.tracks.size()==2&&tracks.tracks[0].codec=="aac"&&tracks.tracks[1].codec=="ass","audio/ASS track list queried");
     auto encode_start=std::chrono::steady_clock::now();auto plain=media_segment(files.media_source("source.mkv"),tracks.source.version,{1280,720,1,-1},0,[]{return false;});double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-encode_start).count();write_file(root/L"plain.ts",plain);

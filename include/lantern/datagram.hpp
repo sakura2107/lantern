@@ -26,12 +26,13 @@ class DatagramCipher {
 // One frame => fragments + one XOR parity fragment per group of eight. No compression of encoded media.
 void fragment_datagram(uint64_t frame,std::span<const uint8_t>,const std::function<void(Datagram)>&);
 class DatagramFrames {
-    struct Frame {uint32_t total,count;uint64_t began;std::map<uint32_t,Bytes> data,parity;};
+    struct Frame {uint32_t total,count;uint64_t began,last_nack=0;std::map<uint32_t,Bytes> data,parity;};
     std::map<uint64_t,Frame> frames_;
     uint64_t delivered_=0;bool have_delivered_=false;
   public:
     std::optional<Bytes> accept(const Datagram&,uint64_t now_ms);
-    std::vector<uint32_t> missing(uint64_t frame,uint64_t now_ms) const;
+    std::vector<uint32_t> missing(uint64_t frame,uint64_t now_ms,uint32_t retention_ms=160) const;
+    std::optional<std::pair<uint64_t,std::vector<uint32_t>>> nack(uint64_t now_ms,uint32_t retention_ms=160);
     void clear(){frames_.clear();}
 };
 } // namespace lantern

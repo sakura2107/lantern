@@ -1,8 +1,10 @@
 #pragma once
 #include "core.hpp"
+#include "input_session.hpp"
 #include "network.hpp"
 #include "network_security.hpp"
 #include "pairing.hpp"
+#include <condition_variable>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -46,8 +48,11 @@ std::string random_token();
 uint64_t monotonic_us();
 std::string sha256(std::span<const uint8_t>);
 std::string hash_file(HANDLE);
+std::string hash_file(HANDLE, const std::function<void()>& check_cancel,
+                      const std::function<void(uint64_t,uint64_t)>& progress);
 std::string hash_file(HANDLE,Cancel&,std::function<void(uint64_t,uint64_t)>);
 std::string hash_file(const fs::path&);
+std::string hash_file(const fs::path&, Cancel&);
 Bytes read_file(const fs::path&, size_t max = 1024 * 1024);
 void write_file(const fs::path&, std::span<const uint8_t>);
 Bytes protect(std::span<const uint8_t>);
@@ -61,6 +66,7 @@ struct Identity {
     std::string fingerprint() const;
 };
 class Tls {
+    friend struct TlsFirstSendProbe;
     struct Impl;
     std::unique_ptr<Impl> p_;
 
@@ -109,14 +115,28 @@ class DirectorySearch {
 class FileService {
     friend class IncrementalSearch;
     fs::path root_;
-    Handle root_lock_;
-    std::mutex mutations_;
+    Handle root_lock_, stage_lock_;
+    class Mutation {
+        FileService& files_;
+        std::vector<std::wstring> keys_;
+        void reserve();
+      public:
+        struct UploadId { const std::string& value; };
+        Mutation(FileService&, UploadId);
+        Mutation(FileService&, const std::string& path, const std::string& other = {});
+        ~Mutation();
+        Mutation(const Mutation&) = delete;
+    };
+    std::mutex mutation_table_;
+    std::condition_variable mutation_done_;
+    std::vector<const Mutation*> active_mutations_;
+    std::once_flag init_stage_;
     std::mutex hash_mutex_;
     std::map<std::string,std::string> hash_cache_;
     FileInfo inspect(const std::string&,bool,Cancel*,std::function<void(uint64_t,uint64_t)>);
     Guard guard(const std::string&, bool allow_missing = false);
     Handle open_read(Guard&);
-    fs::path stage(const std::string& id);
+    fs::path stage(const std::string& id, bool create_directory = false);
 
   public:
     explicit FileService(fs::path);
@@ -134,7 +154,7 @@ class FileService {
     Bytes read(const std::string&, const std::string& version, uint64_t off, uint32_t n);
     std::pair<std::string, uint64_t> begin(const std::string&, uint64_t, const std::string& hash);
     uint64_t chunk(const std::string& id, uint64_t off, std::span<const uint8_t>);
-    void commit(const std::string& id);
+    void commit(const std::string& id, const std::function<bool()>& cancelled = {});
     void mutate(Op, const std::string&, const std::string& to = "");
 };
 Bytes image_thumbnail(std::span<const uint8_t>, uint32_t width);
@@ -188,21 +208,6 @@ std::unique_ptr<DesktopStream> open_desktop_stream(uint32_t monitor, uint32_t wi
 void remote_input(uint32_t kind, int32_t x, int32_t y, uint32_t value, uint32_t monitor);
 void set_input_validation_pid(uint32_t pid);
 void remote_click(int32_t x, int32_t y, uint32_t monitor);
-// Connection-owned pointer lease. Never transfers a held button to a new connection.
-class InputSession {
-  public:
-    ~InputSession();
-    InputSession() = default;
-    InputSession(const InputSession&) = delete;
-    void pointer(uint32_t phase, int32_t x, int32_t y, uint32_t monitor);
-    void click(int32_t x, int32_t y, uint32_t monitor, bool twice = false);
-    void text(const std::string&);
-    void key(uint32_t vk, uint32_t count);
-    void shortcut(uint32_t modifiers,uint32_t vk);
-    void right_click(int32_t x,int32_t y,uint32_t monitor);
-    uint32_t focus(); // flags: 1 known editable native text field, 2 password; no contents.
-    void cancel() noexcept;
-};
 void expire_pointer_lease() noexcept;
 struct AudioConfig { uint32_t sample_rate, channels = 2, bits = 16; std::string provider = "wasapi-loopback"; };
 struct AudioFrame { uint64_t pts_us; uint32_t flags; Bytes pcm; }; // flags1 discontinuity,2 idle heartbeat

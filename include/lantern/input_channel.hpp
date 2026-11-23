@@ -44,6 +44,24 @@ class InputChannel {
     void run();
     void publish();
 };
+// Caller holds the input mutex. Zero is reserved for an unowned button.
+class PointerLease {
+    uint64_t owner_ = 0;
+  public:
+    bool held() const noexcept { return owner_ != 0; }
+    bool owns(uint64_t generation) const noexcept { return held() && owner_ == generation; }
+    bool acquire(uint64_t generation) noexcept {
+        if (!generation || held()) return false;
+        owner_ = generation;
+        return true;
+    }
+    bool release(uint64_t generation) noexcept {
+        if (!owns(generation)) return false;
+        owner_ = 0;
+        return true;
+    }
+    uint64_t owner() const noexcept { return owner_; }
+};
 // Retained by one authenticated host process. Never persist raw input or identity in a journal.
 class InputReplay {
     uint64_t last_ = 0;

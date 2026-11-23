@@ -19,7 +19,7 @@ final class DevicePage {
     final TextView headline, detail, fingerprintSummary, pinHint, formSummary;
     final Button scan, pair, browse, disconnect;
     final EditText host, pin, secret;
-    final LinearLayout form, formHeader;
+    final LinearLayout hero, form, formHeader;
     final ImageView formChevron;
     final TextView notifyState;
     final LinearLayout computersRow;
@@ -37,29 +37,32 @@ final class DevicePage {
         view.addView(content);
 
         // Hero: the lamp and what the app can do right now.
-        LinearLayout hero = Ui.column(a);
-        hero.setBackground(Ui.outline(Theme.SURFACE, Theme.LINE, 24));
-        hero.setPadding(Theme.dp(20), Theme.dp(20), Theme.dp(20), Theme.dp(20));
+        hero = Ui.column(a);
+        hero.setBackground(Ui.card(24));
+        hero.setElevation(Theme.dp(2));
+        hero.setPadding(Theme.dp(22), Theme.dp(22), Theme.dp(22), Theme.dp(22));
         content.addView(hero, Ui.lp(-1, -2));
         LinearLayout top = Ui.row(a);
         lamp = new Lamp(a);
-        top.addView(lamp, Ui.lp(Theme.dp(64), Theme.dp(64)));
+        top.addView(lamp, Ui.lp(Theme.dp(68), Theme.dp(68)));
         LinearLayout lines = Ui.column(a);
         LinearLayout.LayoutParams lp = Ui.weight(1);
-        lp.setMarginStart(Theme.dp(14));
+        lp.setMarginStart(Theme.dp(15));
         top.addView(lines, lp);
-        headline = Ui.medium(a, S.HERO_UNPAIRED, 20, Theme.INK);
+        headline = Ui.medium(a, S.HERO_UNPAIRED, 20.5f, Theme.INK);
+        headline.setLetterSpacing(-0.015f);
         headline.setMaxLines(2);
         headline.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         lines.addView(headline);
-        fingerprintSummary = Ui.numeric(Ui.text(a, "", 13, Theme.MUTED));
+        fingerprintSummary = Ui.numeric(Ui.text(a, "", 12.5f, Theme.MUTED));
+        fingerprintSummary.setTypeface(Theme.MONO);
         Ui.oneLine(fingerprintSummary);
-        fingerprintSummary.setPadding(0, Theme.dp(2), 0, 0);
+        fingerprintSummary.setPadding(0, Theme.dp(4), 0, 0);
         lines.addView(fingerprintSummary);
         hero.addView(top, Ui.lp(-1, -2));
-        detail = Ui.text(a, S.HERO_UNPAIRED_DETAIL, 14, Theme.MUTED);
-        detail.setLineSpacing(0, 1.15f);
-        detail.setPadding(0, Theme.dp(14), 0, Theme.dp(16));
+        detail = Ui.text(a, S.HERO_UNPAIRED_DETAIL, 13.5f, Theme.MUTED);
+        detail.setLineSpacing(0, 1.25f);
+        detail.setPadding(0, Theme.dp(14), 0, Theme.dp(18));
         hero.addView(detail);
         LinearLayout actions = Ui.row(a);
         // First pairing: scanning the computer's QR is the main path; manual entry stays below.
@@ -89,24 +92,27 @@ final class DevicePage {
 
         // Saved computers: shown once one exists; opens the switch/remove sheet.
         computersRow = Ui.row(a);
-        computersRow.setPadding(Theme.dp(16), Theme.dp(14), Theme.dp(12), Theme.dp(14));
-        computersRow.setBackground(Ui.press(Ui.outline(Theme.SURFACE, Theme.LINE, 20), 20));
+        computersRow.setPadding(Theme.dp(16), Theme.dp(15), Theme.dp(14), Theme.dp(15));
+        computersRow.setBackground(Ui.press(Ui.card(22), 22));
+        computersRow.setElevation(Theme.dp(1));
         computersRow.setGravity(Gravity.CENTER_VERTICAL);
-        computersRow.addView(Ui.glyphTile(a, Glyph.MONITORS, Theme.INK, 0, 40, 12), Ui.lp(Theme.dp(40), Theme.dp(40)));
+        computersRow.addView(Ui.glyphTile(a, Glyph.MONITORS, Theme.dark ? Theme.LAMP : Theme.LAMP_TEXT, Theme.LAMP_SOFT, 42, 13), Ui.lp(Theme.dp(42), Theme.dp(42)));
         LinearLayout computerLines = Ui.column(a);
-        computerLines.addView(Ui.medium(a, S.COMPUTERS_ROW, 15, Theme.INK));
+        computerLines.addView(Ui.medium(a, S.COMPUTERS_ROW, 15.5f, Theme.INK));
         computersSummary = Ui.text(a, "", 13, Theme.MUTED);
+        computersSummary.setPadding(0, Theme.dp(2), 0, 0);
         Ui.oneLine(computersSummary);
         computerLines.addView(computersSummary);
         LinearLayout.LayoutParams clp = Ui.weight(1);
-        clp.setMarginStart(Theme.dp(12));
+        clp.setMarginStart(Theme.dp(13));
         computersRow.addView(computerLines, clp);
         ImageView computerChevron = new ImageView(a);
-        computerChevron.setImageDrawable(new Glyph(Glyph.CHEVRON_RIGHT, Theme.MUTED));
-        computersRow.addView(computerChevron, Ui.lp(Theme.dp(24), Theme.dp(24)));
+        computerChevron.setImageDrawable(new Glyph(Glyph.CHEVRON_RIGHT, Theme.FAINT, Theme.dp(18)));
+        computersRow.addView(computerChevron, Ui.lp(Theme.dp(20), Theme.dp(20)));
         computersRow.setOnClickListener(v -> a.showComputers());
         computersRow.setFocusable(true);
         Ui.role(computersRow, Button.class);
+        Ui.bounce(computersRow, 0.98f);
         Ui.id(computersRow, "device.computers");
         LinearLayout.LayoutParams crp = Ui.lp(-1, -2);
         crp.topMargin = Theme.dp(12);
@@ -115,15 +121,18 @@ final class DevicePage {
 
         // Pairing details; collapses to a one-line summary once saved.
         formHeader = Ui.row(a);
-        formHeader.setPadding(Theme.dp(4), Theme.dp(22), Theme.dp(4), Theme.dp(8));
+        formHeader.setPadding(Theme.dp(6), Theme.dp(22), Theme.dp(6), Theme.dp(10));
         LinearLayout headerText = Ui.column(a);
-        headerText.addView(Ui.medium(a, S.PAIRING, 15, Theme.INK));
-        formSummary = Ui.text(a, "", 13, Theme.MUTED);
+        TextView pairingTitle = Ui.medium(a, S.PAIRING, 14, Theme.MUTED);
+        pairingTitle.setLetterSpacing(0.03f);
+        headerText.addView(pairingTitle);
+        formSummary = Ui.text(a, "", 13, Theme.INK);
+        formSummary.setPadding(0, Theme.dp(2), 0, 0);
         Ui.oneLine(formSummary);
         headerText.addView(formSummary);
         formHeader.addView(headerText, Ui.weight(1));
         formChevron = new ImageView(a);
-        formChevron.setImageDrawable(new Glyph(Glyph.CHEVRON_DOWN, Theme.MUTED));
+        formChevron.setImageDrawable(new Glyph(Glyph.CHEVRON_DOWN, Theme.MUTED, Theme.dp(20)));
         formHeader.addView(formChevron, Ui.lp(Theme.dp(24), Theme.dp(24)));
         formHeader.setBackground(Ui.press(Ui.round(0, 14), 14));
         formHeader.setOnClickListener(v -> setFormOpen(!formOpen));
@@ -133,12 +142,13 @@ final class DevicePage {
         content.addView(formHeader, Ui.lp(-1, -2));
 
         form = Ui.column(a);
-        form.setBackground(Ui.outline(Theme.SURFACE, Theme.LINE, 20));
-        form.setPadding(Theme.dp(16), Theme.dp(4), Theme.dp(16), Theme.dp(16));
+        form.setBackground(Ui.card(22));
+        form.setElevation(Theme.dp(1));
+        form.setPadding(Theme.dp(18), Theme.dp(6), Theme.dp(18), Theme.dp(18));
         content.addView(form, Ui.lp(-1, -2));
 
         LinearLayout quick = Ui.row(a);
-        quick.setPadding(0, Theme.dp(12), 0, Theme.dp(2));
+        quick.setPadding(0, Theme.dp(12), 0, Theme.dp(4));
         Button formScan = Ui.button(a, S.SCAN_PAIR, Ui.SECONDARY, a::scanPairing);
         Ui.withIcon(formScan, Glyph.SCAN);
         Ui.id(formScan, "device.form.scan");
@@ -147,7 +157,7 @@ final class DevicePage {
         Ui.withIcon(pasteLink, Glyph.CLIPBOARD);
         Ui.id(pasteLink, "device.form.paste");
         LinearLayout.LayoutParams qp = new LinearLayout.LayoutParams(0, Theme.dp(44), 1);
-        qp.setMarginStart(Theme.dp(8));
+        qp.setMarginStart(Theme.dp(10));
         quick.addView(pasteLink, qp);
         form.addView(quick, Ui.lp(-1, -2));
 
@@ -180,7 +190,8 @@ final class DevicePage {
         Ui.id(pin, "device.fingerprint");
         pinRow.addView(pin, Ui.weight(1));
         ImageView paste = Ui.iconButton(a, Glyph.PASTE, S.PASTE_FINGERPRINT, this::pasteFingerprint);
-        paste.setBackground(Ui.press(Ui.round(Theme.INSET, 14), 14));
+        paste.setBackground(Ui.press(Ui.outline(Theme.INSET, Theme.LINE, 1f, 16), 16));
+        Ui.bounce(paste, 0.94f);
         LinearLayout.LayoutParams pp = Ui.lp(Theme.dp(48), Theme.dp(48));
         pp.setMarginStart(Theme.dp(8));
         pinRow.addView(paste, pp);
@@ -211,7 +222,8 @@ final class DevicePage {
             eye[0].setImageDrawable(new Glyph(secretVisible ? Glyph.EYE_OFF : Glyph.EYE, Theme.INK));
             eye[0].setContentDescription(secretVisible ? S.HIDE_SECRET : S.SHOW_SECRET);
         });
-        eye[0].setBackground(Ui.press(Ui.round(Theme.INSET, 14), 14));
+        eye[0].setBackground(Ui.press(Ui.outline(Theme.INSET, Theme.LINE, 1f, 16), 16));
+        Ui.bounce(eye[0], 0.94f);
         LinearLayout.LayoutParams ep = Ui.lp(Theme.dp(48), Theme.dp(48));
         ep.setMarginStart(Theme.dp(8));
         secretRow.addView(eye[0], ep);
@@ -230,53 +242,63 @@ final class DevicePage {
         // Tools.
         content.addView(Ui.heading(a, S.TOOLS));
         LinearLayout tools = Ui.column(a);
-        tools.setBackground(Ui.outline(Theme.SURFACE, Theme.LINE, 20));
+        tools.setBackground(Ui.card(22));
+        tools.setElevation(Theme.dp(1));
         tools.setPadding(Theme.dp(6), Theme.dp(6), Theme.dp(6), Theme.dp(6));
         content.addView(tools, Ui.lp(-1, -2));
-        toolRow(tools, Glyph.PULSE, S.DIAGNOSTICS, S.DIAGNOSTICS_DETAIL, a::networkDiagnostics, "device.diagnostics", null);
-        notifyState = Ui.text(a, "", 13, Theme.MUTED);
-        toolRow(tools, Glyph.BELL, S.NOTIFICATIONS, S.NOTIFICATIONS_DETAIL, a::enableTransferNotifications, "device.notifications", notifyState);
-        toolRow(tools, Glyph.LICENSE, S.LICENSES, S.LICENSES_DETAIL, a::showLicenses, "device.licenses", null);
+        toolRow(tools, Glyph.PULSE, S.DIAGNOSTICS, S.DIAGNOSTICS_DETAIL, a::networkDiagnostics, "device.diagnostics", null, true);
+        notifyState = Ui.chip(a, "", Theme.MUTED, Theme.INSET);
+        toolRow(tools, Glyph.BELL, S.NOTIFICATIONS, S.NOTIFICATIONS_DETAIL, a::enableTransferNotifications, "device.notifications", notifyState, true);
+        toolRow(tools, Glyph.LICENSE, S.LICENSES, S.LICENSES_DETAIL, a::showLicenses, "device.licenses", null, false);
 
         TextView footer = Ui.text(a, S.PRIVACY_NOTE, 12, Theme.FAINT);
-        footer.setLineSpacing(0, 1.2f);
-        footer.setPadding(Theme.dp(4), Theme.dp(18), Theme.dp(4), 0);
+        footer.setLineSpacing(0, 1.25f);
+        footer.setPadding(Theme.dp(6), Theme.dp(18), Theme.dp(6), 0);
         content.addView(footer);
         summarize();
     }
 
-    void toolRow(LinearLayout parent, int glyph, String title, String sub, Runnable action, String id, TextView trailing) {
+    void toolRow(LinearLayout parent, int glyph, String title, String sub, Runnable action, String id, TextView trailing, boolean divider) {
         LinearLayout r = Ui.row(a);
-        r.setPadding(Theme.dp(10), Theme.dp(10), Theme.dp(10), Theme.dp(10));
-        r.setMinimumHeight(Theme.dp(60));
-        r.addView(Ui.glyphTile(a, glyph, Theme.INK, Theme.INSET, 40, 12), Ui.lp(Theme.dp(40), Theme.dp(40)));
+        r.setPadding(Theme.dp(12), Theme.dp(11), Theme.dp(10), Theme.dp(11));
+        r.setMinimumHeight(Theme.dp(62));
+        r.addView(Ui.glyphTile(a, glyph, Theme.INK, Theme.INSET, 42, 13), Ui.lp(Theme.dp(42), Theme.dp(42)));
         LinearLayout lines = Ui.column(a);
         LinearLayout.LayoutParams p = Ui.weight(1);
-        p.setMarginStart(Theme.dp(12));
-        lines.addView(Ui.text(a, title, 16, Theme.INK));
-        TextView d = Ui.text(a, sub, 13, Theme.MUTED);
+        p.setMarginStart(Theme.dp(13));
+        lines.addView(Ui.medium(a, title, 15.5f, Theme.INK));
+        TextView d = Ui.text(a, sub, 12.5f, Theme.MUTED);
+        d.setPadding(0, Theme.dp(2), 0, 0);
         lines.addView(d);
         r.addView(lines, p);
         if (trailing != null) {
             LinearLayout.LayoutParams tp = Ui.lp(-2, -2);
             tp.setMarginStart(Theme.dp(8));
+            tp.setMarginEnd(Theme.dp(4));
             r.addView(trailing, tp);
         }
         ImageView chevron = new ImageView(a);
         chevron.setImageDrawable(new Glyph(Glyph.CHEVRON_RIGHT, Theme.FAINT, Theme.dp(18)));
         r.addView(chevron, Ui.lp(Theme.dp(18), Theme.dp(18)));
-        r.setBackground(Ui.press(Ui.round(0, 14), 14));
+        r.setBackground(Ui.press(Ui.round(0, 16), 16));
         r.setOnClickListener(v -> action.run());
         r.setFocusable(true);
         Ui.role(r, Button.class);
         Ui.id(r, id);
         parent.addView(r, Ui.lp(-1, -2));
+        if (divider) {
+            View line = Ui.hairline(a);
+            LinearLayout.LayoutParams dp = Ui.lp(-1, Math.max(1, Theme.dp(0.6f)));
+            dp.setMarginStart(Theme.dp(66));
+            dp.setMarginEnd(Theme.dp(12));
+            parent.addView(line, dp);
+        }
     }
 
     void setFormOpen(boolean open) {
         formOpen = open;
         form.setVisibility(open ? View.VISIBLE : View.GONE);
-        formChevron.setRotation(open ? 180 : 0);
+        formChevron.animate().rotation(open ? 180f : 0f).setDuration(180).start();
         formSummary.setVisibility(open ? View.GONE : View.VISIBLE);
         formHeader.setContentDescription(S.PAIRING + "，" + (open ? S.EXPANDED : S.COLLAPSED));
     }
@@ -386,10 +408,26 @@ final class DevicePage {
         }
         if (offerScan)
             Ui.style(pair, Ui.SECONDARY);
+        // Keep the first visible action button flush-left with no stray start margin.
+        boolean first = true;
+        for (Button btn : new Button[] {scan, pair, browse, disconnect}) {
+            LinearLayout.LayoutParams lpBtn = (LinearLayout.LayoutParams)btn.getLayoutParams();
+            int want = (btn.getVisibility() == View.VISIBLE && !first) ? Theme.dp(10) : 0;
+            if (lpBtn.getMarginStart() != want) { lpBtn.setMarginStart(want); btn.setLayoutParams(lpBtn); }
+            if (btn.getVisibility() == View.VISIBLE) first = false;
+        }
+        if (state == AppShell.CONNECTED) {
+            hero.setBackground(Ui.gradient(Theme.TILE_ON, Theme.SURFACE, Theme.LAMP_GLOW, 1.25f, 24));
+        } else if (state == AppShell.FAILED || state == AppShell.INVALID) {
+            hero.setBackground(Ui.outline(Theme.SURFACE, Theme.alpha(Theme.DANGER, 0.4f), 1.15f, 24));
+        } else {
+            hero.setBackground(Ui.card(24));
+        }
     }
 
     void notificationsAllowed(boolean allowed) {
         notifyState.setText(allowed ? S.ALLOWED : S.NOT_ALLOWED);
         notifyState.setTextColor(allowed ? Theme.POSITIVE : Theme.MUTED);
+        notifyState.setBackground(Ui.round(allowed ? Theme.POSITIVE_SOFT : Theme.INSET, 50));
     }
 }

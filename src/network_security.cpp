@@ -28,7 +28,10 @@ bool AuthenticationGuard::acquire(const std::string& address, uint64_t now) {
     return true;
 }
 void AuthenticationGuard::release(const std::string& address) {
-    auto at = entries_.find(source_key(address));
+    release_bucket(source_key(address));
+}
+void AuthenticationGuard::release_bucket(const std::string& key) noexcept {
+    auto at = entries_.find(key);
     if (at != entries_.end() && at->second.active)
         --at->second.active;
 }

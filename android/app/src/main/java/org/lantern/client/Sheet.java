@@ -6,6 +6,7 @@ import android.graphics.drawable.ColorDrawable;
 import android.os.Build;
 import android.text.TextUtils;
 import android.view.*;
+import android.view.animation.PathInterpolator;
 import android.view.inputmethod.EditorInfo;
 import android.widget.*;
 
@@ -26,25 +27,26 @@ final class Sheet {
         dialog = new Dialog(a);
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
         root = Ui.column(a);
-        root.setBackground(Ui.topRound(Theme.SURFACE, 26));
-        root.setPadding(Theme.dp(8), Theme.dp(10), Theme.dp(8), Theme.dp(12));
+        root.setBackground(Ui.topRoundSurface(Theme.SURFACE, Theme.RIM, 28));
+        root.setPadding(Theme.dp(10), Theme.dp(10), Theme.dp(10), Theme.dp(14));
         View handle = new View(a);
-        handle.setBackground(Ui.round(Theme.LINE, 3));
-        LinearLayout.LayoutParams hp = Ui.lp(Theme.dp(36), Theme.dp(4));
+        handle.setBackground(Ui.round(Theme.alpha(Theme.MUTED, 0.36f), 4));
+        LinearLayout.LayoutParams hp = Ui.lp(Theme.dp(40), Theme.dp(4));
         hp.gravity = Gravity.CENTER_HORIZONTAL;
-        hp.bottomMargin = Theme.dp(10);
+        hp.topMargin = Theme.dp(2);
+        hp.bottomMargin = Theme.dp(12);
         root.addView(handle, hp);
         if (title != null) {
-            TextView t = Ui.medium(a, title, 18, Theme.INK);
-            t.setPadding(Theme.dp(16), Theme.dp(4), Theme.dp(16), subtitle == null ? Theme.dp(10) : Theme.dp(2));
+            TextView t = Ui.medium(a, title, 18.5f, Theme.INK);
+            t.setPadding(Theme.dp(14), Theme.dp(2), Theme.dp(14), subtitle == null ? Theme.dp(10) : Theme.dp(3));
             t.setMaxLines(2);
             t.setEllipsize(TextUtils.TruncateAt.MIDDLE);
             root.addView(t);
         }
         if (subtitle != null) {
-            TextView s = Ui.text(a, subtitle, 14, Theme.MUTED);
-            s.setPadding(Theme.dp(16), 0, Theme.dp(16), Theme.dp(12));
-            s.setLineSpacing(0, 1.15f);
+            TextView s = Ui.text(a, subtitle, 13.5f, Theme.MUTED);
+            s.setPadding(Theme.dp(14), 0, Theme.dp(14), Theme.dp(12));
+            s.setLineSpacing(0, 1.2f);
             root.addView(s);
         }
         ScrollView scroll = new ScrollView(a) {
@@ -59,7 +61,7 @@ final class Sheet {
         root.addView(scroll, Ui.lp(-1, -2));
         footer = Ui.row(a);
         footer.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
-        footer.setPadding(Theme.dp(12), Theme.dp(8), Theme.dp(12), 0);
+        footer.setPadding(Theme.dp(10), Theme.dp(10), Theme.dp(10), 0);
         footer.setVisibility(View.GONE);
         root.addView(footer, Ui.lp(-1, -2));
         root.setOnApplyWindowInsetsListener((v, insets) -> {
@@ -68,7 +70,7 @@ final class Sheet {
                 bottom = insets.getInsets(WindowInsets.Type.navigationBars() | WindowInsets.Type.ime()).bottom;
             else
                 bottom = insets.getSystemWindowInsetBottom();
-            v.setPadding(Theme.dp(8), Theme.dp(10), Theme.dp(8), Theme.dp(12) + bottom);
+            v.setPadding(Theme.dp(10), Theme.dp(10), Theme.dp(10), Theme.dp(14) + bottom);
             return insets;
         });
         dialog.setContentView(root);
@@ -79,26 +81,27 @@ final class Sheet {
             w.setBackgroundDrawable(new ColorDrawable(0));
             w.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             w.setGravity(Gravity.BOTTOM);
-            w.setWindowAnimations(android.R.style.Animation_InputMethod);
-            w.setDimAmount(Theme.dark ? 0.6f : 0.36f);
+            w.setWindowAnimations(0);
+            w.setDimAmount(Theme.dark ? 0.68f : 0.40f);
             w.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
         }
     }
 
     View row(int glyph, CharSequence title, CharSequence detail, int tint, View trailing) {
         LinearLayout r = Ui.row(activity);
-        r.setPadding(Theme.dp(12), Theme.dp(10), Theme.dp(12), Theme.dp(10));
+        r.setPadding(Theme.dp(12), Theme.dp(11), Theme.dp(12), Theme.dp(11));
         r.setMinimumHeight(Theme.dp(56));
         r.setBackground(Ui.press(Ui.round(0, 16), 16));
         if (glyph >= 0) {
-            ImageView icon = Ui.glyphTile(activity, glyph, tint, 0, 40, 12);
+            int tileFill = tint == Theme.DANGER ? Theme.DANGER_SOFT : tint == Theme.FAINT ? 0 : Theme.INSET;
+            ImageView icon = Ui.glyphTile(activity, glyph, tint, tileFill, 40, 12);
             r.addView(icon, Ui.lp(Theme.dp(40), Theme.dp(40)));
         }
         LinearLayout lines = Ui.column(activity);
         LinearLayout.LayoutParams p = Ui.weight(1);
         p.setMarginStart(Theme.dp(glyph >= 0 ? 12 : 4));
         r.addView(lines, p);
-        TextView t = Ui.text(activity, title, 16, tint == Theme.DANGER ? Theme.DANGER : Theme.INK);
+        TextView t = Ui.medium(activity, title, 15.5f, tint == Theme.DANGER ? Theme.DANGER : Theme.INK);
         t.setMaxLines(2);
         t.setEllipsize(TextUtils.TruncateAt.END);
         lines.addView(t);
@@ -132,20 +135,22 @@ final class Sheet {
         r.setAlpha(0.75f);
         return this;
     }
-    /** A single-choice option; the current one carries a check. */
+    /** A single-choice option; the current one carries a warm lantern check and soft wash. */
     Sheet option(CharSequence title, CharSequence detail, boolean checked, Runnable action) {
         ImageView check = new ImageView(activity);
-        check.setImageDrawable(new Glyph(Glyph.CHECK, Theme.INK));
+        check.setImageDrawable(new Glyph(Glyph.CHECK, Theme.dark ? Theme.LAMP : Theme.LAMP_TEXT));
         check.setVisibility(checked ? View.VISIBLE : View.INVISIBLE);
         View r = row(-1, title, detail, Theme.INK, check);
+        if (checked) r.setBackground(Ui.press(Ui.outline(Theme.LAMP_SOFT, Theme.alpha(Theme.LAMP, 0.28f), 1f, 16), 16));
         r.setOnClickListener(v -> { dialog.dismiss(); if (action != null) action.run(); });
         r.setSelected(checked);
         Ui.role(r, RadioButton.class);
         return this;
     }
     Sheet section(String label) {
-        TextView t = Ui.medium(activity, label, 13, Theme.MUTED);
-        t.setPadding(Theme.dp(16), Theme.dp(14), Theme.dp(16), Theme.dp(4));
+        TextView t = Ui.medium(activity, label, 12.5f, Theme.MUTED);
+        t.setLetterSpacing(0.03f);
+        t.setPadding(Theme.dp(14), Theme.dp(14), Theme.dp(14), Theme.dp(5));
         body.addView(t);
         return this;
     }
@@ -157,11 +162,11 @@ final class Sheet {
         footer.setVisibility(View.VISIBLE);
         if (cancel != null) {
             Button c = Ui.button(activity, cancel, Ui.GHOST, dialog::dismiss);
-            footer.addView(c, Ui.lp(-2, Theme.dp(48)));
+            footer.addView(c, Ui.lp(-2, Theme.dp(46)));
         }
         if (confirm != null) {
             Button ok = Ui.button(activity, confirm, style, () -> { dialog.dismiss(); if (action != null) action.run(); });
-            LinearLayout.LayoutParams p = Ui.lp(-2, Theme.dp(48));
+            LinearLayout.LayoutParams p = Ui.lp(-2, Theme.dp(46));
             p.setMarginStart(Theme.dp(8));
             footer.addView(ok, p);
         }
@@ -171,7 +176,14 @@ final class Sheet {
     static Sheet current; // the most recently shown sheet (tests dismiss it)
     Sheet show() {
         current = this;
-        if (!activity.isFinishing() && !activity.isDestroyed()) dialog.show();
+        if (!activity.isFinishing() && !activity.isDestroyed()) {
+            dialog.show();
+            root.animate().cancel();
+            root.setTranslationY(Theme.dp(56));
+            root.setAlpha(0f);
+            root.animate().translationY(0f).alpha(1f).setDuration(240)
+                .setInterpolator(new PathInterpolator(0.2f, 0.92f, 0.25f, 1f)).start();
+        }
         return this;
     }
     void dismiss() { if (dialog.isShowing()) dialog.dismiss(); }

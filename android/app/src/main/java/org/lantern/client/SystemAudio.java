@@ -65,7 +65,7 @@ final class SystemAudio {
     }
     void consume(Request request) throws Exception {
         Remote.Credentials c=request.credentials;
-        AudioTrack track=null;OpusAudioDecoder decoder=null;
+        AudioTrack track=null;OpusAudioDecoder decoder=null;byte[] opusScratch=null;
         long owner=request.timeline.beginAudio(),firstHost=0,firstFrame=0,lastPosition=0,positionEpoch=0;boolean anchored=false;
         AudioManager manager=(AudioManager)context.getSystemService(Context.AUDIO_SERVICE);
         AudioAttributes attributes=new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build();
@@ -83,7 +83,8 @@ final class SystemAudio {
             String provider=session.provider;
             int codec=session.codec,lookahead=session.lookahead;
             if(codec<0||codec>1||lookahead<0||lookahead>5760||codec==1&&rate!=48000)throw new IOException("音频编码协商失败");
-            if(codec==1)decoder=new OpusAudioDecoder(lookahead);encoding=codec==1?"Opus 96 kbps":"PCM16LE";wireBytes.set(0);
+            if(codec==1){decoder=new OpusAudioDecoder(lookahead);opusScratch=new byte[OpusAudioDecoder.MAX_OUTPUT_BYTES];}
+            encoding=codec==1?"Opus 96 kbps":"PCM16LE";wireBytes.set(0);
             if(rate<8000 || rate>96000 || rate%100!=0 || channels!=2 || bits!=16 || !provider.equals("wasapi-loopback"))
                 throw new IOException("音频格式不兼容");
             int minimum=AudioTrack.getMinBufferSize(rate,AudioFormat.CHANNEL_OUT_STEREO,AudioFormat.ENCODING_PCM_16BIT);
@@ -107,24 +108,25 @@ final class SystemAudio {
             long sequence=-1,lastPts=-1,basePts=0,baseClock=0,behindSince=0; boolean resync=false;
             while(current(request)) {
                 DataInputStream packet=Remote.reader(session.packet());
-                long next=packet.readLong(), pts=packet.readLong(); int flags=packet.readInt(); byte[] pcm=Remote.blob(packet,codec==1?1275:rate*4/100);
+                long next=packet.readLong(), pts=packet.readLong(); int flags=packet.readInt(); byte[] payload=Remote.blob(packet,codec==1?1275:rate*4/100);
                 boolean lost=next!=sequence+1;
-                if((session.version<3&&lost) || next<=sequence || pts<0 || pts<=lastPts || pts>Long.MAX_VALUE/1000 || (flags & ~3)!=0 || (codec==0 && pcm.length%4!=0) || ((flags&2)!=0)!= (pcm.length==0) || packet.available()!=0)
+                if((session.version<3&&lost) || next<=sequence || pts<0 || pts<=lastPts || pts>Long.MAX_VALUE/1000 || (flags & ~3)!=0 || (codec==0 && payload.length%4!=0) || ((flags&2)!=0)!= (payload.length==0) || packet.available()!=0)
                     throw new IOException("音频序号、时间戳或长度错误");
                 if(lost){flags|=1;resync=true;}
                 path=session.usingUdp?"udp":"tcp";
                 sequence=next; lastPts=pts; packets.incrementAndGet();
                 if(connection.snapshot().phase!=ConnectionStatus.Phase.NORMAL){connection.normal();main.post(()->{if(current(request))events.connectionState(connection.snapshot());});}
                 if(sequence>=100)request.attempts=0;
-                if(pcm.length==0) {
+                if(payload.length==0) {
                     baseClock=0;
                     // Silence heartbeats carry no samples. A previous stream origin cannot
                     // bridge that gap: AudioTrack counts submitted samples, not absent time.
                     if(anchored){track.stop();track.flush();playing=false;writtenFrames=0;anchored=false;lastPosition=0;positionEpoch=0;request.timeline.endAudio(owner);owner=request.timeline.beginAudio();if(decoder!=null){decoder.hostOrigin=-1;decoder.decodedFrames=0;}}
                     continue;
                 }
-                wireBytes.addAndGet(pcm.length);
-                if(decoder!=null){if((flags&1)!=0){decoder.hostOrigin=pts;decoder.decodedFrames=0;}pcm=decoder.decode(pcm,pts);if(pcm.length==0)continue;pts=decoder.outputHostPts;}
+                wireBytes.addAndGet(payload.length);
+                byte[] pcm=payload;int validBytes=payload.length;
+                if(decoder!=null){if((flags&1)!=0){decoder.hostOrigin=pts;decoder.decodedFrames=0;}validBytes=decoder.decodeInto(payload,pts,opusScratch);if(validBytes==0)continue;pcm=opusScratch;pts=decoder.outputHostPts;}
                 long now=System.nanoTime(); if(firstPacketNs==0) firstPacketNs=now;
                 // More than 250 ms behind live (the network held packets back): skip them so playback
                 // catches up instead of ending the stream. Behind for a whole second means the link is
@@ -140,8 +142,8 @@ final class SystemAudio {
                 if(gap&&playing){track.stop();track.flush();playing=false;writtenFrames=0;firstHost=pts;firstFrame=0;lastPosition=0;positionEpoch=0;request.timeline.endAudio(owner);owner=request.timeline.beginAudio();}
                 if(baseClock==0 || gap) {baseClock=now; basePts=pts;}
                 long deadline=now+250_000_000L; int offset=0;
-                while(offset<pcm.length && current(request)) {
-                    int count=track.write(pcm,offset,pcm.length-offset,AudioTrack.WRITE_NON_BLOCKING);
+                while(offset<validBytes && current(request)) {
+                    int count=track.write(pcm,offset,validBytes-offset,AudioTrack.WRITE_NON_BLOCKING);
                     if(count<0) throw new IOException("手机音频输出失败："+count);
                     offset+=count;
                     if(count==0) {if(System.nanoTime()>deadline) break; Thread.sleep(2);} // output stalled: drop the rest of this packet

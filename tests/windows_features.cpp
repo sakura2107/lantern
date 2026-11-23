@@ -1,8 +1,10 @@
 #include "lantern/windows_clipboard.hpp"
+#include "lantern/windows_media.hpp"
 #include "lantern/windows_thumbnail.hpp"
 #include <fstream>
 #include <iostream>
 #include <objbase.h>
+#include <ws2tcpip.h>
 using namespace lantern;
 static int checks = 0;
 static void check(bool b, const char* name) {
@@ -100,6 +102,134 @@ static TransferTask task(WindowsTransfers& q, const std::string& id) {
             return t;
     throw std::runtime_error("Task missing");
 }
+struct RawHttpResponse {
+    std::string status_line;
+    std::string headers;
+    std::string body;
+};
+static RawHttpResponse raw_http(uint16_t port, const std::string& request, bool half_close = true) {
+    init_sockets();
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    check(s != INVALID_SOCKET, "raw http socket");
+    DWORD timeout = 5000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(port);
+    if (connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        closesocket(s);
+        throw std::runtime_error("raw http connect");
+    }
+    size_t sent = 0;
+    while (sent < request.size()) {
+        int n = send(s, request.data() + sent, int(request.size() - sent), 0);
+        if (n <= 0)
+            break;
+        sent += size_t(n);
+    }
+    if (half_close)
+        shutdown(s, SD_SEND);
+    std::string raw;
+    char buf[4096];
+    for (;;) {
+        int n = recv(s, buf, sizeof(buf), 0);
+        if (n <= 0)
+            break;
+        raw.append(buf, size_t(n));
+    }
+    closesocket(s);
+    RawHttpResponse res;
+    auto sep = raw.find("\r\n\r\n");
+    if (sep == std::string::npos)
+        return res;
+    auto first_end = raw.find("\r\n");
+    res.status_line = raw.substr(0, first_end);
+    res.headers = raw.substr(0, sep);
+    res.body = raw.substr(sep + 4);
+    return res;
+}
+static void verify_windows_media_bridge_host(const ClientCredentials& c, const fs::path& share) {
+    const std::string media_text = "0123456789abcdef-lantern-media-bridge-host-check";
+    write_file(share / L"host-check.bin", Bytes(media_text.begin(), media_text.end()));
+    WindowsMediaBridge bridge(c, "host-check.bin");
+    auto full_url = bridge.url();
+    // Parse bearer URL in memory only; never print or persist it.
+    check(full_url.starts_with("http://127.0.0.1:"), "media bridge binds 127.0.0.1 loopback");
+    auto slash = full_url.find('/', 7);
+    check(slash != std::string::npos, "media bridge url has path");
+    auto authority = full_url.substr(7, slash - 7);
+    auto path = full_url.substr(slash);
+    auto colon = authority.find(':');
+    check(colon != std::string::npos, "media bridge authority includes port");
+    uint16_t port = uint16_t(std::stoul(authority.substr(colon + 1)));
+    uint16_t wrong_port = port == 65535 ? uint16_t(port - 1) : uint16_t(port + 1);
+
+    auto rejected_no_media = [](const RawHttpResponse& r) {
+        return !r.status_line.starts_with("HTTP/1.1 200") && !r.status_line.starts_with("HTTP/1.1 206") &&
+               r.body.empty();
+    };
+
+    // Valid GET, case-insensitive Host with OWS (SP/HTAB), HEAD, and Range.
+    auto r_get = raw_http(port, "GET " + path + " HTTP/1.1\r\nHost: " + authority + "\r\n\r\n");
+    check(r_get.status_line == "HTTP/1.1 200 OK" && r_get.body == media_text,
+          "media bridge accepts valid GET with exact loopback Host");
+
+    auto r_ows = raw_http(port, "GET " + path + " HTTP/1.1\r\nhOsT: \t " + authority + " \t\r\n\r\n");
+    check(r_ows.status_line == "HTTP/1.1 200 OK" && r_ows.body == media_text,
+          "media bridge accepts case-insensitive Host with SP/HTAB trimming");
+
+    auto r_head = raw_http(port, "HEAD " + path + " HTTP/1.1\r\nHost: " + authority + "\r\n\r\n");
+    check(r_head.status_line == "HTTP/1.1 200 OK" && r_head.body.empty() &&
+              r_head.headers.find("Content-Length: " + std::to_string(media_text.size())) != std::string::npos,
+          "media bridge accepts valid HEAD");
+
+    auto r_range =
+        raw_http(port, "GET " + path + " HTTP/1.1\r\nHost: " + authority + "\r\nRange: bytes=4-15\r\n\r\n");
+    check(r_range.status_line == "HTTP/1.1 206 Partial Content" && r_range.body == media_text.substr(4, 12) &&
+              r_range.headers.find("Content-Range: bytes 4-15/" + std::to_string(media_text.size())) !=
+                  std::string::npos,
+          "media bridge accepts valid Range");
+
+    // Header size boundary: exact 8192 bytes accepted, 8193 bytes rejected.
+    std::string prefix = "GET " + path + " HTTP/1.1\r\nHost: " + authority + "\r\nX-Pad: ";
+    std::string suffix = "\r\n\r\n";
+    auto exact_8192 = prefix + std::string(8192 - prefix.size() - suffix.size(), 'a') + suffix;
+    check(exact_8192.size() == 8192, "8192-byte media bridge header constructed");
+    auto r_8192 = raw_http(port, exact_8192);
+    check(r_8192.status_line == "HTTP/1.1 200 OK" && r_8192.body == media_text,
+          "media bridge accepts 8192-byte header");
+
+    auto over_8192 = prefix + std::string(8193 - prefix.size() - suffix.size(), 'a') + suffix;
+    check(over_8192.size() == 8193, "8193-byte media bridge header constructed");
+    auto r_8193 = raw_http(port, over_8192);
+    check(rejected_no_media(r_8193), "media bridge rejects header over 8192 bytes");
+
+    // Rejected Host / framing cases: none may return media.
+    auto r_missing = raw_http(port, "GET " + path + " HTTP/1.1\r\n\r\n");
+    check(rejected_no_media(r_missing), "media bridge rejects missing Host");
+
+    auto r_dup = raw_http(port, "GET " + path + " HTTP/1.1\r\nHost: " + authority + "\r\nHOST: " + authority +
+                                    "\r\n\r\n");
+    check(rejected_no_media(r_dup), "media bridge rejects duplicate identical Host");
+
+    auto r_bare = raw_http(port, "GET " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    check(rejected_no_media(r_bare), "media bridge rejects bare 127.0.0.1 Host");
+
+    auto r_localhost = raw_http(port, "GET " + path + " HTTP/1.1\r\nHost: localhost:" +
+                                          std::to_string(port) + "\r\n\r\n");
+    check(rejected_no_media(r_localhost), "media bridge rejects localhost alias Host");
+
+    auto r_wrong_port = raw_http(port, "GET " + path + " HTTP/1.1\r\nHost: 127.0.0.1:" +
+                                           std::to_string(wrong_port) + "\r\n\r\n");
+    check(rejected_no_media(r_wrong_port), "media bridge rejects wrong port Host");
+
+    auto r_truncated = raw_http(port, "GET " + path + " HTTP/1.1\r\nHost: " + authority + "\r\n", true);
+    check(rejected_no_media(r_truncated), "media bridge rejects truncated header without CRLFCRLF");
+
+    bridge.stop();
+}
 int wmain(int argc, wchar_t** argv) {
     if (argc < 2)
         return 2;
@@ -152,6 +282,7 @@ int wmain(int argc, wchar_t** argv) {
         write_file(root / L"two.txt", Bytes{'2'});
         Child child(root);
         until([&] { return fs::exists(root / L"ready"); }, "private host ready");
+        verify_windows_media_bridge_host(c, share);
         auto peer = c.connect(control, 0);
         std::mutex memory_mutex;
         ClipboardText memory{1, false, {}};

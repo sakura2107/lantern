@@ -20,7 +20,7 @@ final class AudioSession implements AutoCloseable {
             if(r.available()!=0||(!path.equals("udp")&&!path.equals("tcp")))throw new IOException("Audio path");usingUdp=path.equals("udp");}
     }
     byte[] packet()throws Exception{
-        if(usingUdp)try{return Native.response(42,udp.receive());}
+        if(usingUdp)try{return Native.response(42,udp.receive(100));}
         catch(java.net.SocketException|java.net.SocketTimeoutException timeout){
             udp.close();usingUdp=false;DataInputStream path=Remote.reader(remote.receive(61));
             if(!Remote.str(path).equals("tcp")||path.available()!=0)throw new IOException("Audio TCP fallback");

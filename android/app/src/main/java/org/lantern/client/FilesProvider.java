@@ -40,22 +40,32 @@ public final class FilesProvider extends ContentProvider {
         }
     }
     static final ConcurrentHashMap<String, Source> sources = new ConcurrentHashMap<>();
+    private static final Object SHARE_LOCK = new Object();
+    private static final int MAX_SHARED_SOURCES = 32;
     static final AtomicInteger activeProxies = new AtomicInteger();
     static void revoke(Uri uri){
-        List<String> path=uri.getPathSegments();if(path.isEmpty())return;Source source=sources.remove(path.get(0));
+        List<String> path=uri.getPathSegments();if(path.isEmpty())return;
+        Source source;
+        synchronized(SHARE_LOCK){source=sources.remove(path.get(0));}
         if(source!=null){List<RemoteFileReader> readers;synchronized(source){source.closed=true;synchronized(source.readers){readers=new ArrayList<>(source.readers);source.readers.clear();}}for(RemoteFileReader reader:readers)reader.close();}
     }
     static Uri share(Source source) throws IOException {
-        if (sources.size() >= 32)
-            throw new IOException("共享句柄已达上限，请重启应用结束旧共享");
+        if (source == null || source.name == null)
+            throw new IOException("共享来源无效");
         String id = UUID.randomUUID().toString();
-        sources.put(id, source);
-        return new Uri.Builder()
+        Uri uri = new Uri.Builder()
             .scheme("content")
             .authority("org.lantern.client.files")
             .appendPath(id)
             .appendPath(source.name)
             .build();
+        synchronized (SHARE_LOCK) {
+            if (sources.size() >= MAX_SHARED_SOURCES)
+                throw new IOException("共享句柄已达上限，请重启应用结束旧共享");
+            if (sources.putIfAbsent(id, source) != null)
+                throw new IOException("共享句柄冲突，请重试");
+        }
+        return uri;
     }
     static Source source(Uri uri) throws FileNotFoundException {
         List<String> p = uri.getPathSegments();

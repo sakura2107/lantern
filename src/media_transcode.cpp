@@ -1,4 +1,5 @@
 #include "lantern/media_transcode.hpp"
+#include "lantern/media_frame_guard.hpp"
 #include <cmath>
 #include <cctype>
 #include <cstring>
@@ -10,6 +11,7 @@ extern "C" {
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
 #include <libavutil/audio_fifo.h>
+#include <libavutil/common.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
@@ -28,6 +30,21 @@ struct Buffer {AVBufferRef* p=nullptr;~Buffer(){av_buffer_unref(&p);}};
 struct Graph {AVFilterGraph* p=avfilter_graph_alloc();~Graph(){avfilter_graph_free(&p);}Graph(){if(!p)throw std::bad_alloc();}};
 struct Resampler {SwrContext* p=nullptr;~Resampler(){swr_free(&p);}};
 struct Fifo {AVAudioFifo* p=nullptr;~Fifo(){if(p)av_audio_fifo_free(p);}};
+AudioInputFormat audio_format(int rate, int format, const AVChannelLayout& layout) {
+    if (layout.nb_channels < 1 || layout.nb_channels > 16 || !av_channel_layout_check(&layout) ||
+        format < 0 || format >= AV_SAMPLE_FMT_NB)
+        throw Error(Code::unsupported, "Invalid resampler input format");
+    AudioInputFormat result{rate, format, layout.nb_channels, int(layout.order)};
+    if (layout.order == AV_CHANNEL_ORDER_NATIVE || layout.order == AV_CHANNEL_ORDER_AMBISONIC)
+        result.channel_mask = layout.u.mask;
+    if (layout.order == AV_CHANNEL_ORDER_CUSTOM)
+        for (int i = 0; i < layout.nb_channels; ++i)
+            result.custom_channels[i] = layout.u.map[i].id;
+    result.planar = av_sample_fmt_is_planar(AVSampleFormat(format)) != 0;
+    result.required_planes = result.planar ? result.channels : 1;
+    result.bytes_per_sample = av_get_bytes_per_sample(AVSampleFormat(format));
+    return result;
+}
 struct Input {
     MediaSource source;std::function<bool()> stop;AVFormatContext* format=nullptr;AVIOContext* io=nullptr;
     static int interrupted(void* self){try{return static_cast<Input*>(self)->stop()?1:0;}catch(...){return 1;}}
@@ -192,12 +209,14 @@ Bytes media_segment(MediaSource source,const std::string& expected,MediaAdaptOpt
     decoder.p->get_format=[](AVCodecContext*,const AVPixelFormat* formats){for(auto* p=formats;*p!=AV_PIX_FMT_NONE;p++)if(*p==AV_PIX_FMT_CUDA)return *p;return AV_PIX_FMT_NONE;};
     ff(avcodec_open2(decoder.p,decoder.p->codec,nullptr),"NVDEC open");
     Codec audio_decoder,audio_encoder;Resampler resampler;Fifo fifo;AVStream* audio_stream=nullptr;
+    AudioInputFormat resampler_input{};
     if(audio_index>=0){auto* parameters=format->streams[audio_index]->codecpar;audio_decoder.create(avcodec_find_decoder(parameters->codec_id));
         if(parameters->sample_rate<8000||parameters->sample_rate>192000||parameters->ch_layout.nb_channels<1||parameters->ch_layout.nb_channels>16)
             throw Error(Code::unsupported,"Source audio channel/rate bound; use original playback");
         ff(avcodec_parameters_to_context(audio_decoder.p,parameters),"Audio parameters");ff(avcodec_open2(audio_decoder.p,audio_decoder.p->codec,nullptr),"Audio decoder");
         audio_encoder.create(avcodec_find_encoder(AV_CODEC_ID_AAC));audio_encoder.p->sample_rate=48000;audio_encoder.p->time_base={1,48000};audio_encoder.p->sample_fmt=AV_SAMPLE_FMT_FLTP;
         av_channel_layout_default(&audio_encoder.p->ch_layout,2);audio_encoder.p->bit_rate=160000;audio_encoder.p->flags|=AV_CODEC_FLAG_GLOBAL_HEADER;ff(avcodec_open2(audio_encoder.p,audio_encoder.p->codec,nullptr),"AAC stereo encoder");
+        resampler_input = audio_format(audio_decoder.p->sample_rate, audio_decoder.p->sample_fmt, audio_decoder.p->ch_layout);
         ff(swr_alloc_set_opts2(&resampler.p,&audio_encoder.p->ch_layout,AV_SAMPLE_FMT_FLTP,48000,&audio_decoder.p->ch_layout,audio_decoder.p->sample_fmt,audio_decoder.p->sample_rate,0,nullptr),"Audio resampler");ff(swr_init(resampler.p),"Audio resampler start");
         fifo.p=av_audio_fifo_alloc(AV_SAMPLE_FMT_FLTP,2,4096);if(!fifo.p)throw std::bad_alloc();
     }
@@ -270,10 +289,25 @@ Bytes media_segment(MediaSource source,const std::string& expected,MediaAdaptOpt
     };
     auto audio_frame=[&](AVFrame* frame){
         auto* stream=format->streams[audio_index];int64_t stamp=av_rescale_q(frame->best_effort_timestamp,stream->time_base,AV_TIME_BASE_Q);
-        if(stamp>=feed_until_us){audio_done=true;return;}if(stamp+av_rescale(frame->nb_samples,AV_TIME_BASE,frame->sample_rate)<=feed_from_us)return;
-        int skip=stamp<feed_from_us?int(av_rescale(feed_from_us-stamp,frame->sample_rate,AV_TIME_BASE)):0;
-        int samples=feed_until_us==INT64_MAX?frame->nb_samples-skip:
-            std::min(frame->nb_samples-skip,int(av_rescale(feed_until_us-std::max(stamp,feed_from_us),frame->sample_rate,AV_TIME_BASE)));
+        auto actual = audio_format(frame->sample_rate, frame->format, frame->ch_layout);
+        std::span<const uint8_t* const> planes;
+        if (frame->extended_data && actual == resampler_input) {
+            // FFmpeg's separate extended_data table has one entry per input plane.
+            auto count = frame->extended_data == frame->data
+                ? std::min(actual.required_planes, AV_NUM_DATA_POINTERS) : actual.required_planes;
+            planes = {frame->extended_data, static_cast<size_t>(count)};
+        }
+        if (!valid_audio_frame(resampler_input, actual, planes, frame->nb_samples, 0))
+            throw Error(Code::unsupported, "Audio frame incompatible with resampler input");
+        if(stamp>=feed_until_us){audio_done=true;return;}
+        auto duration = av_rescale(frame->nb_samples, AV_TIME_BASE, actual.sample_rate);
+        if (av_sat_add64(stamp, duration) <= feed_from_us) return;
+        auto skip = stamp < feed_from_us ? av_rescale(feed_from_us-stamp, actual.sample_rate, AV_TIME_BASE) : 0;
+        if (!valid_audio_frame(resampler_input, actual, planes, frame->nb_samples, skip))
+            throw Error(Code::unsupported, "Audio frame trim outside input bounds");
+        int samples = frame->nb_samples - int(skip);
+        if (feed_until_us != INT64_MAX)
+            samples = int(std::min<int64_t>(samples, av_rescale(feed_until_us-std::max(stamp,feed_from_us),actual.sample_rate,AV_TIME_BASE)));
         if(samples<=0)return;
         if(!audio_started){audio_started=true;
             // Audio that starts after the pre-roll point (stream start, or a late first packet) is
@@ -284,8 +318,13 @@ Bytes media_segment(MediaSource source,const std::string& expected,MediaAdaptOpt
                 ff(av_frame_get_buffer(quiet.p,0),"Audio silence buffer");ff(av_samples_set_silence(quiet.p->data,0,quiet.p->nb_samples,2,AV_SAMPLE_FMT_FLTP),"Audio silence");
                 ff(av_audio_fifo_realloc(fifo.p,av_audio_fifo_size(fifo.p)+quiet.p->nb_samples),"Audio FIFO capacity");
                 ff(av_audio_fifo_write(fifo.p,reinterpret_cast<void**>(quiet.p->data),quiet.p->nb_samples),"Audio silence write");}
-        }int planar=av_sample_fmt_is_planar(AVSampleFormat(frame->format)),bytes=av_get_bytes_per_sample(AVSampleFormat(frame->format));
-        std::vector<const uint8_t*> data(size_t(planar?frame->ch_layout.nb_channels:1));for(size_t i=0;i<data.size();i++)data[i]=frame->extended_data[i]+skip*bytes*(planar?1:frame->ch_layout.nb_channels);
+        }
+        int stride = actual.bytes_per_sample * (actual.planar ? 1 : actual.channels);
+        if (frame->linesize[0] < frame->nb_samples * stride)
+            throw Error(Code::unsupported, "Audio frame plane too short");
+        std::array<const uint8_t*, 16> data{};
+        for (int i = 0; i < actual.required_planes; ++i)
+            data[i] = planes[i] + skip * stride;
         Frame converted;converted.p->format=AV_SAMPLE_FMT_FLTP;converted.p->sample_rate=48000;av_channel_layout_default(&converted.p->ch_layout,2);
         converted.p->nb_samples=int(av_rescale_rnd(swr_get_delay(resampler.p,frame->sample_rate)+samples,48000,frame->sample_rate,AV_ROUND_UP));
         ff(av_frame_get_buffer(converted.p,0),"Audio conversion buffer");int got=swr_convert(resampler.p,converted.p->data,converted.p->nb_samples,data.data(),samples);ff(got,"Stereo resample");

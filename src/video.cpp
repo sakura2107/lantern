@@ -263,6 +263,8 @@ class NvDesktop final : public DesktopStream {
         return configuration;
     }
     void reconfigure(uint32_t width,uint32_t fps,uint32_t bitrate) override {
+        // The desktop stream thread owns this encoder, its D3D context and teardown.
+        // It validates the control revision before exposing these settings or capturing.
         if(width<640||width>3840||(fps!=30&&fps!=60&&fps!=120)||bitrate<250'000||bitrate>160'000'000)
             throw Error(Code::invalid,"Desktop reconfigure bound");
         width=std::min(width,max_width)&~1u;fps=std::min(fps,native_fps);

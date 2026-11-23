@@ -21,12 +21,18 @@ static std::string version(const BY_HANDLE_FILE_INFORMATION& i) {
            std::to_string(i.ftLastWriteTime.dwHighDateTime) + ":" +
            std::to_string(i.ftLastWriteTime.dwLowDateTime);
 }
-static Handle lock_path(const fs::path& p) {
-    Handle h(CreateFileW(p.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+static Handle lock_path(const fs::path& p, DWORD sharing = FILE_SHARE_READ | FILE_SHARE_WRITE) {
+    Handle h(CreateFileW(p.c_str(), FILE_READ_ATTRIBUTES, sharing, nullptr,
                          OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
     if (h.h == INVALID_HANDLE_VALUE)
         win_error("Open authorized path");
     info(h);
+    return h;
+}
+static Handle lock_stage_directory(const fs::path& path) {
+    auto h = lock_path(path, FILE_SHARE_READ);
+    if (!(info(h).dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        throw Error(Code::invalid, "Upload staging path must be a directory");
     return h;
 }
 FileService::FileService(fs::path root)
@@ -35,7 +41,7 @@ FileService::FileService(fs::path root)
         throw Error(Code::invalid, "Authorized root must be a directory");
     auto private_dir = root_ / L".rdx-private";
     if (fs::exists(private_dir)) {
-        auto lock = lock_path(private_dir);
+        stage_lock_ = lock_stage_directory(private_dir);
     }
 }
 Guard FileService::guard(const std::string& p, bool missing) {
@@ -172,29 +178,104 @@ Bytes FileService::read(const std::string& p, const std::string& v, uint64_t off
     b.resize(got);
     return b;
 }
-fs::path FileService::stage(const std::string& id) {
-    if (!valid_sha(id))
+// Fixed order: upload ID (if any), then ALL namespace paths in one reservation.
+// The table mutex only protects membership. wait releases it, and no filesystem
+// I/O, callbacks, or waits for another reservation run with that mutex held.
+FileService::Mutation::Mutation(FileService& files, UploadId id) : files_(files) {
+    if (!valid_sha(id.value))
         throw Error(Code::invalid, "Invalid transfer id");
-    return root_ / L".rdx-private" / wide(id);
+    keys_.push_back(L":" + wide(id.value)); // disjoint from absolute filesystem paths
+    reserve();
+}
+static std::wstring long_path_name(const fs::path& path) {
+    wchar_t local[MAX_PATH];
+    DWORD n = GetLongPathNameW(path.c_str(), local, MAX_PATH);
+    if (n && n < MAX_PATH) return {local, n};
+    if (n >= MAX_PATH) {
+        std::wstring result(n, L'\0');
+        n = GetLongPathNameW(path.c_str(), result.data(), DWORD(result.size()));
+        if (n && n < result.size()) {
+            result.resize(n);
+            return result;
+        }
+        if (n) throw Error(Code::conflict, "Mutation path changed");
+    }
+    DWORD error = GetLastError();
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return {};
+    win_error("Resolve mutation path");
+}
+FileService::Mutation::Mutation(FileService& files, const std::string& path, const std::string& other)
+    : files_(files) {
+    for (auto* name : {&path, &other}) {
+        if (name->empty())
+            continue;
+        if (!safe_path(*name))
+            throw Error(Code::unauthorized, "Unsafe mutation path");
+        // Expand Windows short-name aliases, including aliases in a missing leaf's parent.
+        auto slash = name->rfind('/');
+        auto parent = files.guard(slash == std::string::npos ? "" : name->substr(0, slash));
+        auto full = files.root_ / wide(*name);
+        full.make_preferred();
+        auto key = long_path_name(full);
+        if (key.empty()) {
+            auto directory = long_path_name(parent.path);
+            if (directory.empty())
+                throw Error(Code::conflict, "Mutation parent changed");
+            key = (fs::path(directory) / full.filename()).native();
+        }
+        keys_.push_back(std::move(key));
+    }
+    reserve();
+}
+void FileService::Mutation::reserve() {
+    auto overlaps = [](const std::wstring& a, const std::wstring& b) {
+        auto n = int(std::min(a.size(), b.size()));
+        return (a.size() == b.size() || (a.size() > b.size() ? a[n] : b[n]) == L'\\') &&
+               CompareStringOrdinal(a.data(), n, b.data(), n, TRUE) == CSTR_EQUAL;
+    };
+    std::unique_lock lock(files_.mutation_table_);
+    files_.mutation_done_.wait(lock, [&] {
+        for (auto* active : files_.active_mutations_)
+            for (const auto& held : active->keys_)
+                for (const auto& wanted : keys_)
+                    if (overlaps(held, wanted)) return false;
+        return true;
+    });
+    files_.active_mutations_.push_back(this);
+}
+FileService::Mutation::~Mutation() {
+    {
+        std::lock_guard lock(files_.mutation_table_);
+        std::erase(files_.active_mutations_, this);
+    }
+    files_.mutation_done_.notify_all();
+}
+fs::path FileService::stage(const std::string& id, bool create_directory) {
+    auto dir = root_ / L".rdx-private";
+    std::call_once(init_stage_, [&] {
+        if (stage_lock_.h != INVALID_HANDLE_VALUE) return;
+        if (create_directory)
+            fs::create_directory(dir);
+        stage_lock_ = lock_stage_directory(dir);
+    });
+    return dir / wide(id);
 }
 std::pair<std::string, uint64_t> FileService::begin(const std::string& p, uint64_t size,
                                                     const std::string& hash) {
-    std::lock_guard lock(mutations_);
-    auto private_dir = root_ / L".rdx-private";
-    fs::create_directories(private_dir);
-    auto private_lock = lock_path(private_dir);
     if (p.empty() || !valid_sha(hash) || size > uint64_t(INT64_MAX))
         throw Error(Code::invalid, "Invalid upload metadata");
-    auto g = guard(p, true);
-    if (fs::exists(g.path))
-        throw Error(Code::conflict, "Destination exists");
     Writer metadata;
     metadata.u16(1);
     metadata.str(p);
     metadata.u64(size);
     metadata.str(hash);
     auto id = sha256(metadata.b);
-    auto temp = stage(id);
+    Mutation upload(*this, Mutation::UploadId{id});
+    Mutation target(*this, p);
+    auto g = guard(p, true);
+    if (fs::exists(g.path))
+        throw Error(Code::conflict, "Destination exists");
+    auto temp = stage(id, true);
     auto meta = temp;
     meta += L".meta";
     if (fs::exists(meta)) {
@@ -212,15 +293,19 @@ std::pair<std::string, uint64_t> FileService::begin(const std::string& p, uint64
     auto off = file_size(i);
     if (off > size)
         throw Error(Code::integrity, "Partial exceeds source size");
+    if (off && !FlushFileBuffers(h))
+        win_error("Flush recovered upload before acknowledging offset");
     return {id, off};
 }
 uint64_t FileService::chunk(const std::string& id, uint64_t off, std::span<const uint8_t> b) {
-    std::lock_guard lock(mutations_);
+    Mutation upload(*this, Mutation::UploadId{id});
     if (b.empty() || b.size() > chunk_size)
         throw Error(Code::invalid, "Upload chunk bound");
     auto temp = stage(id), meta = temp;
     meta += L".meta";
     auto data = read_file(meta);
+    if (sha256(data) != id)
+        throw Error(Code::integrity, "Resume manifest mismatch");
     Reader r{data};
     if (r.u16() != 1)
         throw Error(Code::invalid, "Manifest version");
@@ -228,6 +313,7 @@ uint64_t FileService::chunk(const std::string& id, uint64_t off, std::span<const
     auto total = r.u64();
     auto hash = r.str();
     r.end();
+    Mutation target(*this, path);
     auto g = guard(path, true);
     Handle h(CreateFileW(temp.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                          FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
@@ -245,11 +331,24 @@ uint64_t FileService::chunk(const std::string& id, uint64_t off, std::span<const
         win_error("Write or flush upload");
     return off + wrote;
 }
-void FileService::commit(const std::string& id) {
-    std::lock_guard lock(mutations_);
+static void rename_to_new_path(HANDLE h, const fs::path& destination) {
+    const auto& name = destination.native();
+    Bytes bytes(offsetof(FILE_RENAME_INFO, FileName) + (name.size() + 1) * sizeof(wchar_t));
+    auto rename = (FILE_RENAME_INFO*)bytes.data();
+    rename->ReplaceIfExists = FALSE;
+    rename->RootDirectory = nullptr;
+    rename->FileNameLength = DWORD(name.size() * sizeof(wchar_t));
+    std::copy(name.begin(), name.end(), rename->FileName);
+    if (!SetFileInformationByHandle(h, FileRenameInfo, rename, DWORD(bytes.size())))
+        win_error("Rename file by handle");
+}
+void FileService::commit(const std::string& id, const std::function<bool()>& cancelled) {
+    Mutation upload(*this, Mutation::UploadId{id});
     auto temp = stage(id), meta = temp;
     meta += L".meta";
     auto data = read_file(meta);
+    if (sha256(data) != id)
+        throw Error(Code::integrity, "Resume manifest mismatch");
     Reader r{data};
     if (r.u16() != 1)
         throw Error(Code::invalid, "Manifest version");
@@ -257,28 +356,32 @@ void FileService::commit(const std::string& id) {
     auto total = r.u64();
     auto hash = r.str();
     r.end();
+    Mutation target(*this, p);
     auto g = guard(p, true);
-    auto partial = lock_path(temp);
-    Handle h(CreateFileW(temp.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+    if (fs::exists(g.path))
+        throw Error(Code::conflict, "Destination appeared during upload");
+    Handle h(CreateFileW(temp.c_str(), GENERIC_READ | DELETE, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                          FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
     if (h.h == INVALID_HANDLE_VALUE)
         win_error("Open partial for verification");
     if (file_size(info(h)) != total)
         throw Error(Code::conflict, "Upload incomplete");
-    if (hash_file(h) != hash)
+    auto check_cancel = [&] {
+        if (cancelled && cancelled())
+            throw Error(Code::cancelled, "Upload commit cancelled; partial retained");
+    };
+    if (hash_file(h, check_cancel, {}) != hash)
         throw Error(Code::integrity, "Upload SHA256 mismatch; partial retained");
-    h = Handle();
-    partial = Handle();
     if (fs::exists(g.path))
         throw Error(Code::conflict, "Destination appeared during upload");
-    if (!MoveFileExW(temp.c_str(), g.path.c_str(), MOVEFILE_WRITE_THROUGH))
-        win_error("Commit upload");
+    check_cancel();
+    rename_to_new_path(h, g.path);
     DeleteFileW(meta.c_str());
 }
 void FileService::mutate(Op op, const std::string& p, const std::string& to) {
-    std::lock_guard lock(mutations_);
     if (p.empty())
         throw Error(Code::unauthorized, "Cannot modify authorized root");
+    Mutation paths(*this, p, to);
     auto from = guard(p, op == Op::mkdir);
     if (op == Op::mkdir) {
         if (!CreateDirectoryW(from.path.c_str(), nullptr))
@@ -313,15 +416,7 @@ void FileService::mutate(Op op, const std::string& p, const std::string& to) {
         throw Error(Code::conflict, "Destination exists");
     if (op == Op::rename) {
         auto h = mutable_handle();
-        auto name = dest.path.wstring();
-        Bytes bytes(offsetof(FILE_RENAME_INFO, FileName) + (name.size() + 1) * sizeof(wchar_t));
-        auto rename = (FILE_RENAME_INFO*)bytes.data();
-        rename->ReplaceIfExists = FALSE;
-        rename->RootDirectory = nullptr;
-        rename->FileNameLength = DWORD(name.size() * sizeof(wchar_t));
-        std::copy(name.begin(), name.end(), rename->FileName);
-        if (!SetFileInformationByHandle(h, FileRenameInfo, rename, DWORD(bytes.size())))
-            win_error("Move within host by handle");
+        rename_to_new_path(h, dest.path);
     } else if (op == Op::copy) {
         auto src = open_read(from);
         auto dir = dest.path.parent_path();

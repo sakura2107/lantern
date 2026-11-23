@@ -27,6 +27,8 @@ public final class MainActivity extends Activity {
     final Handler inputUi = new Handler(Looper.getMainLooper());
     boolean draggingRemote, rightArmed;
     float dragX, dragY;
+    static final class DragGesture {}
+    DragGesture dragGesture, lastRejectedDrag;
     final AtomicLong dragEndsCompleted = new AtomicLong(), textCommitsCompleted = new AtomicLong();
     final Runnable dragHeartbeat = new Runnable() {
         public void run() {
@@ -194,6 +196,10 @@ public final class MainActivity extends Activity {
         screen.tap = this::desktopTap;
         screen.doubleTap = (x, y) -> desktopClick(x, y, true);
         screen.twoFingerTap = this::desktopRightClick;
+        screen.wheel = new DesktopView.Wheel() {
+            public void move(float x, float y) { desktopWheelMove(x, y); }
+            public void scroll(int delta) { desktopWheel(delta); }
+        };
         screen.drag = new DesktopView.Drag() {
             public boolean begin(float x, float y) { return desktopDragBegin(x, y); }
             public void move(float x, float y) { desktopDragMove(x, y); }
@@ -721,7 +727,11 @@ public final class MainActivity extends Activity {
     void uploadDirectory(){if(credentials==null){status("请先连接电脑");ui.select(AppShell.DEVICE);return;}startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION),102);}
     void toggleDesktop(){ui.select(AppShell.DESKTOP);if(!subscribed.get()&&credentials==null){status(S.NEED_DEVICE);return;}subscribed.set(!subscribed.get());updateDesktopPresentation();status(subscribed.get()?"桌面已订阅；点击全屏放大":"桌面采集与传输已停止");}
     void toggleDisplay(){display.set(!display.get());updateDesktopPresentation();status(display.get()?"显示画面":"客户端画面已隐藏，采集继续");}
-    void renderTransfers(){if(ui==null||transfers==null)return;int active=ui.transfers.render(transfers);ui.transferBadge(active);}
+    void renderTransfers(){
+        if(ui==null||transfers==null)return;
+        if(ui.selected!=AppShell.TRANSFERS){ui.transferBadge(TransfersPage.activeCount(transfers));return;}
+        int active=ui.transfers.render(transfers);ui.transferBadge(active);
+    }
     void showTransfer(String id){for(TransfersPage.TaskItem t:ui.transfers.all)if(t.id.equals(id)){ui.transfers.showTask(t);return;}}
     void updateDesktopPresentation() {
         TransferPacer.SHARED.realtime=subscribed.get()||audioSubscribed;
@@ -963,21 +973,9 @@ public final class MainActivity extends Activity {
         }
         sheet.show();
     }
-    /** One step down from a fixed choice that the network cannot carry (banner action). */
-    void lowerQuality() {
-        for (int i = 0; i < Q_WIDTHS.length - 1; i++)
-            if (qualityWidth >= Q_WIDTHS[i]) { qualityWidth = Q_WIDTHS[i + 1]; applyQuality(String.format(S.Q_CHANGED, tierName(qualityWidth) + qualityFps)); return; }
-        if (qualityFps > 30) { qualityFps = qualityFps == 120 ? 60 : 30; applyQuality(String.format(S.Q_CHANGED, tierName(qualityWidth) + qualityFps)); }
-    }
-    String lowerQualityLabel() {
-        if (qualityAuto) return null;
-        for (int i = 0; i < Q_WIDTHS.length - 1; i++) if (qualityWidth >= Q_WIDTHS[i]) return String.format(S.Q_LOWER, tierName(Q_WIDTHS[i + 1]) + qualityFps);
-        return qualityFps > 30 ? String.format(S.Q_LOWER, tierName(qualityWidth) + (qualityFps == 120 ? 60 : 30)) : null;
-    }
     void quality(DesktopSession.Status s) {
+        if (s == null || s.sameAs(liveQuality)) return;
         liveQuality = s;
-        boolean short_ = !qualityAuto && (s.constrained || s.dropping);
-        if (!short_) constrainedSince = 0; else if (constrainedSince == 0) constrainedSince = SystemClock.uptimeMillis();
         refreshDesktopUi();
     }
     String profileLabel(){
@@ -993,7 +991,7 @@ public final class MainActivity extends Activity {
         if (screen != null) screen.controlEnabled = control.get();
         if (!control.get()) {
             if (screen != null) screen.cancelDrag();
-            draggingRemote = false; inputUi.removeCallbacks(dragHeartbeat);
+            draggingRemote = false; dragGesture = null; inputUi.removeCallbacks(dragHeartbeat);
             if (keyboard != null) keyboard.close();
             disarmRightClick();
         }
@@ -1035,8 +1033,12 @@ public final class MainActivity extends Activity {
         linkChanged();
     }
     void openInput(Remote.Credentials c) {
+        long epoch = inputEpoch.incrementAndGet();
         closeInput();
-        long epoch = inputEpoch.get();
+        draggingRemote = false;
+        dragGesture = null;
+        inputUi.removeCallbacks(dragHeartbeat);
+        screen.resetGesture();
         input = new InputChannel(c, new InputChannel.Events() {
             public void state(InputChannel.State s) {
                 runOnUiThread(() -> {
@@ -1044,7 +1046,9 @@ public final class MainActivity extends Activity {
                     if (s.terminal) {
                         // Revoked trust, an ended session or an uncertain replay: never retried silently.
                         controlRequested = false; control.set(false); inputEpoch.incrementAndGet(); closeInput(); controlLabels();
-                        status(S.CONTROL_STOPPED);
+                        controlLink = s;
+                        linkChanged();
+                        inputNotice("控制已停止，请重新连接：" + (s.reason == null ? "连接中断" : s.reason));
                         return;
                     }
                     controlLink = s.phase == InputChannel.Phase.NORMAL ? null : s; controlLinkAt = SystemClock.uptimeMillis();
@@ -1052,9 +1056,21 @@ public final class MainActivity extends Activity {
                 });
             }
             public void result(long seq, int code, String reason, byte[] payload, Object tag) {
+                if (inputEpoch.get() != epoch) return;
                 lastInputResult = seq + ":" + code + ":" + reason;
-                if (tag == null) return; // pointer moves
-                if (code != 0) { if (inputEpoch.get() == epoch) status(S.CONTROL_REFUSED + reason); return; }
+                if (code != 0) {
+                    runOnUiThread(() -> {
+                        if (inputEpoch.get() != epoch) return;
+                        if (tag instanceof DragGesture) {
+                            if (dragGesture != tag && lastRejectedDrag == tag) return;
+                            lastRejectedDrag = (DragGesture) tag;
+                            if (dragGesture == tag) screen.resetGesture();
+                        }
+                        inputNotice(S.CONTROL_REFUSED + reason);
+                    });
+                    return;
+                }
+                if (tag == null) return;
                 if (tag instanceof Click) {
                     Click click = (Click) tag;
                     if (!click.left) return;
@@ -1078,13 +1094,17 @@ public final class MainActivity extends Activity {
             }
         });
     }
+    void inputNotice(String message) {
+        status(message);
+        if (desktopLayout != null) desktopLayout.inputNotice(message);
+    }
     static boolean pointerMove(int op, byte[] body) {
         return body.length >= 4 && ((op == 36 && java.nio.ByteBuffer.wrap(body).getInt(0) == 2) || (op == 22 && java.nio.ByteBuffer.wrap(body).getInt(0) == 0));
     }
     /** UI thread. When the channel is full the event waits here, in order; only the newest pointer move is kept. */
     void sendInput(int op, byte[] body, Object tag) {
         InputChannel channel = input;
-        if (channel == null) return;
+        if (channel == null) { inputNotice("控制通道未连接，请重新开启控制"); return; }
         boolean move = pointerMove(op, body);
         if (inputBacklog.isEmpty()) {
             try { if (channel.submit(op, body, tag)) return; }
@@ -1092,18 +1112,27 @@ public final class MainActivity extends Activity {
             inputUi.postDelayed(drainInput, 30);
         } else {
             Object[] tail = inputBacklog.peekLast();
-            if (move && (Boolean) tail[3]) inputBacklog.removeLast();
+            if (move && (Integer) tail[0] == op && (Boolean) tail[3]) inputBacklog.removeLast();
+        }
+        if (inputBacklog.size() >= 512) {
+            controlRequested = false;
+            control.set(false);
+            inputEpoch.incrementAndGet();
+            closeInput();
+            controlLabels();
+            inputNotice("控制队列已满，待发送操作已取消，请重新开启控制");
+            return;
         }
         inputBacklog.addLast(new Object[]{op, body, tag, move});
     }
     final Runnable drainInput = new Runnable() {
         public void run() {
             InputChannel channel = input;
-            if (channel == null) { inputBacklog.clear(); return; }
+            if (channel == null || channel.state().terminal) { inputBacklog.clear(); return; }
             while (!inputBacklog.isEmpty()) {
                 Object[] next = inputBacklog.peekFirst();
                 try { if (!channel.submit((Integer) next[0], (byte[]) next[1], next[2])) { inputUi.postDelayed(this, 30); return; } }
-                catch (IOException invalid) { /* bounded payloads; cannot happen for queued events */ }
+                catch (IOException invalid) { inputNotice(invalid.getMessage()); }
                 inputBacklog.pollFirst();
             }
         }
@@ -1145,28 +1174,27 @@ public final class MainActivity extends Activity {
             long e = elapsed(audioLink.recoveringMillis, audioLinkAt, now); worst = Math.max(worst, e);
             lost |= audioLink.phase == ConnectionStatus.Phase.DISCONNECTED || e >= 30_000;
         }
+        if (controlLink != null && controlLink.terminal) lost = true;
         if (controlRequested && input != null && controlLink != null && controlLink.phase != InputChannel.Phase.NORMAL) {
             long e = elapsed(controlLink.recoveringMillis, controlLinkAt, now); worst = Math.max(worst, e);
             lost |= controlLink.phase == InputChannel.Phase.DISCONNECTED || e >= 30_000;
         }
-        // A fixed choice the network cannot carry: suggest one step down, never switch by itself.
-        String lower = lowerQualityLabel();
-        boolean short_ = hardwareDesktop && videoSeen && constrainedSince != 0 && now - constrainedSince >= 3000;
         if (lost) desktopLayout.link(S.LINK_LOST, S.LINK_RECONNECT, this::reconnectLinks);
         else if (worst >= 3000) desktopLayout.link(String.format(Locale.ROOT, S.LINK_RECOVERING_FOR, worst / 1000), null, null);
         else if (worst >= 1000) desktopLayout.link(S.LINK_RECOVERING, null, null);
-        else if (short_) desktopLayout.link(String.format(S.Q_SHORT, tierName(qualityWidth) + qualityFps), lower, lower == null ? null : this::lowerQuality);
         else desktopLayout.link(null, null, null);
-        if (worst > 0 || (constrainedSince != 0 && !short_)) inputUi.postDelayed(linkTick, 500);
+        if (worst > 0) inputUi.postDelayed(linkTick, 500);
     }
     /** “重新连接”: restarts every channel the user has on, with the same authorization. */
     void reconnectLinks() {
         Remote.Credentials c = credentials;
         if (c == null) { status(S.NEED_DEVICE); return; }
+        boolean restartControl = controlLink != null && controlLink.terminal;
         videoLink = audioLink = null; controlLink = null;
         if (subscribed.get() && hardwareDesktop) { video.stop(); videoSeen = false; } // the frame loop starts it again
         if (audioSubscribed) { systemAudio.stop(); audioSeen = false; audioState(AUDIO_CONNECTING); systemAudio.start(c); }
         if (controlRequested && control.get()) openInput(c);
+        else if (restartControl && !controlRequested) toggleControl();
         linkChanged();
     }
     void toggleControl() {
@@ -1176,6 +1204,7 @@ public final class MainActivity extends Activity {
         }
         Remote.Credentials c = credentials;
         if (c == null) { status(S.NEED_DEVICE); return; }
+        controlLink = null; linkChanged();
         controlRequested = true; controlLabels();
         try { work.execute(() -> {
             try (Remote probe = new Remote(c, 8, 0)) {
@@ -1184,7 +1213,7 @@ public final class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     if (inputEpoch.get() != epoch || credentials != c || !controlRequested) return;
                     openInput(c); control.set(true); controlLabels();
-                    status("控制已开启：单指拖拽、双击打开、双指轻点右键，双指缩放和平移");
+                    status("控制已开启：单指拖拽、双击打开、双指轻点右键、双指上下滑滚轮，双指捏合缩放");
                 });
             } catch (Exception error) {
                 String why = error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage();
@@ -1196,21 +1225,44 @@ public final class MainActivity extends Activity {
             }
         }); } catch (RejectedExecutionException busy) { controlRequested = false; controlLabels(); status("操作队列已满"); }
     }
+    int[] desktopPoint(float x, float y) {
+        if (!screen.viewport.valid) {
+            screen.updateTransform();
+            if (!screen.viewport.valid) inputNotice("正在等待桌面画面尺寸，请稍后再试");
+        }
+        return screen.viewport.pointer(x, y);
+    }
     void desktopTap(float touchX, float touchY) {
         if (rightArmed) { desktopRightClick(touchX, touchY); return; }
         desktopClick(touchX, touchY, false);
     }
+    static byte[] inputBody(int kind, int x, int y, int value, int monitor) {
+        return java.nio.ByteBuffer.allocate(20).putInt(kind).putInt(x).putInt(y).putInt(value).putInt(monitor).array();
+    }
+    void desktopWheelMove(float touchX, float touchY) {
+        if (!control.get() || !subscribed.get() || !display.get()) return;
+        int[] point = desktopPoint(touchX, touchY);
+        if (point == null) return;
+        // Op 22, kind 0 = absolute pointer move (x, y, value=0, monitor).
+        sendInput(22, inputBody(0, point[0], point[1], 0, selectedMonitor), null);
+    }
+    void desktopWheel(int delta) {
+        if (!control.get() || !subscribed.get() || !display.get() || delta == 0) return;
+        int clamped = DesktopView.WheelGesture.clampDelta(delta);
+        // Op 22, kind 3 = MOUSEEVENTF_WHEEL (deltaX in [-1200, 1200], y=0, value=0, monitor).
+        sendInput(22, inputBody(3, clamped, 0, 0, selectedMonitor), null);
+    }
     void desktopRightClick(float touchX, float touchY) {
         disarmRightClick();
         if (!control.get() || !subscribed.get() || !display.get()) return;
-        int[] point = screen.viewport.pointer(touchX, touchY);
+        int[] point = desktopPoint(touchX, touchY);
         if (point == null) return; // Letterbox or outside the picture.
         // Op 52 = right_click: x, y, monitor (same body as click).
         sendInput(52, pointerBody(point[0], point[1], selectedMonitor), new Click(keyboardRequestId.incrementAndGet(), false));
     }
     void desktopClick(float touchX, float touchY, boolean twice) {
         if (!control.get() || !subscribed.get() || !display.get()) return;
-        int[] point = screen.viewport.pointer(touchX, touchY);
+        int[] point = desktopPoint(touchX, touchY);
         if (point == null) return; // Ignore letterboxes and coordinates outside the view.
         sendInput(twice ? 37 : 35, pointerBody(point[0], point[1], selectedMonitor), new Click(keyboardRequestId.incrementAndGet(), true));
     }
@@ -1224,10 +1276,11 @@ public final class MainActivity extends Activity {
     }
     boolean desktopDragBegin(float x, float y) {
         if (!control.get() || !subscribed.get() || !display.get()) return false;
-        int[] point = screen.viewport.pointer(x, y); if (point == null) return false;
+        int[] point = desktopPoint(x, y); if (point == null) return false;
         keyboardRequestId.incrementAndGet(); keyboard.close(); draggingRemote = true;
         dragX = x; dragY = y;
-        sendPointer(1, point, TAG_KEY);
+        dragGesture = new DragGesture();
+        sendPointer(1, point, dragGesture);
         inputUi.removeCallbacks(dragHeartbeat); inputUi.postDelayed(dragHeartbeat, 250);
         return true;
     }
@@ -1238,11 +1291,11 @@ public final class MainActivity extends Activity {
         if (!draggingRemote || !control.get()) return;
         dragX = x; dragY = y;
         int[] point = screen.viewport.dragPointer(x, y); if (point == null) return;
-        sendPointer(2, point, null);
+        sendPointer(2, point, dragGesture);
     }
     void desktopDragEnd(float x, float y, boolean cancel) {
         if (!draggingRemote) return;
-        draggingRemote = false; inputUi.removeCallbacks(dragHeartbeat);
+        draggingRemote = false; dragGesture = null; inputUi.removeCallbacks(dragHeartbeat);
         int[] point = screen.viewport.dragPointer(x, y); if (point == null) point = new int[]{0, 0};
         sendPointer(cancel ? 4 : 3, point, TAG_DRAG_END);
     }

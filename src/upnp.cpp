@@ -264,6 +264,25 @@ struct UpnpIgd::Impl {
     std::vector<Service> found;
     UpnpReport report;
     UpnpRequest request;
+    using Clock = std::chrono::steady_clock;
+    using Deadline = Clock::time_point;
+    Deadline ipv4_deadline{}, ipv6_deadline{};
+    enum class Ownership { absent, confirmed, unknown, expired };
+
+    static Ownership ownership(const UpnpMapping& mapping, Deadline deadline) {
+        if (!mapping.external_port) return Ownership::absent;
+        if (Clock::now() >= deadline) return Ownership::expired;
+        return mapping.status == UpnpStatus::success ? Ownership::confirmed : Ownership::unknown;
+    }
+
+    UpnpReport status() const {
+        auto snapshot = report;
+        if (ownership(report.ipv4, ipv4_deadline) == Ownership::expired)
+            snapshot.ipv4.status = UpnpStatus::expired;
+        if (ownership(report.ipv6, ipv6_deadline) == Ownership::expired)
+            snapshot.ipv6.status = UpnpStatus::expired;
+        return snapshot;
+    }
     std::optional<uint32_t> pinhole;
     explicit Impl(SsdpTarget t) : target(std::move(t)) {}
     Service* service(bool v6) {
@@ -391,7 +410,9 @@ struct UpnpIgd::Impl {
                 return;
             }
             try {
+                auto& deadline = v6 ? ipv6_deadline : ipv4_deadline;
                 if (v6) {
+                    deadline = Clock::now() + std::chrono::seconds(r.lease_seconds);
                     auto reply = xml(soap(*s, "AddPinhole",
                                           {{"RemoteHost", ""},
                                            {"RemotePort", "0"},
@@ -415,6 +436,7 @@ struct UpnpIgd::Impl {
                         mapping.status = UpnpStatus::unsupported;
                         return;
                     }
+                    deadline = Clock::now() + std::chrono::seconds(r.lease_seconds);
                     soap(*s, "AddPortMapping",
                          {{"NewRemoteHost", ""},
                           {"NewExternalPort", std::to_string(r.external_port)},
@@ -441,9 +463,10 @@ struct UpnpIgd::Impl {
         return report;
     }
     UpnpReport renew() {
-        if (report.ipv4.status == UpnpStatus::success) {
+        if (ownership(report.ipv4, ipv4_deadline) == Ownership::confirmed) {
             auto* s = service(false);
             try {
+                auto deadline = Clock::now() + std::chrono::seconds(request.lease_seconds);
                 soap(*s, "AddPortMapping",
                      {{"NewRemoteHost", ""},
                       {"NewExternalPort", std::to_string(request.external_port)},
@@ -453,40 +476,54 @@ struct UpnpIgd::Impl {
                       {"NewEnabled", "1"},
                       {"NewPortMappingDescription", "Lantern"},
                       {"NewLeaseDuration", std::to_string(request.lease_seconds)}});
+                ipv4_deadline = deadline;
                 report.ipv4.expires_at = pairing_unix_time() + request.lease_seconds;
             } catch (const RouterError& e) {
                 report.ipv4.status = e.status;
             }
         }
-        if (report.ipv6.status == UpnpStatus::success && pinhole) {
+        if (ownership(report.ipv6, ipv6_deadline) == Ownership::confirmed && pinhole) {
             auto* s = service(true);
             try {
+                auto deadline = Clock::now() + std::chrono::seconds(request.lease_seconds);
                 soap(*s, "UpdatePinhole",
                      {{"UniqueID", std::to_string(*pinhole)},
                       {"NewLeaseTime", std::to_string(request.lease_seconds)}});
+                ipv6_deadline = deadline;
                 report.ipv6.expires_at = pairing_unix_time() + request.lease_seconds;
             } catch (const RouterError& e) {
                 report.ipv6.status = e.status;
             }
         }
-        return report;
+        return status();
+    }
+
+    void delete_port(uint16_t port) {
+        soap(*service(false), "DeletePortMapping",
+             {{"NewRemoteHost", ""}, {"NewExternalPort", std::to_string(port)},
+              {"NewProtocol", request.protocol == 17 ? "UDP" : "TCP"}});
+    }
+    void delete_pinhole(uint32_t id) {
+        soap(*service(true), "DeletePinhole", {{"UniqueID", std::to_string(id)}});
     }
     UpnpReport unmap() {
-        // Ownership is tracked even after renewal failure; never delete somebody else's mapping.
+        if (ownership(report.ipv4, ipv4_deadline) != Ownership::confirmed)
+            report.ipv4 = {};
         if (report.ipv4.external_port) {
             try {
-                soap(*service(false), "DeletePortMapping",
-                     {{"NewRemoteHost", ""},
-                      {"NewExternalPort", std::to_string(report.ipv4.external_port)},
-                      {"NewProtocol", request.protocol==17?"UDP":"TCP"}});
+                delete_port(report.ipv4.external_port);
                 report.ipv4 = {};
             } catch (const RouterError& e) {
                 report.ipv4.status = e.status;
             }
         }
+        if (ownership(report.ipv6, ipv6_deadline) != Ownership::confirmed) {
+            report.ipv6 = {};
+            pinhole.reset();
+        }
         if (pinhole) {
             try {
-                soap(*service(true), "DeletePinhole", {{"UniqueID", std::to_string(*pinhole)}});
+                delete_pinhole(*pinhole);
                 pinhole.reset();
                 report.ipv6 = {};
             } catch (const RouterError& e) {
@@ -511,7 +548,7 @@ UpnpReport UpnpIgd::unmap() {
     return p_->unmap();
 }
 UpnpReport UpnpIgd::status() const {
-    return p_->report;
+    return p_->status();
 }
 UpnpReport UpnpIgd::remove(uint16_t port, std::optional<uint32_t> pinhole) {
     auto result = p_->found.empty() ? p_->discover() : UpnpStatus::success;
@@ -520,11 +557,31 @@ UpnpReport UpnpIgd::remove(uint16_t port, std::optional<uint32_t> pinhole) {
         r.ipv4.status = r.ipv6.status = result;
         return r;
     }
-    if (port && p_->service(false))
-        p_->report.ipv4.external_port = port;
-    if (pinhole && *pinhole <= 65535 && p_->service(true))
-        p_->pinhole = pinhole;
-    return p_->unmap();
+    UpnpReport result_report;
+    if (port && p_->service(false)) {
+        try {
+            p_->delete_port(port);
+            if (p_->report.ipv4.external_port == port) p_->report.ipv4 = {};
+        } catch (const RouterError& e) {
+            result_report.ipv4.status = e.status;
+            result_report.ipv4.external_port = port;
+            if (p_->report.ipv4.external_port == port) p_->report.ipv4.status = e.status;
+        }
+    }
+    if (pinhole && *pinhole <= 65535 && p_->service(true)) {
+        try {
+            p_->delete_pinhole(*pinhole);
+            if (p_->pinhole == pinhole) {
+                p_->pinhole.reset();
+                p_->report.ipv6 = {};
+            }
+        } catch (const RouterError& e) {
+            result_report.ipv6.status = e.status;
+            result_report.ipv6.pinhole_id = pinhole;
+            if (p_->pinhole == pinhole) p_->report.ipv6.status = e.status;
+        }
+    }
+    return result_report;
 }
 struct UpnpLease::Impl {
     mutable std::mutex mutex;
@@ -572,12 +629,7 @@ UpnpReport UpnpLease::unmap() {
 }
 UpnpReport UpnpLease::status() const {
     std::lock_guard lock(p_->mutex);
-    auto r = p_->igd.status();
-    auto now = pairing_unix_time();
-    for (auto* m : {&r.ipv4, &r.ipv6})
-        if (m->status == UpnpStatus::success && m->expires_at <= now)
-            m->status = UpnpStatus::expired;
-    return r;
+    return p_->igd.status();
 }
 void UpnpLease::stop() {
     if (!p_)

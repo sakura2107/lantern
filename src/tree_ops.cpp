@@ -133,7 +133,7 @@ void FileService::copy_tree(const std::string& from, const std::string& to, Canc
     scan(from, "", 0);
     if (nodes.empty() || !nodes.front().directory)
         throw Error(Code::invalid, "Use regular copy for a single file");
-    std::lock_guard mutation(mutations_);
+    Mutation paths(*this, from, to);
     auto destination = guard(to, true);
     if (fs::exists(destination.path))
         throw Error(Code::conflict, "Destination exists; original preserved");

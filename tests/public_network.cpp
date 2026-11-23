@@ -1,7 +1,10 @@
+#include "../src/tls_test.hpp"
+#include "lantern/connection_registry.hpp"
 #include "lantern/host_admin.hpp"
 #include "lantern/lan.hpp"
 #include "lantern/windows_client.hpp"
 #include <iostream>
+#include <string_view>
 #include <thread>
 #include <ws2tcpip.h>
 using namespace lantern;
@@ -148,6 +151,60 @@ void models() {
     check(read_endpoints(r).size() == 8, "endpoint wire roundtrip");
     r.end();
 }
+void connection_registry() {
+    AuthenticationGuard guard;
+    ConnectionRegistry registry(guard);
+    constexpr SOCKET reused_socket = 5;
+    auto deadline_b = ConnectionRegistry::Clock::time_point::max();
+    auto deadline_a = deadline_b - std::chrono::seconds(1);
+    auto admit = [&](SOCKET socket, ConnectionRegistry::Clock::time_point deadline) {
+        return registry.admit(socket, "2001:db8::1", true, deadline, 0);
+    };
+
+    auto a = admit(reused_socket, deadline_a);
+    check(a && registry.remove(a), "ConnectionRegistry admitted and removed A");
+    auto b = admit(reused_socket, deadline_b);
+    check(b && b != a, "ConnectionRegistry admitted B on the same SOCKET with a distinct ticket");
+    auto timeouts = guard.stats().timeouts;
+    check(!registry.remove(a, true), "ConnectionRegistry rejected late timeout removal of A");
+    check(!registry.promote(a), "ConnectionRegistry rejected late promotion of A");
+    const auto& entries = registry.entries();
+    check(entries.size() == 1 && entries.at(reused_socket) == b && b->pending && !b->timed_out &&
+              b->deadline == deadline_b && guard.stats().timeouts == timeouts,
+          "ConnectionRegistry preserved B's identity, pending state, deadline and timeout count");
+
+    for (SOCKET socket : {6, 7, 8})
+        check(bool(admit(socket, deadline_b)), "ConnectionRegistry admitted another pending handshake");
+    check(!admit(9, deadline_b), "ConnectionRegistry rejected the fifth pending handshake from the source");
+    check(registry.promote(b) && !b->pending && !registry.promote(b),
+          "ConnectionRegistry promoted B exactly once");
+    check(admit(9, deadline_b) && !admit(10, deadline_b),
+          "ConnectionRegistry promotion freed exactly one source slot");
+    check(registry.remove(b) && !registry.remove(b, true) && !entries.contains(reused_socket) &&
+              guard.stats().timeouts == timeouts && !admit(10, deadline_b),
+          "ConnectionRegistry repeated removal left timeout and source counts unchanged");
+    std::cout << "WP-SEC-01 ConnectionRegistry: all assertions passed" << std::endl;
+}
+void tls_first_send_failure(const fs::path& state) {
+    Identity identity(state / L"identity.dpapi", false);
+    auto verify = [&](const char* side, TlsFirstSendProbe& probe, Identity* server,
+                      std::span<const uint8_t> input) {
+        bool send_failed = false;
+        try {
+            probe.handshake(server, input);
+        } catch (const TransportError& e) {
+            send_failed = std::string_view(e.what()) == "Socket send failed";
+        }
+        std::cout << "WP-SEC-02 " << side << " first send: FreeContextBuffer=" << probe.buffer_frees
+                  << ", DeleteSecurityContext=" << probe.context_deletes << std::endl;
+        check(send_failed && !probe.output.empty(), "Schannel first token reached the injected send failure");
+        check(probe.buffer_frees == 1 && probe.context_deletes == 1,
+              "Schannel released the first token and context exactly once");
+    };
+    TlsFirstSendProbe client, server;
+    verify("client", client, nullptr, {});
+    verify("server", server, &identity, client.output);
+}
 void legacy_configs(const fs::path& state, const fs::path& share) {
     for (unsigned version = 1; version <= 3; ++version) {
         Writer w;
@@ -239,12 +296,14 @@ void old_host_fallback(const fs::path& state, const DevicePairing& pairing) {
 int wmain(int argc, wchar_t** argv) {
     try {
         models();
+        connection_registry();
         fs::path root = argc > 1 ? fs::path(argv[1]) : fs::temp_directory_path() / L"lantern-public-tests";
         root /= wide(random_token().substr(0, 12));
         auto share = root / L"share", state = root / L"state";
         fs::create_directories(share);
         write_file(share / L"test.txt", Bytes{'o', 'k'});
         HostAdministration::initialize(state, share, 31);
+        tls_first_send_failure(state);
         HostAdministration admin(state);
         legacy_configs(state, share);
         edit_config(state / L"config.dpapi", [](Config& c) { c.legacy_enabled = true; });

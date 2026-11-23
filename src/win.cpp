@@ -94,6 +94,10 @@ std::string hash_file(HANDLE f) {
     Cancel cancel;return hash_file(f,cancel,{});
 }
 std::string hash_file(HANDLE f,Cancel& cancel,std::function<void(uint64_t,uint64_t)> progress) {
+    return hash_file(f, [&] { cancel.check(); }, progress);
+}
+std::string hash_file(HANDLE f, const std::function<void()>& check_cancel,
+                      const std::function<void(uint64_t,uint64_t)>& progress) {
     LARGE_INTEGER zero{};
     if (!SetFilePointerEx(f, zero, nullptr, FILE_BEGIN))
         win_error("Seek hash");
@@ -103,7 +107,7 @@ std::string hash_file(HANDLE f,Cancel& cancel,std::function<void(uint64_t,uint64
     LARGE_INTEGER size{};if(!GetFileSizeEx(f,&size))win_error("Hash size");uint64_t done=0;
     if(progress)progress(0,uint64_t(size.QuadPart));
     while (true) {
-        cancel.check();
+        check_cancel();
         if (!ReadFile(f, b.data(), DWORD(b.size()), &n, nullptr))
             win_error("Read hash");
         if (!n)
@@ -111,14 +115,20 @@ std::string hash_file(HANDLE f,Cancel& cancel,std::function<void(uint64_t,uint64
         h.add({b.data(), n});
         done+=n;if(progress)progress(done,uint64_t(size.QuadPart));
     }
-    return h.finish();
+    auto digest = h.finish();
+    check_cancel();
+    return digest;
 }
 std::string hash_file(const fs::path& p) {
+    Cancel cancel;
+    return hash_file(p, cancel);
+}
+std::string hash_file(const fs::path& p, Cancel& cancel) {
     Handle h(CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                          FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
     if (h.h == INVALID_HANDLE_VALUE)
         win_error("Open hash");
-    return hash_file(h);
+    return hash_file(h, cancel, {});
 }
 Bytes read_file(const fs::path& p, size_t max) {
     std::ifstream f(p, std::ios::binary);

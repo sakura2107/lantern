@@ -636,7 +636,7 @@ void WindowsTransfers::run() {
                     fs::create_directories(task.local.parent_path());
                     if (fs::exists(task.local)) {
                         auto info = client->stat(task.remote, true, &cancel_);
-                        if (hash_file(task.local) != info.hash)
+                        if (hash_file(task.local, cancel_) != info.hash)
                             throw Error(Code::conflict, "本地同名文件不同，选择另存为");
                         progress(info.size, info.size);
                     } else

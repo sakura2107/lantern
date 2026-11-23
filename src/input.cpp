@@ -1,22 +1,46 @@
 #include "lantern/win.hpp"
 #include <cwctype>
+#include "lantern/input_channel.hpp"
 namespace lantern {
 static std::mutex input_mutex;
-static InputSession* pointer_owner = nullptr;
+static PointerLease pointer_lease;
 static std::chrono::steady_clock::time_point pointer_deadline;
-static void release_pointer() noexcept {
+static void release_pointer(uint64_t generation) noexcept {
     INPUT up{};
     up.type = INPUT_MOUSE;
     up.mi.dwFlags = MOUSEEVENTF_LEFTUP;
-    if (pointer_owner)
+    if (pointer_lease.release(generation))
         SendInput(1, &up, sizeof(INPUT));
-    pointer_owner = nullptr;
 }
 static uint32_t validation_pid = 0;
 void set_input_validation_pid(uint32_t pid) {
     validation_pid = pid;
 }
+static DWORD integrity_level(HANDLE process) {
+    HANDLE raw = nullptr;
+    if (!OpenProcessToken(process, TOKEN_QUERY, &raw))
+        throw Error(Code::unsupported, "无法验证电脑窗口权限");
+    Handle token(raw);
+    alignas(TOKEN_MANDATORY_LABEL) BYTE buffer[sizeof(TOKEN_MANDATORY_LABEL) + SECURITY_MAX_SID_SIZE];
+    DWORD size = 0;
+    if (!GetTokenInformation(token, TokenIntegrityLevel, buffer, sizeof(buffer), &size))
+        throw Error(Code::unsupported, "无法读取电脑窗口完整性级别");
+    auto sid = reinterpret_cast<TOKEN_MANDATORY_LABEL*>(buffer)->Label.Sid;
+    return *GetSidSubAuthority(sid, *GetSidSubAuthorityCount(sid) - 1);
+}
+static void check_integrity(HWND window) {
+    DWORD pid = 0;
+    if (!window || !GetWindowThreadProcessId(window, &pid) || pid == GetCurrentProcessId())
+        return;
+    Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+    if (!process.h)
+        throw Error(Code::unsupported, "无法验证目标窗口权限，请检查电脑当前桌面");
+    static const DWORD host_level = integrity_level(GetCurrentProcess());
+    if (integrity_level(process) > host_level)
+        throw Error(Code::unsupported, "当前电脑窗口为管理员权限，普通模式无法点击");
+}
 static void validate_input_target() {
+    check_integrity(GetForegroundWindow());
     if (!validation_pid)
         return;
     DWORD pid = 0;
@@ -29,6 +53,9 @@ static INPUT pointer_input(const Monitor& m, int32_t x, int32_t y) {
         throw Error(Code::invalid, "Pointer coordinate");
     int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN),
         vw = GetSystemMetrics(SM_CXVIRTUALSCREEN), vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    POINT point{LONG(m.x + int64_t(x) * (m.width - 1) / 65535),
+                LONG(m.y + int64_t(y) * (m.height - 1) / 65535)};
+    check_integrity(WindowFromPoint(point));
     INPUT input{};
     input.type = INPUT_MOUSE;
     input.mi.dx =
@@ -40,7 +67,7 @@ static INPUT pointer_input(const Monitor& m, int32_t x, int32_t y) {
 }
 void remote_input(uint32_t kind, int32_t x, int32_t y, uint32_t value, uint32_t index) {
     std::lock_guard lock(input_mutex);
-    if (pointer_owner)
+    if (pointer_lease.held())
         throw Error(Code::busy, "Another pointer gesture owns input");
     validate_input_target();
     auto v = monitors();
@@ -50,6 +77,8 @@ void remote_input(uint32_t kind, int32_t x, int32_t y, uint32_t value, uint32_t 
     if (kind == 0) {
         i = pointer_input(v[index], x, y);
     } else if (kind == 1) {
+        POINT point{};
+        if (GetCursorPos(&point)) check_integrity(WindowFromPoint(point));
         i.type = INPUT_MOUSE;
         switch (value) {
         case 0:
@@ -76,33 +105,32 @@ void remote_input(uint32_t kind, int32_t x, int32_t y, uint32_t value, uint32_t 
     } else if (kind == 3) {
         if (x < -1200 || x > 1200)
             throw Error(Code::invalid, "Wheel bound");
+        POINT point{};
+        if (GetCursorPos(&point)) check_integrity(WindowFromPoint(point));
         i.type = INPUT_MOUSE;
         i.mi.dwFlags = MOUSEEVENTF_WHEEL;
         i.mi.mouseData = DWORD(x);
     } else
         throw Error(Code::invalid, "Input kind");
     if (SendInput(1, &i, sizeof(i)) != 1)
-        throw Error(Code::unsupported, "Input rejected (UIPI, secure desktop or session isolation)");
+        throw Error(Code::unsupported, "Windows 拒绝输入，请检查窗口权限或安全桌面");
 }
 
 void expire_pointer_lease() noexcept {
     std::lock_guard lock(input_mutex);
-    if (!pointer_owner)
+    if (!pointer_lease.held())
         return;
     DWORD foreground_pid = 0;
     GetWindowThreadProcessId(GetForegroundWindow(), &foreground_pid);
     if (std::chrono::steady_clock::now() >= pointer_deadline ||
         (validation_pid && foreground_pid != validation_pid))
-        release_pointer();
+        release_pointer(pointer_lease.owner());
 }
-InputSession::~InputSession() {
-    cancel();
-}
-void InputSession::cancel() noexcept {
+static void cancel_connection_pointer(uint64_t generation) noexcept {
     std::lock_guard lock(input_mutex);
-    if (pointer_owner == this)
-        release_pointer();
+    release_pointer(generation);
 }
+InputSession::InputSession() : InputSession(cancel_connection_pointer) {}
 static void send_batch(std::span<INPUT> batch) {
     UINT sent = SendInput(UINT(batch.size()), batch.data(), sizeof(INPUT));
     if (sent != batch.size()) {
@@ -113,12 +141,12 @@ static void send_batch(std::span<INPUT> batch) {
             else if (i.type == INPUT_MOUSE && (i.mi.dwFlags & (MOUSEEVENTF_LEFTUP | MOUSEEVENTF_RIGHTUP)))
                 SendInput(1, &i, sizeof(INPUT));
         }
-        throw Error(Code::unsupported, "Input rejected (UIPI or desktop isolation)");
+        throw Error(Code::unsupported, "Windows 拒绝输入，请检查窗口权限或安全桌面");
     }
 }
 void InputSession::click(int32_t x, int32_t y, uint32_t index, bool twice) {
     std::lock_guard lock(input_mutex);
-    if (pointer_owner)
+    if (pointer_lease.held())
         throw Error(Code::busy, "Pointer drag is active");
     validate_input_target();
     auto displays = monitors();
@@ -141,8 +169,7 @@ void InputSession::pointer(uint32_t phase, int32_t x, int32_t y, uint32_t index)
     if (phase < 1 || phase > 4)
         throw Error(Code::invalid, "Pointer phase");
     if (phase == 4) {
-        if (pointer_owner == this)
-            release_pointer();
+        release_pointer(generation_);
         return;
     }
     validate_input_target();
@@ -153,24 +180,22 @@ void InputSession::pointer(uint32_t phase, int32_t x, int32_t y, uint32_t index)
     batch[0] = pointer_input(displays[index], x, y);
     batch[1].type = INPUT_MOUSE;
     if (phase == 1) {
-        if (pointer_owner)
+        if (!pointer_lease.acquire(generation_))
             throw Error(Code::busy, "Pointer lease already held");
-        pointer_owner = this;
         batch[1].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
     } else {
-        if (pointer_owner != this)
+        if (!pointer_lease.owns(generation_))
             throw Error(Code::cancelled, "Pointer lease ended; start a new drag");
         batch[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
     }
     try {
         send_batch(std::span<INPUT>(batch, phase == 2 ? 1 : 2));
         if (phase == 3)
-            pointer_owner = nullptr;
+            pointer_lease.release(generation_);
         else
             pointer_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1800);
     } catch (...) {
-        if (pointer_owner == this)
-            release_pointer();
+        release_pointer(generation_);
         throw;
     }
 }
@@ -194,7 +219,7 @@ void InputSession::text(const std::string& text) {
         batch.push_back(down);
     }
     std::lock_guard lock(input_mutex);
-    if (pointer_owner)
+    if (pointer_lease.held())
         throw Error(Code::busy, "Finish drag before text input");
     validate_input_target();
     send_batch(batch);
@@ -212,7 +237,7 @@ void InputSession::key(uint32_t vk, uint32_t count) {
         batch[i * 2 + 1].ki.dwFlags = KEYEVENTF_KEYUP;
     }
     std::lock_guard lock(input_mutex);
-    if (pointer_owner)
+    if (pointer_lease.held())
         throw Error(Code::busy, "Finish drag before key input");
     validate_input_target();
     send_batch(batch);
@@ -258,14 +283,14 @@ void InputSession::shortcut(uint32_t modifiers, uint32_t vk) {
         if (modifiers & (1u << i))
             key(mods[i], true);
     std::lock_guard lock(input_mutex);
-    if (pointer_owner)
+    if (pointer_lease.held())
         throw Error(Code::busy, "Finish drag before shortcut");
     validate_input_target();
     send_batch(batch);
 }
 void InputSession::right_click(int32_t x, int32_t y, uint32_t index) {
     std::lock_guard lock(input_mutex);
-    if (pointer_owner)
+    if (pointer_lease.held())
         throw Error(Code::busy, "Finish drag before right click");
     validate_input_target();
     auto displays = monitors();

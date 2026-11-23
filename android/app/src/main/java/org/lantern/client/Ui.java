@@ -8,6 +8,8 @@ import android.text.InputType;
 import android.text.TextUtils;
 import android.view.*;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.animation.DecelerateInterpolator;
+import android.view.animation.OvershootInterpolator;
 import android.widget.*;
 import java.util.Calendar;
 import java.util.Locale;
@@ -98,9 +100,27 @@ final class Ui {
         return d;
     }
     static GradientDrawable outline(int fill, int stroke, float radiusDp) {
+        return outline(fill, stroke, 1f, radiusDp);
+    }
+    static GradientDrawable outline(int fill, int stroke, float strokeDp, float radiusDp) {
         GradientDrawable d = round(fill, radiusDp);
-        d.setStroke(Math.max(1, Theme.dp(1)), stroke);
+        if (stroke != 0) d.setStroke(Math.max(1, Theme.dp(strokeDp)), stroke);
         return d;
+    }
+    static GradientDrawable gradient(int startColor, int endColor, int stroke, float strokeDp, float radiusDp) {
+        GradientDrawable d = new GradientDrawable(GradientDrawable.Orientation.TL_BR, new int[] {startColor, endColor});
+        d.setCornerRadius(Theme.dp(radiusDp));
+        if (stroke != 0) d.setStroke(Math.max(1, Theme.dp(strokeDp)), stroke);
+        return d;
+    }
+    static GradientDrawable card(float radiusDp) {
+        return outline(Theme.SURFACE, Theme.RIM, 1f, radiusDp);
+    }
+    static GradientDrawable glass(float radiusDp) {
+        return outline(Theme.VIDEO_CHROME, Theme.VIDEO_CHROME_STROKE, 1f, radiusDp);
+    }
+    static GradientDrawable glass(int fill, int stroke, float radiusDp) {
+        return outline(fill, stroke, 1f, radiusDp);
     }
     static GradientDrawable topRound(int fill, float radiusDp) {
         GradientDrawable d = new GradientDrawable();
@@ -109,15 +129,45 @@ final class Ui {
         d.setCornerRadii(new float[] {r, r, r, r, 0, 0, 0, 0});
         return d;
     }
+    static Drawable topRoundSurface(int fill, int rim, float radiusDp) {
+        GradientDrawable rimBg = topRound(rim, radiusDp);
+        GradientDrawable inner = topRound(fill, radiusDp);
+        LayerDrawable layer = new LayerDrawable(new Drawable[] {rimBg, inner});
+        int inset = Math.max(1, Theme.dp(1));
+        layer.setLayerInset(1, 0, inset, 0, 0);
+        return layer;
+    }
     static Drawable press(Drawable content, float radiusDp) {
-        return new RippleDrawable(ColorStateList.valueOf(Theme.alpha(Theme.INK, 0.12f)), content, round(0xffffffff, radiusDp));
+        return new RippleDrawable(ColorStateList.valueOf(Theme.alpha(Theme.INK, Theme.dark ? 0.14f : 0.10f)), content, round(0xffffffff, radiusDp));
+    }
+    static Drawable pressGlass(Drawable content, float radiusDp) {
+        return new RippleDrawable(ColorStateList.valueOf(0x33ffffff), content, round(0xffffffff, radiusDp));
     }
     static Drawable pressOval(int fill) {
         ShapeDrawable mask = new ShapeDrawable(new android.graphics.drawable.shapes.OvalShape());
         GradientDrawable content = new GradientDrawable();
         content.setShape(GradientDrawable.OVAL);
         content.setColor(fill);
-        return new RippleDrawable(ColorStateList.valueOf(Theme.alpha(Theme.INK, 0.14f)), content, mask);
+        return new RippleDrawable(ColorStateList.valueOf(Theme.alpha(Theme.INK, Theme.dark ? 0.16f : 0.12f)), content, mask);
+    }
+    /** Subtle elastic micro-scale on press without interfering with clicks or scrolling. */
+    static <T extends View> T bounce(T view) { return bounce(view, 0.97f); }
+    static <T extends View> T bounce(T view, float pressedScale) {
+        view.setOnTouchListener((v, e) -> {
+            if (!v.isEnabled()) return false;
+            int action = e.getActionMasked();
+            if (action == MotionEvent.ACTION_DOWN) {
+                v.animate().cancel();
+                v.animate().scaleX(pressedScale).scaleY(pressedScale).setDuration(85)
+                    .setInterpolator(new DecelerateInterpolator(1.6f)).start();
+            } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                v.animate().cancel();
+                v.animate().scaleX(1f).scaleY(1f).setDuration(190)
+                    .setInterpolator(new OvershootInterpolator(1.4f)).start();
+            }
+            return false;
+        });
+        return view;
     }
 
     // ---------- layout ----------
@@ -148,13 +198,15 @@ final class Ui {
         return t;
     }
     static TextView heading(Context c, CharSequence value) {
-        TextView t = medium(c, value, 15, Theme.INK);
-        t.setPadding(Theme.dp(4), Theme.dp(24), 0, Theme.dp(10));
+        TextView t = medium(c, value, 14, Theme.MUTED);
+        t.setLetterSpacing(0.03f);
+        t.setPadding(Theme.dp(6), Theme.dp(22), 0, Theme.dp(10));
         return t;
     }
     static TextView label(Context c, CharSequence value) {
         TextView t = medium(c, value, 13, Theme.MUTED);
-        t.setPadding(0, Theme.dp(14), 0, Theme.dp(6));
+        t.setLetterSpacing(0.015f);
+        t.setPadding(Theme.dp(2), Theme.dp(14), 0, Theme.dp(6));
         return t;
     }
     static TextView oneLine(TextView t) { t.setSingleLine(); t.setEllipsize(TextUtils.TruncateAt.END); return t; }
@@ -173,7 +225,7 @@ final class Ui {
         Button b = new Button(c);
         b.setText(label);
         b.setAllCaps(false);
-        b.setTextSize(15);
+        b.setTextSize(14.5f);
         b.setTypeface(Theme.MEDIUM);
         b.setStateListAnimator(null);
         b.setMinWidth(0); b.setMinimumWidth(0); b.setMinHeight(0); b.setMinimumHeight(0);
@@ -182,21 +234,23 @@ final class Ui {
         b.setEllipsize(TextUtils.TruncateAt.END);
         b.setCompoundDrawablePadding(Theme.dp(8));
         style(b, style);
+        bounce(b, 0.97f);
         if (click != null) b.setOnClickListener(v -> click.run());
         return b;
     }
     static void style(Button b, int style) {
-        int fill, text;
+        int fill, text, stroke = 0;
         switch (style) {
         case PRIMARY: fill = Theme.INK; text = Theme.ON_INK; break;
-        case DANGER: fill = Theme.DANGER_SOFT; text = Theme.DANGER; break;
+        case DANGER: fill = Theme.DANGER_SOFT; text = Theme.DANGER; stroke = Theme.alpha(Theme.DANGER, 0.30f); break;
         case GHOST: fill = 0; text = Theme.INK; break;
-        default: fill = Theme.INSET; text = Theme.INK;
+        default: fill = Theme.INSET; text = Theme.INK; stroke = Theme.RIM;
         }
         b.setTextColor(new ColorStateList(new int[][] {{-android.R.attr.state_enabled}, {}},
-                                          new int[] {Theme.alpha(text, 0.4f), text}));
-        b.setBackground(new RippleDrawable(ColorStateList.valueOf(style == PRIMARY ? 0x33ffffff : Theme.alpha(Theme.INK, 0.12f)),
-                                           round(fill, 24), round(0xffffffff, 24)));
+                                          new int[] {Theme.alpha(text, 0.38f), text}));
+        Drawable bg = stroke != 0 ? outline(fill, stroke, 1f, 24) : round(fill, 24);
+        b.setBackground(new RippleDrawable(ColorStateList.valueOf(style == PRIMARY ? (Theme.dark ? 0x28000000 : 0x33ffffff) : Theme.alpha(Theme.INK, 0.12f)),
+                                           bg, round(0xffffffff, 24)));
     }
     static void withIcon(Button b, int glyph) {
         Glyph g = new Glyph(glyph, b.getCurrentTextColor(), Theme.dp(18));
@@ -220,15 +274,15 @@ final class Ui {
         ImageView v = new ImageView(c);
         v.setImageDrawable(new Glyph(glyph, color));
         v.setScaleType(ImageView.ScaleType.CENTER);
-        v.setBackground(round(fill, radiusDp));
+        v.setBackground(fill == 0 ? null : round(fill, radiusDp));
         v.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         return v;
     }
-    /** A rounded chip; tone is one of the theme soft/strong pairs. */
+    /** A rounded capsule chip; tone is one of the theme soft/strong pairs. */
     static TextView chip(Context c, String label, int textColor, int fill) {
-        TextView t = medium(c, label, 12, textColor);
-        t.setPadding(Theme.dp(10), Theme.dp(4), Theme.dp(10), Theme.dp(4));
-        t.setBackground(round(fill, 12));
+        TextView t = medium(c, label, 11.5f, textColor);
+        t.setPadding(Theme.dp(10), Theme.dp(3.5f), Theme.dp(10), Theme.dp(3.5f));
+        t.setBackground(round(fill, 50));
         t.setSingleLine();
         return t;
     }
@@ -237,20 +291,20 @@ final class Ui {
         e.setHint(hint);
         e.setTextColor(Theme.INK);
         e.setHintTextColor(Theme.FAINT);
-        e.setTextSize(16);
+        e.setTextSize(15.5f);
         e.setSingleLine();
         e.setInputType(secret ? InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD : InputType.TYPE_CLASS_TEXT);
-        e.setPadding(Theme.dp(14), Theme.dp(12), Theme.dp(14), Theme.dp(12));
+        e.setPadding(Theme.dp(15), Theme.dp(12), Theme.dp(15), Theme.dp(12));
         StateListDrawable background = new StateListDrawable();
-        GradientDrawable focused = round(Theme.SURFACE, 14);
-        focused.setStroke(Theme.dp(1.5f), Theme.INK);
+        GradientDrawable focused = outline(Theme.SURFACE, Theme.LAMP, 1.5f, 16);
+        GradientDrawable normal = outline(Theme.INSET, Theme.LINE, 1f, 16);
         background.addState(new int[] {android.R.attr.state_focused}, focused);
-        background.addState(new int[] {}, round(Theme.INSET, 14));
+        background.addState(new int[] {}, normal);
         e.setBackground(background);
         e.setMinHeight(Theme.dp(48));
         e.setHighlightColor(Theme.LAMP_SOFT);
         if (android.os.Build.VERSION.SDK_INT >= 29) {
-            GradientDrawable cursor = round(Theme.INK, 1);
+            GradientDrawable cursor = round(Theme.LAMP, 1);
             cursor.setSize(Theme.dp(2), -1);
             e.setTextCursorDrawable(cursor);
         }
@@ -258,22 +312,26 @@ final class Ui {
     }
     static ProgressBar spinner(Context c, float sizeDp) {
         ProgressBar p = new ProgressBar(c, null, android.R.attr.progressBarStyleSmall);
-        p.setIndeterminateTintList(ColorStateList.valueOf(Theme.INK));
+        p.setIndeterminateTintList(ColorStateList.valueOf(Theme.LAMP));
         p.setLayoutParams(new LinearLayout.LayoutParams(Theme.dp(sizeDp), Theme.dp(sizeDp)));
         return p;
     }
 
-    /** Thin rounded progress line; indeterminate mode animates a short segment. */
+    /** Smooth rounded progress bar; determinate mode eases updates, indeterminate animates a warm sweep. */
     static final class Meter extends View {
-        float value;
-        boolean indeterminate;
-        int color = Theme.INK, track = Theme.INSET;
+        float value, displayed;
+        boolean indeterminate, initialized;
+        int color = Theme.LAMP, track = Theme.INSET;
         final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        long started;
+        long started, lastFrame;
         Meter(Context c) { super(c); setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO); }
         void set(float fraction, int tone) {
             float next = Math.max(0, Math.min(1, fraction));
-            if (next != value || tone != color || indeterminate) { value = next; color = tone; indeterminate = false; invalidate(); }
+            if (next != value || tone != color || indeterminate) {
+                if (!initialized || next < value - 0.15f) { displayed = next; initialized = true; }
+                value = next; color = tone; indeterminate = false; lastFrame = System.nanoTime();
+                invalidate();
+            }
         }
         void busy(boolean on) {
             if (indeterminate == on) return;
@@ -287,15 +345,27 @@ final class Ui {
             canvas.drawRoundRect(0, 0, w, h, r, r, paint);
             paint.setColor(color);
             if (indeterminate) {
-                float t = ((System.nanoTime() - started) / 1e9f) % 1.4f / 1.4f;
-                float seg = w * 0.3f, x = -seg + (w + seg) * t;
+                float t = ((System.nanoTime() - started) / 1e9f) % 1.35f / 1.35f;
+                float seg = w * 0.34f, x = -seg + (w + seg) * t;
                 canvas.save();
                 canvas.clipRect(0, 0, w, h);
                 canvas.drawRoundRect(x, 0, x + seg, h, r, r, paint);
                 canvas.restore();
                 postInvalidateOnAnimation();
-            } else if (value > 0) {
-                canvas.drawRoundRect(0, 0, Math.max(h, w * value), h, r, r, paint);
+            } else {
+                long now = System.nanoTime();
+                float diff = value - displayed;
+                if (Math.abs(diff) > 0.003f) {
+                    float dt = Math.min(0.05f, Math.max(0.008f, (now - lastFrame) / 1e9f));
+                    displayed += diff * Math.min(1f, dt * 14f);
+                    lastFrame = now;
+                    postInvalidateOnAnimation();
+                } else {
+                    displayed = value;
+                }
+                if (displayed > 0) {
+                    canvas.drawRoundRect(0, 0, Math.max(h, w * displayed), h, r, r, paint);
+                }
             }
         }
     }

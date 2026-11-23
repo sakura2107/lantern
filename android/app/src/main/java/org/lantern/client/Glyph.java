@@ -14,7 +14,8 @@ final class Glyph extends Drawable {
                      COMMAND = 38, TRASH = 39, EDIT = 40, COPY = 41, MOVE = 42, INFO = 43, OPEN = 44,
                      FOLDER_PLUS = 45, SELECT = 46, PULSE = 47, BELL = 48, LICENSE = 49, TOOLS = 50,
                      CHEVRON_DOWN = 51, TOP = 52, STOP = 53, HOME = 54, PASTE = 55, CLOCK = 56,
-                     WARNING = 57, SELECT_ALL = 58, LOCK = 59, CHEVRON_LEFT = 60, MOUSE_RIGHT = 61, SCAN = 62;
+                     WARNING = 57, SELECT_ALL = 58, LOCK = 59, CHEVRON_LEFT = 60, MOUSE_RIGHT = 61, SCAN = 62,
+                     GRIP = 63;
 
     final int kind;
     final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG), fill = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -164,6 +165,11 @@ final class Glyph extends Drawable {
             path.reset(); path.moveTo(12.9f, 3.9f); path.lineTo(12.9f, 9.1f); path.lineTo(17.1f, 9.1f);
             path.lineTo(17.1f, 8.5f); path.quadTo(17.1f, 3.9f, 12.9f, 3.9f); path.close(); c.drawPath(path, fill); break;
         case CLOCK: c.drawCircle(12, 12, 9, stroke); poly(c, false, 12, 7, 12, 12, 15.5f, 14); break;
+        case GRIP:
+            dot(c, 9, 6.5f, 1.45f); dot(c, 15, 6.5f, 1.45f);
+            dot(c, 9, 12f, 1.45f); dot(c, 15, 12f, 1.45f);
+            dot(c, 9, 17.5f, 1.45f); dot(c, 15, 17.5f, 1.45f);
+            break;
         default: rect(c, 4, 4, 20, 20, 3);
         }
         c.restore();

@@ -1,3 +1,4 @@
+#include "loopback_http.hpp"
 #include "lantern/windows_media.hpp"
 #include <array>
 #include <cctype>
@@ -19,7 +20,7 @@ void send_text(SOCKET s, const std::string& text) {
 } // namespace
 struct WindowsMediaBridge::Impl {
     ClientCredentials credentials;
-    std::string remote, path, address;
+    std::string remote, path, authority, address;
     FileInfo info;
     SOCKET listener = INVALID_SOCKET;
     std::array<SOCKET, 4> clients{INVALID_SOCKET, INVALID_SOCKET, INVALID_SOCKET, INVALID_SOCKET};
@@ -57,14 +58,7 @@ struct WindowsMediaBridge::Impl {
     void serve(SOCKET socket, unsigned worker) {
         bool responded = false;
         try {
-            std::string header;
-            char buffer[1024];
-            while (header.find("\r\n\r\n") == std::string::npos) {
-                int n = recv(socket, buffer, sizeof(buffer), 0);
-                if (n <= 0 || header.size() + n > 8192)
-                    throw Error(Code::invalid, "HTTP header bound");
-                header.append(buffer, n);
-            }
+            auto header = read_loopback_header(socket, authority);
             auto line_end = header.find("\r\n"), first = header.find(' '), last = header.find(' ', first + 1);
             bool head = header.starts_with("HEAD ");
             if (!head && !header.starts_with("GET ")) {
@@ -199,14 +193,11 @@ WindowsMediaBridge::WindowsMediaBridge(ClientCredentials c, std::string remote)
     auto metadata = p.credentials.connect(files_read, 2);
     p.info = metadata->stat(p.remote, false);
     p.listener = listen_socket("127.0.0.1", 0);
-    sockaddr_in address{};
-    int length = sizeof(address);
-    if (getsockname(p.listener, (sockaddr*)&address, &length))
-        throw TransportError("Local media bind");
+    p.authority = loopback_authority(p.listener);
     u_long nonblocking = 1;
     ioctlsocket(p.listener, FIONBIO, &nonblocking);
     p.path = "/" + random_token() + "/media" + utf8(fs::path(wide(p.remote)).extension().wstring());
-    p.address = "http://127.0.0.1:" + std::to_string(ntohs(address.sin_port)) + p.path;
+    p.address = "http://" + p.authority + p.path;
     for (unsigned i = 0; i < 4; ++i)
         p.workers[i] = std::thread([&p, i] { p.run(i); });
 }

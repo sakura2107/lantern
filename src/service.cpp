@@ -1,4 +1,5 @@
 #include "lantern/clipboard.hpp"
+#include "lantern/connection_registry.hpp"
 #include "lantern/discovery.hpp"
 #include "lantern/host_admin.hpp"
 #include "lantern/lan.hpp"
@@ -15,35 +16,8 @@
 #include <deque>
 #include <thread>
 #include <ws2tcpip.h>
-#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
-#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
-#endif
+#include "pace_until.hpp"
 namespace lantern {
-namespace {
-// An ordinary sleep wakes on the system timer tick (up to 15.6 ms late). At 120 fps the desktop
-// loop overslept 4-16 ms (median 3.7 ms) and then sent the next frames back to back; two frames
-// that land in one display refresh show as one on the phone. A high-resolution waitable timer
-// (Windows 10 1803+) wakes within about half a millisecond; older systems fall back to sleep_until.
-void pace_until(std::chrono::steady_clock::time_point target) {
-    struct Timer {
-        HANDLE h = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-        ~Timer() { if (h) CloseHandle(h); }
-    };
-    thread_local Timer timer;
-    for (;;) {
-        auto left = target - std::chrono::steady_clock::now();
-        if (left <= std::chrono::steady_clock::duration::zero())
-            return;
-        LARGE_INTEGER due;
-        due.QuadPart = -std::max<long long>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(left).count() / 100);
-        if (!timer.h || !SetWaitableTimer(timer.h, &due, 0, nullptr, nullptr, FALSE) ||
-            WaitForSingleObject(timer.h, INFINITE) != WAIT_OBJECT_0) {
-            std::this_thread::sleep_until(target);
-            return;
-        }
-    }
-}
-} // namespace
 struct Host::Impl {
     fs::path state;
     Identity identity;
@@ -57,14 +31,8 @@ struct Host::Impl {
     LinkScheduler link{40 * 1024 * 1024};
     std::atomic_uint64_t next_flow = 1;
     std::mutex m;
-    std::vector<SOCKET> active;
-    struct Handshake {
-        std::string address;
-        std::chrono::steady_clock::time_point deadline;
-        bool guarded = false, timed_out = false;
-    };
-    std::map<SOCKET, Handshake> handshakes;
     AuthenticationGuard auth_guard;
+    ConnectionRegistry registry{auth_guard};
     uint32_t public_sessions = 0;
     std::atomic_bool internet_enabled = false;
     UpnpLease upnp,upnp_udp;
@@ -81,6 +49,7 @@ struct Host::Impl {
         uint64_t epoch;
         HostSession info;
         std::shared_ptr<std::atomic_bool> cancelled;
+        std::shared_ptr<InputSession> input;
         bool ended = false; // closed by an administrator (end session / end device)
     };
     std::map<SOCKET, Peer> authenticated;
@@ -100,10 +69,9 @@ struct Host::Impl {
         if (peer.ended)
             return;
         peer.ended = true;
-        {
-            std::lock_guard lock(replay_mutex);
-            for(auto& [key,replay]:replay_inputs) if(key.first==peer.token) replay->input.cancel();
-        }
+        for (const auto& [socket, other] : authenticated)
+            if (other.token == peer.token)
+                other.input->cancel();
         ended_holds[peer.token] = std::chrono::steady_clock::now() + ended_hold;
     }
     std::vector<std::thread> workers;
@@ -119,7 +87,6 @@ struct Host::Impl {
     std::atomic_bool media_busy=false;
     struct ReplayState {
         InputReplay replay;
-        InputSession input;
         uint64_t epoch;
         std::chrono::steady_clock::time_point touched;
     };
@@ -179,7 +146,7 @@ struct Host::Impl {
     }
     Bytes dispatch(Op op, Reader& r, uint32_t granted, Lane lane, InputSession& input,
                    std::unique_ptr<DirectorySearch>& search, const std::string& owner,
-                   const std::string& session, std::function<bool()> media_cancel = {}) {
+                   const std::string& session, std::function<bool()> request_cancelled = {}) {
         auto require = [&](uint32_t flag) {
             if (!(granted & flag))
                 throw Error(Code::unauthorized, "Permission denied for this action");
@@ -189,7 +156,7 @@ struct Host::Impl {
 #ifdef LANTERN_WITH_ADAPT_MEDIA
         case Op::media_tracks: {
             require(files_read);if(r.u32()!=1)throw Error(Code::unsupported,"Media tracks version");auto path=r.str();r.end();
-            auto tracks=media_tracks(files.media_source(path),media_cancel?media_cancel:[this]{return stopped.load();});
+            auto tracks=media_tracks(files.media_source(path),request_cancelled?request_cancelled:[this]{return stopped.load();});
             w.u32(1);w.u64(tracks.source.size);w.str(tracks.source.version);w.u64(tracks.duration_ms);w.u64(tracks.bitrate);
             w.u32(tracks.width);w.u32(tracks.height);w.u32(tracks.hdr);w.u32(uint32_t(tracks.tracks.size()));
             for(auto& track:tracks.tracks){w.u32(track.index);w.u32(track.kind);w.str(track.codec);w.str(track.language);w.str(track.title);}break;
@@ -200,7 +167,7 @@ struct Host::Impl {
             options.audio=int32_t(r.u32());options.subtitle=int32_t(r.u32());auto segment=r.u32();r.end();
             if(media_busy.exchange(true))throw Error(Code::busy,"One adapted media segment is already encoding");
             struct Release {std::atomic_bool& busy;~Release(){busy=false;}} release{media_busy};
-            auto bytes=media_segment(files.media_source(path),version,options,segment,media_cancel?media_cancel:[this]{return stopped.load();});
+            auto bytes=media_segment(files.media_source(path),version,options,segment,request_cancelled?request_cancelled:[this]{return stopped.load();});
             w.u32(3);w.blob(bytes);break;
         }
 #endif
@@ -235,8 +202,12 @@ struct Host::Impl {
             std::lock_guard lock(video_mutex);auto it=video_controls.find(id);
             if(it==video_controls.end()||it->second->owner!=owner)throw Error(Code::not_found,"Desktop stream unavailable");
             auto& c=*it->second;
-            if(initial_bps)c.initial_bps=initial_bps;
-            if(c.settings.width!=quality.width||c.settings.fps!=quality.fps||c.settings.automatic!=quality.automatic){c.settings=quality;++c.revision;}
+            if(c.settings.width!=quality.width || c.settings.fps!=quality.fps ||
+               c.settings.automatic!=quality.automatic || (initial_bps && initial_bps!=c.initial_bps)) {
+                c.settings=quality;
+                if(initial_bps)c.initial_bps=initial_bps;
+                ++c.revision;
+            }
             c.keyframe|=keyframe!=0;
             auto& status=c.status;w.u32(1);w.u32(status.width);w.u32(status.fps);w.u32(status.bitrate);
             w.str(status.codec);w.str(status.path);w.u32(status.selected_width);w.u32(status.constrained);w.u32(status.dropping);
@@ -272,10 +243,10 @@ struct Host::Impl {
             return it->second->replay.execute(seq,nested,payload,[&] {
                 Writer answer;answer.u64(seq);
                 try {
-                    Reader body{payload};auto result=dispatch(nested,body,granted,lane,it->second->input,search,owner,session);
+                    Reader body{payload};auto result=dispatch(nested,body,granted,lane,input,search,owner,session);
                     answer.u32(0);answer.str("");answer.blob(result);
                 } catch(const Error& error) {
-                    it->second->input.cancel();answer.u32(uint32_t(error.code));answer.str(error.what());answer.blob({});
+                    input.cancel();answer.u32(uint32_t(error.code));answer.str(error.what());answer.blob({});
                 }
                 return answer.b;
             });
@@ -504,7 +475,7 @@ struct Host::Impl {
             require(files_write);
             auto id = r.str();
             r.end();
-            files.commit(id);
+            files.commit(id, request_cancelled);
             break;
         }
         case Op::mkdir:
@@ -630,40 +601,32 @@ struct Host::Impl {
         }
         return w.b;
     }
-    void connection(SOCKET socket) {
+    bool unregister_connection(const ConnectionRegistry::Ticket& ticket, bool timed_out = false) noexcept {
+        std::lock_guard lock(m);
+        if (!registry.remove(ticket, timed_out))
+            return false;
+        authenticated.erase(ticket->socket);
+        if (ticket->reserved)
+            --public_sessions;
+        return true;
+    }
+    void connection(const ConnectionRegistry::Ticket& ticket) {
+        auto socket = ticket->socket;
         std::unique_ptr<Tls> tls;
-        InputSession input;
+        auto session_input = std::make_shared<InputSession>();
+        auto& input = *session_input;
         std::unique_ptr<DirectorySearch> search;
         std::string session;
         auto flow = next_flow.fetch_add(1);
         auto cancelled = std::make_shared<std::atomic_bool>(false);
         Lane send_lane = Lane::input;
-        std::string source;
-        bool guarded = false;
-        bool reserved = false;
-        bool authentication_timeout = false;
-        {
-            std::lock_guard lock(m);
-            auto& h = handshakes.at(socket);
-            source = h.address;
-            guarded = h.guarded;
-        }
+        const auto& source = ticket->address;
+        bool guarded = ticket->guarded;
         try {
-            auto deadline = guarded ? std::chrono::steady_clock::now() + std::chrono::seconds(10)
-                                    : std::chrono::steady_clock::time_point::max();
-            tls = std::make_unique<Tls>(
-                socket, &identity, "", deadline, [this, socket, source, guarded](bool timed_out) {
-                    std::lock_guard lock(m);
-                    auto h = handshakes.find(socket);
-                    if (h != handshakes.end() && guarded) {
-                        if (!h->second.timed_out &&
-                            (timed_out || std::chrono::steady_clock::now() >= h->second.deadline))
-                            auth_guard.timeout(source);
-                        auth_guard.release(source);
-                    }
-                    handshakes.erase(socket);
-                    std::erase(active, socket);
-                });
+            auto deadline = guarded ? ticket->deadline : std::chrono::steady_clock::time_point::max();
+            tls = std::make_unique<Tls>(socket, &identity, "", deadline, [this, ticket](bool timed_out) {
+                unregister_connection(ticket, timed_out);
+            });
             session = random_token();
             auto first = tls->receive(512);
             Reader auth{first};
@@ -797,7 +760,7 @@ struct Host::Impl {
                 sessions_full = guarded && public_sessions >= 16;
                 if (guarded && !sessions_full) {
                     ++public_sessions;
-                    reserved = true;
+                    ticket->reserved = true;
                 }
             }
             if (sessions_full)
@@ -831,13 +794,10 @@ struct Host::Impl {
                 info.address = normalize_address(ip);
             {
                 std::lock_guard lock(m);
+                if (!registry.promote(ticket))
+                    throw Error(Code::cancelled, "Handshake expired");
                 authenticated[socket] = {token,         session,         requested,
-                                         session_epoch, std::move(info), cancelled};
-                if (guarded) {
-                    auth_guard.success(source);
-                    auth_guard.release(source);
-                }
-                handshakes.erase(socket);
+                                         session_epoch, std::move(info), cancelled, session_input};
             }
             tls->set_send_gate([&, flow](size_t bytes) {
                 link.acquire(flow, send_lane, bytes, [&] { return stopped || cancelled->load(); });
@@ -904,27 +864,10 @@ struct Host::Impl {
                 }
                 tls->send(response.b);
             }
-        } catch (const TransportError& error) {
-            authentication_timeout = error.native_code == WSAETIMEDOUT;
-        } catch (...) { /* No secrets or remote paths in ambient logs. Client sees close on handshake/auth
-                           failure. */
-        }
+        } catch (...) { /* The peer sees a closed connection. */ }
+        input.cancel();
+        tls.reset(); // callback unregisters before the numeric socket can be recycled
         file_jobs.disconnect(session);
-        {
-            std::lock_guard lock(m);
-            authenticated.erase(socket);
-            if (reserved)
-                --public_sessions;
-            auto h = handshakes.find(socket);
-            if (h != handshakes.end() && guarded) {
-                if (!h->second.timed_out &&
-                    (authentication_timeout || std::chrono::steady_clock::now() >= h->second.deadline))
-                    auth_guard.timeout(source);
-                auth_guard.release(source);
-            }
-            handshakes.erase(socket);
-            active.erase(std::remove(active.begin(), active.end(), socket), active.end());
-        }
         link.forget(flow);
         // Tls construction owns and closes socket, including failed handshakes.
     }
@@ -977,9 +920,9 @@ struct Host::Impl {
         AdaptiveQuality adaptive;
         uint32_t ceiling=3840;
         uint32_t display_width=3840,display_height=2160;
-        auto decoder_ceiling=[&]{
+        auto decoder_ceiling=[&](uint32_t requested_fps){
             if(!controller->decoder_modes.empty()){
-                auto mode=decoder_limit(controller->decoder_modes,controller->settings.fps,display_width,display_height);
+                auto mode=decoder_limit(controller->decoder_modes,requested_fps,display_width,display_height);
                 controller->max_width=mode.width;controller->max_height=mode.height;controller->max_fps=mode.fps;
             }
             return std::min({3840u,display_width,controller->max_width,
@@ -988,7 +931,7 @@ struct Host::Impl {
         if(version>=3) {
             auto displays=monitors();if(monitor>=displays.size())throw Error(Code::invalid,"Monitor index");
             auto& display=displays[monitor];
-            display_width=display.width;display_height=display.height;ceiling=decoder_ceiling();
+            display_width=display.width;display_height=display.height;ceiling=decoder_ceiling(fps);
             adaptive.configure(controller->settings,ceiling,controller->initial_bps);
             width=std::min(adaptive.state().width,ceiling);fps=std::min(fps,controller->max_fps);bitrate=adaptive.state().bitrate;
         }
@@ -1046,35 +989,63 @@ struct Host::Impl {
             auto next_frame = next_auth;
             auto frame_period = std::chrono::microseconds(1'000'000 / cfg.fps);
             uint64_t revision=0,last_sample=0;bool slow=false;bool first_metadata=true;
+            auto check_view = [&] {
+                auto now = std::chrono::steady_clock::now();
+                auto current = load_config(state / L"config.dpapi");
+                auto allowed = authorized_scopes(current, token);
+                if (!allowed || !(*allowed & view) || authorization_epoch(current, token) != epoch)
+                    throw Error(Code::unauthorized, "Desktop trust revoked");
+                if (current.root != config.root)
+                    throw Error(Code::conflict, "Root changed; restart host");
+                next_auth = now + std::chrono::milliseconds(250);
+            };
             while (!stopped) {
                 if(cancelled->load()||peer_closed(socket))throw Error(Code::cancelled,"Desktop connection ended");
                 if(using_udp&&!datagrams->live()){using_udp=false;media_path(tls,false);source->request_keyframe();}
                 auto began = std::chrono::steady_clock::now();
-                if (began >= next_auth) {
-                    auto current = load_config(state / L"config.dpapi");
-                    auto allowed = authorized_scopes(current, token);
-                    if (!allowed || !(*allowed & view) || authorization_epoch(current, token) != epoch)
-                        throw Error(Code::unauthorized, "Desktop trust revoked");
-                    if (current.root != config.root)
-                        throw Error(Code::conflict, "Root changed; restart host");
-                    next_auth = began + std::chrono::milliseconds(250);
-                }
+                if (began >= next_auth) check_view();
                 bool changed=false;
                 if(version>=3) {
-                    std::lock_guard lock(video_mutex);
+                    QualitySettings settings;
+                    uint64_t desired_revision, initial_bps;
+                    {
+                        std::lock_guard lock(video_mutex);
+                        settings = controller->settings;
+                        desired_revision = controller->revision;
+                        initial_bps = controller->initial_bps;
+                    }
                     auto now_ms=uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(began.time_since_epoch()).count());
-                    if(revision!=controller->revision) {
-                        ceiling=decoder_ceiling();
-                        adaptive.configure(controller->settings,ceiling,controller->initial_bps);revision=controller->revision;changed=true;
+                    if(revision!=desired_revision) {
+                        ceiling=decoder_ceiling(settings.fps);
+                        adaptive.configure(settings,ceiling,initial_bps);
+                        changed=true;
                     }
                     if(now_ms-last_sample>=1000) {
                         bool shortage=slow||(using_udp&&datagrams->congested(cfg.fps));
-                        adaptive.sample(now_ms,shortage,!shortage&&controller->initial_bps>uint64_t(adaptive.state().bitrate)*14/10);
+                        adaptive.sample(now_ms,shortage,!shortage&&initial_bps>uint64_t(adaptive.state().bitrate)*14/10);
                         last_sample=now_ms;changed=true;
                     }
-                    if(changed)source->reconfigure(std::min(adaptive.state().width,ceiling),std::min(controller->settings.fps,controller->max_fps),adaptive.state().bitrate);
-                    if(controller->keyframe){source->request_keyframe();controller->keyframe=false;}
-                    controller->status=adaptive.state();controller->status.width=cfg.width;controller->status.fps=cfg.fps;controller->status.codec=cfg.codec;controller->status.path=using_udp?"udp":"tcp";
+                    if(changed) {
+                        source->reconfigure(std::min(adaptive.state().width,ceiling),
+                                            std::min(settings.fps,controller->max_fps),adaptive.state().bitrate);
+                        if (stopped || cancelled->load() || peer_closed(socket))
+                            throw Error(Code::cancelled,"Desktop connection ended");
+                        check_view();
+                    }
+                    bool keyframe;
+                    {
+                        std::lock_guard lock(video_mutex);
+                        if (stopped || cancelled->load())
+                            throw Error(Code::cancelled,"Desktop connection ended");
+                        // A newer request owns the next frame. Reconcile the same encoder
+                        // on its owner thread before publishing status, headers or pixels.
+                        if (desired_revision != controller->revision) continue;
+                        revision = desired_revision;
+                        keyframe = controller->keyframe;
+                        controller->keyframe = false;
+                        controller->status=adaptive.state();controller->status.width=cfg.width;controller->status.fps=cfg.fps;controller->status.codec=cfg.codec;controller->status.path=using_udp?"udp":"tcp";
+                    }
+                    if(keyframe)source->request_keyframe();
                     frame_period=std::chrono::microseconds(1'000'000/cfg.fps);
                 }
                 auto frame = source->next();
@@ -1092,7 +1063,7 @@ struct Host::Impl {
                 }
                 packet.blob(frame.annex_b,version>=3?max_video_frame-512:max_frame-256);
                 auto sending=std::chrono::steady_clock::now();
-                if(using_udp)datagrams->send_frame(frame.sequence,packet.b);
+                if(using_udp)datagrams->send_frame(frame.sequence,packet.b,frame_period,true);
                 else tls.send(packet.b); // TCP remains one fresh frame in flight.
                 slow=std::chrono::steady_clock::now()-sending>frame_period*2;
                 next_frame += frame_period;
@@ -1202,7 +1173,7 @@ struct Host::Impl {
                     packet.blob(encoder->encode(frame.pcm));
                 else
                     packet.blob(frame.pcm);
-                if(using_udp)datagrams->send_frame(sequence-1,packet.b);else tls.send(packet.b);
+                if(using_udp)datagrams->send_frame(sequence-1,packet.b,std::chrono::milliseconds(10),false);else tls.send(packet.b);
             }
         } catch (const Error& error) {
             try {
@@ -1235,10 +1206,10 @@ struct Host::Impl {
                 {
                     std::lock_guard lock(m);
                     auto now = std::chrono::steady_clock::now();
-                    for (auto& [socket, h] : handshakes)
-                        if (h.guarded && !h.timed_out && now >= h.deadline) {
-                            h.timed_out = true;
-                            auth_guard.timeout(h.address);
+                    for (auto& [socket, h] : registry.entries())
+                        if (h->pending && h->guarded && !h->timed_out && now >= h->deadline) {
+                            h->timed_out = true;
+                            auth_guard.timeout(h->address);
                             shutdown(socket, SD_BOTH);
                         }
                 }
@@ -1306,41 +1277,34 @@ struct Host::Impl {
                 closesocket(s);
                 continue;
             }
-            bool admitted = false;
-            {
-                std::lock_guard lock(m);
-                bool guarded = internet_enabled.load();
-                if (!stopped && active.size() < 64 && handshakes.size() < 32 &&
-                    (!guarded || auth_guard.acquire(text, GetTickCount64()))) {
-                    active.push_back(s);
-                    handshakes[s] = {normalize_address(text),
-                                     std::chrono::steady_clock::now() + std::chrono::seconds(10), guarded};
-                    admitted = true;
-                }
-            }
-            if (!admitted) {
-                closesocket(s);
-                continue;
-            }
-            auto done = std::make_shared<std::atomic_bool>(false);
+            ConnectionRegistry::Ticket ticket;
+            std::shared_ptr<std::atomic_bool> done;
             try {
+                {
+                    std::lock_guard lock(m);
+                    if (!stopped)
+                        ticket = registry.admit(s, normalize_address(text), internet_enabled.load(),
+                            std::chrono::steady_clock::now() + std::chrono::seconds(10), GetTickCount64());
+                }
+                if (!ticket) {
+                    closesocket(s);
+                    continue;
+                }
+                done = std::make_shared<std::atomic_bool>(false);
                 connections.emplace_back();
                 connections.back().done = done;
-                connections.back().thread = std::thread([this, s, done] {
-                    connection(s);
+                connections.back().thread = std::thread([this, ticket, done] {
+                    try { connection(ticket); } catch (...) {}
+                    // If construction failed before TLS assumed ownership, the socket is still ours.
+                    if (unregister_connection(ticket))
+                        closesocket(ticket->socket);
                     done->store(true);
                 });
             } catch (...) {
-                if (!connections.empty() && connections.back().done == done &&
-                    !connections.back().thread.joinable())
+                if (done && !connections.empty() && connections.back().done == done)
                     connections.pop_back();
-                std::lock_guard lock(m);
-                auto h = handshakes.find(s);
-                if (h != handshakes.end() && h->second.guarded)
-                    auth_guard.release(h->second.address);
-                handshakes.erase(s);
-                std::erase(active, s);
-                closesocket(s);
+                if (!ticket || unregister_connection(ticket))
+                    closesocket(s);
                 continue;
             }
         }
@@ -1366,7 +1330,7 @@ struct Host::Impl {
         }
         {
             std::lock_guard lock(m);
-            for (auto sock : active)
+            for (auto& [sock, ticket] : registry.entries())
                 shutdown(sock, SD_BOTH);
         }
         upnp.stop();upnp_udp.stop();

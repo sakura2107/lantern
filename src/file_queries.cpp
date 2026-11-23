@@ -6,9 +6,8 @@ static std::wstring folded(const std::wstring& input) {
     std::transform(result.begin(), result.end(), result.begin(), towlower);
     return result;
 }
-static bool hidden_entry(const WIN32_FIND_DATAW& data) {
-    auto name = folded(data.cFileName);
-    return name == L"." || name == L".." || name.starts_with(L".rdx-private") ||
+static bool hidden_entry(const WIN32_FIND_DATAW& data, const std::wstring& folded_name) {
+    return folded_name == L"." || folded_name == L".." || folded_name.starts_with(L".rdx-private") ||
            (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) || protected_os_entry(data.dwFileAttributes);
 }
 struct FindHandle {
@@ -60,15 +59,19 @@ DirectoryPage FileService::page(const std::string& path, uint32_t off, uint32_t 
             return out;
         win_error("Enumerate directory");
     }
-    std::vector<Entry> all;
+    struct IndexedEntry {
+        Entry item;
+        std::wstring sort_key;
+    };
+    std::vector<IndexedEntry> all;
     auto needle = folded(wide(filter));
     size_t memory = 0;
     uint32_t scanned = 0;
     do {
         if (++scanned > 200000)
             throw Error(Code::busy, "Directory scan exceeds 200000 entries");
-        if (hidden_entry(data) ||
-            (!needle.empty() && folded(data.cFileName).find(needle) == std::wstring::npos))
+        auto sort_key = folded(data.cFileName);
+        if (hidden_entry(data, sort_key) || (!needle.empty() && sort_key.find(needle) == std::wstring::npos))
             continue;
         auto item = entry(data);
         if (item.directory) {
@@ -95,37 +98,36 @@ DirectoryPage FileService::page(const std::string& path, uint32_t off, uint32_t 
             item.mtime = (uint64_t(information.ftLastWriteTime.dwHighDateTime) << 32) |
                          information.ftLastWriteTime.dwLowDateTime;
         }
-        memory += sizeof(Entry) + item.name.size() + 32;
+        memory += sizeof(IndexedEntry) + item.name.size() + sort_key.size() * sizeof(wchar_t) + 32;
         if (memory > 32 * 1024 * 1024)
             throw Error(Code::busy, "Directory index exceeds 32MiB; narrow filter");
-        all.push_back(std::move(item));
+        all.push_back({std::move(item), std::move(sort_key)});
     } while (FindNextFileW(find.value, &data));
     if (GetLastError() != ERROR_NO_MORE_FILES)
         win_error("Directory enumeration changed or denied");
     if (dir_version(directory) != out.generation)
         throw Error(Code::conflict, "Directory changed while listing");
-    std::sort(all.begin(), all.end(), [&](const Entry& a, const Entry& b) {
-        if (a.directory != b.directory)
-            return a.directory;
-        if (sort == 1 && a.size != b.size)
-            return descending ? a.size > b.size : a.size < b.size;
-        if (sort == 2 && a.mtime != b.mtime)
-            return descending ? a.mtime > b.mtime : a.mtime < b.mtime;
-        auto an = folded(wide(a.name)), bn = folded(wide(b.name));
-        if (an == bn)
-            return descending ? a.name > b.name : a.name < b.name;
-        return descending ? an > bn : an < bn;
+    std::sort(all.begin(), all.end(), [&](const IndexedEntry& a, const IndexedEntry& b) {
+        if (a.item.directory != b.item.directory)
+            return a.item.directory;
+        if (sort == 1 && a.item.size != b.item.size)
+            return descending ? a.item.size > b.item.size : a.item.size < b.item.size;
+        if (sort == 2 && a.item.mtime != b.item.mtime)
+            return descending ? a.item.mtime > b.item.mtime : a.item.mtime < b.item.mtime;
+        if (a.sort_key == b.sort_key)
+            return descending ? a.item.name > b.item.name : a.item.name < b.item.name;
+        return descending ? a.sort_key > b.sort_key : a.sort_key < b.sort_key;
     });
     Writer fingerprint;
     fingerprint.str(out.generation);
     fingerprint.str(filter);
     fingerprint.u32(sort);
     fingerprint.u32(descending);
-    for (const auto& item : all) {
-        fingerprint.str(item.name);
-        fingerprint.u32(item.directory);
-        fingerprint.u64(item.size);
-        fingerprint.u64(item.mtime);
+    for (const auto& indexed : all) {
+        fingerprint.str(indexed.item.name);
+        fingerprint.u32(indexed.item.directory);
+        fingerprint.u64(indexed.item.size);
+        fingerprint.u64(indexed.item.mtime);
     }
     out.generation = sha256(fingerprint.b);
     if (!expected.empty() && expected != out.generation)
@@ -133,7 +135,7 @@ DirectoryPage FileService::page(const std::string& path, uint32_t off, uint32_t 
     out.total = uint32_t(all.size());
     size_t end = std::min(all.size(), size_t(off) + limit);
     for (size_t i = off; i < end; i++)
-        out.entries.push_back(std::move(all[i]));
+        out.entries.push_back(std::move(all[i].item));
     return out;
 }
 class IncrementalSearch final : public DirectorySearch {
@@ -211,7 +213,8 @@ class IncrementalSearch final : public DirectorySearch {
                 find.reset();
                 active.reset();
             }
-            if (hidden_entry(current))
+            auto folded_name = folded(current.cFileName);
+            if (hidden_entry(current, folded_name))
                 continue;
             auto item = entry(current, prefix);
             if (item.directory) {
@@ -221,7 +224,7 @@ class IncrementalSearch final : public DirectorySearch {
                 pending.push_back(
                     {current_path.empty() ? name : current_path + "/" + name, item.name + "/", depth + 1});
             }
-            if (folded(current.cFileName).find(needle) != std::wstring::npos)
+            if (folded_name.find(needle) != std::wstring::npos)
                 out.entries.push_back(std::move(item));
         }
         if (active)

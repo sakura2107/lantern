@@ -188,7 +188,7 @@ if(WIN32)
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/DatagramTest.java"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/PairingLinkTest.java")
     add_test(NAME pairing_link_java COMMAND "${LANTERN_JNI_TEST_JDK}/bin/java.exe" -cp "${CMAKE_CURRENT_BINARY_DIR}/java-classes" org.lantern.client.PairingLinkTest)
-    add_test(NAME datagram_java COMMAND "${LANTERN_JNI_TEST_JDK}/bin/java.exe" -cp "${CMAKE_CURRENT_BINARY_DIR}/java-classes" org.lantern.client.DatagramTest "${CMAKE_CURRENT_BINARY_DIR}/datagram-vector.txt")
+    add_test(NAME datagram_java COMMAND "${LANTERN_JNI_TEST_JDK}/bin/java.exe" -cp "${CMAKE_CURRENT_BINARY_DIR}/java-classes" org.lantern.client.DatagramTest "${CMAKE_CURRENT_BINARY_DIR}/datagram-vector.txt" "$<TARGET_FILE:datagram_tests>")
     set_tests_properties(datagram_java PROPERTIES DEPENDS datagram)
     add_test(NAME timeline_endpoint COMMAND "${LANTERN_JNI_TEST_JDK}/bin/java.exe" -cp "${CMAKE_CURRENT_BINARY_DIR}/java-classes" org.lantern.client.TimelineTest)
     add_test(NAME retry_policy COMMAND "${LANTERN_JNI_TEST_JDK}/bin/java.exe" -cp "${CMAKE_CURRENT_BINARY_DIR}/java-classes" org.lantern.client.RetryPolicyTest)

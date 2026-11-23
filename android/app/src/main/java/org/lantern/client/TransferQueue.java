@@ -19,6 +19,7 @@ final class TransferQueue implements AutoCloseable {
         int port, kind;
         int retries,errorCode;long retryAt;
         boolean directory;
+        volatile boolean pendingPersist;
         volatile long current, total;
         JSONObject json() throws Exception {
             return new JSONObject()
@@ -61,10 +62,12 @@ final class TransferQueue implements AutoCloseable {
     java.lang.ref.WeakReference<MainActivity> activity=new java.lang.ref.WeakReference<>(null);
     volatile Remote.Credentials credentials;
     final AtomicFile journal;
+    final Object fileLock = new Object();
     final File root;
     final List<Task> tasks = new ArrayList<>();
     final AtomicBoolean cancel = new AtomicBoolean();
     final ExecutorService worker = Executors.newSingleThreadExecutor();
+    final ExecutorService journalWriter = Executors.newSingleThreadExecutor(r -> new Thread(r, "Lantern transfer journal"));
     final ScheduledExecutorService probes = Executors.newSingleThreadScheduledExecutor();
     volatile Task running;
     volatile Remote remote;
@@ -100,65 +103,131 @@ final class TransferQueue implements AutoCloseable {
     void attach(MainActivity ui){activity=new java.lang.ref.WeakReference<>(ui);}
     void detach(MainActivity ui){if(activity.get()==ui)activity.clear();}
     void status(String text){MainActivity ui=activity.get();if(ui!=null&&!ui.isDestroyed())ui.status(text);}
+    void notifyUi(){MainActivity ui=activity.get();if(ui!=null&&!ui.isDestroyed())ui.runOnUiThread(ui::renderTransfers);}
     synchronized void setCredentials(Remote.Credentials c){if(running!=null&&!matches(running,c))pause(running,false);credentials=c;pump();}
-    synchronized boolean hasPending(){for(Task task:tasks)if(matches(task,credentials)&&(task==running||task.state.equals("等待")||task.state.equals("等待网络")))return true;return false;}
+    synchronized boolean hasPending(){for(Task task:tasks)if(matches(task,credentials)&&(task==running||(!task.pendingPersist&&(task.state.equals("等待")||task.state.equals("等待网络")))))return true;return false;}
     synchronized String notificationText(){if(running!=null)return Ui.size(running.current)+" / "+Ui.size(running.total);for(Task task:tasks)if(task.state.equals("等待网络")&&matches(task,credentials))return "连接中断，保留进度后自动重试（"+task.retries+"/"+RetryPolicy.MAX_ATTEMPTS+"）";return "等待任务";}
     void abortSocket(){try{if(opening!=null)opening.close();}catch(Exception ignored){}try{if(remote!=null)remote.abort();}catch(Exception ignored){}}
     synchronized void networkChanged(){if(running!=null)abortSocket();for(Task t:tasks)if(t.state.equals("等待网络"))t.retryAt=SystemClock.elapsedRealtime();pump();}
-    synchronized void pauseAll(String reason){for(Task task:tasks)if(task==running||task.state.equals("等待")||task.state.equals("等待网络")){pause(task,false);task.error=reason;}try{persist();}catch(Exception e){status(e.getMessage());}}
+    void pauseAll(String reason){
+        synchronized(this){
+            for(Task task:tasks)if(task==running||task.state.equals("等待")||task.state.equals("等待网络")){
+                pauseLocked(task,false);
+                task.error=reason;
+            }
+        }
+        persistAsync(this::notifyUi,e->status(e.getMessage()));
+    }
     static boolean matches(Task t, Remote.Credentials c) {
         return c != null && t.host.equals(c.host) && t.pin.equals(c.pin) && t.port == c.port;
     }
-    synchronized void persist() throws Exception {
+    private synchronized byte[] serializeJournal() throws Exception {
         JSONArray array = new JSONArray();
         for (Task t : tasks)
             array.put(t.json());
-        FileOutputStream out = null;
-        try {
-            out = journal.startWrite();
-            out.write(array.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
-            journal.finishWrite(out);
-        } catch (Exception e) {
-            if (out != null)
-                journal.failWrite(out);
-            throw e;
+        return array.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+    private void writeJournalBytes(byte[] bytes) throws Exception {
+        synchronized (fileLock) {
+            FileOutputStream out = null;
+            try {
+                out = journal.startWrite();
+                out.write(bytes);
+                journal.finishWrite(out);
+            } catch (Exception e) {
+                if (out != null)
+                    journal.failWrite(out);
+                throw e;
+            }
         }
     }
-    synchronized void add(String path, String name, boolean directory, int kind, String local) {
-        if (credentials == null) {
-            status("请先配对");
-            return;
-        }
-        if (!storageError.isEmpty()) {
-            status(storageError);
-            return;
-        }
-        if (tasks.size() >= 32) {
-            status("最多保留 32 项任务，请清理已完成项");
-            return;
-        }
-        if (name.isEmpty() || name.contains("/") || name.contains("\\") || name.equals(".") ||
-            name.equals("..")) {
-            status("文件名无效");
-            return;
-        }
-        Task t = new Task();
-        t.id = UUID.randomUUID().toString();
-        t.host = credentials.host;
-        t.pin = credentials.pin;
-        t.port = credentials.port;
-        t.path = path;
-        t.name = name;
-        t.directory = directory;
-        t.kind = kind;
-        t.local = local;
-        tasks.add(t);
+    /** Ordered single-writer durable persist for background threads (never call while holding this monitor). */
+    void persist() throws Exception {
         try {
-            persist();
-            pump();
-            status("已加入传输任务：" + name);
-        } catch (Exception e) {
-            tasks.remove(t);
+            journalWriter.submit(() -> {
+                writeJournalBytes(serializeJournal());
+                return null;
+            }).get();
+        } catch (ExecutionException e) {
+            if (e.getCause() instanceof Exception) throw (Exception)e.getCause();
+            throw new IOException(e.getCause());
+        } catch (RejectedExecutionException closedPool) {
+            writeJournalBytes(serializeJournal());
+        }
+    }
+    /** Non-blocking ordered persistence for UI entry points; runs AtomicFile I/O on journalWriter. */
+    private void persistAsync(Runnable onSuccess, java.util.function.Consumer<Exception> onError) {
+        try {
+            journalWriter.execute(() -> {
+                try {
+                    writeJournalBytes(serializeJournal());
+                    if (onSuccess != null) onSuccess.run();
+                } catch (Exception e) {
+                    if (onError != null) onError.accept(e);
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            if (onError != null) onError.accept(e);
+        }
+    }
+    void add(String path, String name, boolean directory, int kind, String local) {
+        final Task t;
+        synchronized (this) {
+            if (credentials == null) {
+                status("请先配对");
+                return;
+            }
+            if (!storageError.isEmpty()) {
+                status(storageError);
+                return;
+            }
+            if (tasks.size() >= 32) {
+                status("最多保留 32 项任务，请清理已完成项");
+                return;
+            }
+            if (name.isEmpty() || name.contains("/") || name.contains("\\") || name.equals(".") ||
+                name.equals("..")) {
+                status("文件名无效");
+                return;
+            }
+            t = new Task();
+            t.id = UUID.randomUUID().toString();
+            t.host = credentials.host;
+            t.pin = credentials.pin;
+            t.port = credentials.port;
+            t.path = path;
+            t.name = name;
+            t.directory = directory;
+            t.kind = kind;
+            t.local = local;
+            t.pendingPersist = true;
+            tasks.add(t);
+        }
+        try {
+            journalWriter.execute(() -> {
+                try {
+                    synchronized (TransferQueue.this) {
+                        if (!tasks.contains(t)) return;
+                    }
+                    writeJournalBytes(serializeJournal());
+                    synchronized (TransferQueue.this) {
+                        t.pendingPersist = false;
+                        pump();
+                    }
+                    status("已加入传输任务：" + name);
+                    notifyUi();
+                } catch (Exception e) {
+                    synchronized (TransferQueue.this) {
+                        tasks.remove(t);
+                    }
+                    status("保存任务失败：" + e.getMessage());
+                    notifyUi();
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            synchronized (this) {
+                tasks.remove(t);
+            }
             status("保存任务失败：" + e.getMessage());
         }
     }
@@ -166,8 +235,8 @@ final class TransferQueue implements AutoCloseable {
         if (closed || running != null)
             return;
         for (Task t : tasks)
-            if ((t.state.equals("等待")||(t.state.equals("等待网络")&&SystemClock.elapsedRealtime()>=t.retryAt)) && matches(t, credentials)) {
-                try{TransferService.ensure(context,this);}catch(RuntimeException error){t.state="已暂停";t.error="系统拒绝后台启动，请回到应用继续";try{persist();}catch(Exception ignored){}status(t.error);return;}
+            if (!t.pendingPersist && (t.state.equals("等待")||(t.state.equals("等待网络")&&SystemClock.elapsedRealtime()>=t.retryAt)) && matches(t, credentials)) {
+                try{TransferService.ensure(context,this);}catch(RuntimeException error){t.state="已暂停";t.error="系统拒绝后台启动，请回到应用继续";persistAsync(this::notifyUi,null);status(t.error);return;}
                 running = t;
                 cancel.set(false);
                 Remote.Credentials c = credentials;
@@ -195,8 +264,9 @@ final class TransferQueue implements AutoCloseable {
         try {
             synchronized (this) {
                 t.state = "进行中";
-                persist();
             }
+            persist();
+            notifyUi();
             try (Remote r = new Remote(c, t.kind == 0 ? 1 : 3, 3, s -> {
                      opening = s;
                      if (cancel.get())
@@ -204,7 +274,7 @@ final class TransferQueue implements AutoCloseable {
                  })) {
                 remote = r;
                 if(t.kind==3){
-                    try(SafSource source=SafSource.open(context.getContentResolver(),android.net.Uri.parse(t.local))){if(source==null)throw new IOException("源应用不再支持可寻址读取，请重新选择文件以暂存上传");activeSource=source;String hash=source.hash(cancel);if(!t.sourceHash.isEmpty()&&!t.sourceHash.equals(hash))throw new IOException("源文件已变化，请保留远端暂存并创建新任务");synchronized(this){t.sourceHash=hash;persist();}r.upload(source,t.path,cancel,(n,total)->progress(t,n,total));}finally{activeSource=null;}
+                    try(SafSource source=SafSource.open(context.getContentResolver(),android.net.Uri.parse(t.local))){if(source==null)throw new IOException("源应用不再支持可寻址读取，请重新选择文件以暂存上传");activeSource=source;String hash=source.hash(cancel);if(!t.sourceHash.isEmpty()&&!t.sourceHash.equals(hash))throw new IOException("源文件已变化，请保留远端暂存并创建新任务");synchronized(this){t.sourceHash=hash;}persist();r.upload(source,t.path,cancel,(n,total)->progress(t,n,total));}finally{activeSource=null;}
                 }else if (t.kind == 2)
                     TreeUpload.run(this, t, r);
                 else if (t.kind == 1) {
@@ -225,9 +295,11 @@ final class TransferQueue implements AutoCloseable {
             synchronized (this) {
                 t.state = "完成";
                 t.error = "";t.retries=0;t.errorCode=0;
-                persist();
             }
+            persist();
+            notifyUi();
         } catch (Exception error) {
+            String message;
             synchronized (this) {
                 t.errorCode=error instanceof Remote.RemoteError?((Remote.RemoteError)error).code:0;
                 if(!t.state.equals("已取消")){
@@ -236,13 +308,17 @@ final class TransferQueue implements AutoCloseable {
                     else t.state=t.errorCode==4&&t.kind!=0?"等待处理":"失败";
                 }
                 t.error = error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage();
-                try {
-                    persist();
-                } catch (Exception save) {
+                message = t.state + "：" + t.error;
+            }
+            try {
+                persist();
+            } catch (Exception save) {
+                synchronized (this) {
                     storageError = "任务状态保存失败：" + save.getMessage();
                 }
-                status(t.state + "：" + t.error);
             }
+            status(message);
+            notifyUi();
         } finally {
             remote = null;
             opening = null;
@@ -368,8 +444,9 @@ final class TransferQueue implements AutoCloseable {
         java.nio.file.Files.move(stage.toPath(), dest.toPath());
         t.local = dest.getAbsolutePath();
     }
-    synchronized void pause(Task t, boolean discard) {
+    private void pauseLocked(Task t, boolean discard) {
         t.state = discard ? "已取消" : "已暂停";
+        t.pendingPersist = false;
         if (running == t) {
             cancel.set(true);
             Remote.UploadSource source=activeSource;if(source!=null)try{source.close();}catch(Exception ignored){}
@@ -384,23 +461,34 @@ final class TransferQueue implements AutoCloseable {
             } catch (Exception ignored) {
             }
         }
-        try {
-            persist();
-        } catch (Exception e) {
-            status(e.getMessage());
-        }
     }
-    synchronized void resume(Task t) {
-        if (running == t)
-            return;
-        t.state = "等待";
-        t.error = "";t.retries=0;t.errorCode=0;t.retryAt=0;
-        try {
-            persist();
-            pump();
-        } catch (Exception e) {
-            status(e.getMessage());
+    void pause(Task t, boolean discard) {
+        synchronized (this) {
+            pauseLocked(t, discard);
         }
+        persistAsync(this::notifyUi, e -> status(e.getMessage()));
+    }
+    void resume(Task t) {
+        synchronized (this) {
+            if (running == t)
+                return;
+            t.state = "等待";
+            t.error = "";t.retries=0;t.errorCode=0;t.retryAt=0;
+            t.pendingPersist = true;
+        }
+        persistAsync(() -> {
+            synchronized (TransferQueue.this) {
+                t.pendingPersist = false;
+                pump();
+            }
+            notifyUi();
+        }, e -> {
+            synchronized (TransferQueue.this) {
+                t.pendingPersist = false;
+            }
+            status(e.getMessage());
+            notifyUi();
+        });
     }
     /** Deletes the task's private cache directory and, for staged uploads, the staged copy. */
     void deleteTaskFiles(Task task) throws IOException {
@@ -421,43 +509,47 @@ final class TransferQueue implements AutoCloseable {
                 source.delete();
         }
     }
-    synchronized void clearCompleted() {
+    void clearCompleted() {
         try {
-            for (Iterator<Task> it = tasks.iterator(); it.hasNext();) {
-                Task task = it.next();
-                if (!task.state.equals("完成"))
-                    continue;
-                deleteTaskFiles(task);
-                it.remove();
+            synchronized (this) {
+                for (Iterator<Task> it = tasks.iterator(); it.hasNext();) {
+                    Task task = it.next();
+                    if (!task.state.equals("完成"))
+                        continue;
+                    deleteTaskFiles(task);
+                    it.remove();
+                }
             }
             persist();
             status("已清理完成任务及应用下载缓存");
+            notifyUi();
         } catch (Exception e) {
             status(e.getMessage());
         }
     }
     /** Removes one finished or cancelled task and its private cache; host files are untouched. */
-    synchronized void remove(Task task) {
+    void remove(Task task) {
         try {
-            if (running == task || !(task.state.equals("完成") || task.state.equals("已取消")))
-                throw new IOException("只能移除已完成或已取消的任务");
-            deleteTaskFiles(task);
-            tasks.remove(task);
+            synchronized (this) {
+                if (running == task || !(task.state.equals("完成") || task.state.equals("已取消")))
+                    throw new IOException("只能移除已完成或已取消的任务");
+                deleteTaskFiles(task);
+                tasks.remove(task);
+            }
             persist();
             status("已移除任务：" + task.name);
+            notifyUi();
         } catch (Exception e) {
             status(e.getMessage());
         }
     }
-    synchronized void moveToTop(Task task) {
-        if (!tasks.remove(task))
-            return;
-        tasks.add(0, task);
-        try {
-            persist();
-        } catch (Exception e) {
-            status(e.getMessage());
+    void moveToTop(Task task) {
+        synchronized (this) {
+            if (!tasks.remove(task))
+                return;
+            tasks.add(0, task);
         }
+        persistAsync(this::notifyUi, e -> status(e.getMessage()));
     }
     void openDone(Task task) {
         MainActivity ui = activity.get();
@@ -473,17 +565,38 @@ final class TransferQueue implements AutoCloseable {
             status(e.getMessage());
         }
     }
-    synchronized void renameConflict(Task task,String name)throws Exception{
-        TreeUpload.safeName(name);if(task.kind==0||running==task||!task.state.equals("等待处理"))throw new IOException("此任务无法更改目标");
-        int slash=task.path.lastIndexOf('/');String path=(slash<0?"":task.path.substring(0,slash+1))+name;
-        if(task.kind==2){pause(task,true);add(path,name,true,2,task.local);return;}
-        task.path=path;task.name=name;resume(task);
+    void renameConflict(Task task,String name)throws Exception{
+        TreeUpload.safeName(name);
+        String newPath;
+        int kind;
+        String local;
+        synchronized (this) {
+            if(task.kind==0||running==task||!task.state.equals("等待处理"))throw new IOException("此任务无法更改目标");
+            int slash=task.path.lastIndexOf('/');
+            newPath=(slash<0?"":task.path.substring(0,slash+1))+name;
+            kind=task.kind;
+            local=task.local;
+            if(kind!=2){task.path=newPath;task.name=name;}
+        }
+        if(kind==2){pause(task,true);add(newPath,name,true,2,local);return;}
+        resume(task);
     }
-    public synchronized void close() {
-        closed = true;
-        if (running != null)
-            pause(running, false);
+    public void close() {
+        synchronized (this) {
+            closed = true;
+            if (running != null)
+                pauseLocked(running, false);
+        }
+        persistAsync(null, null);
         worker.shutdown();
         probes.shutdownNow();
+        journalWriter.shutdown();
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            try {
+                journalWriter.awaitTermination(3, TimeUnit.SECONDS);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 }

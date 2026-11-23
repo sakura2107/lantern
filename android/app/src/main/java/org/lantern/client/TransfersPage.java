@@ -46,27 +46,29 @@ final class TransfersPage {
         view.setPadding(Theme.dp(16), Theme.dp(4), Theme.dp(16), 0);
 
         summary = Ui.column(a);
-        summary.setBackground(Ui.outline(Theme.SURFACE, Theme.LINE, 22));
-        summary.setPadding(Theme.dp(18), Theme.dp(16), Theme.dp(18), Theme.dp(14));
-        headline = Ui.numeric(Ui.medium(a, S.QUEUE_IDLE, 20, Theme.INK));
+        summary.setBackground(Ui.card(24));
+        summary.setElevation(Theme.dp(2));
+        summary.setPadding(Theme.dp(20), Theme.dp(18), Theme.dp(20), Theme.dp(16));
+        headline = Ui.numeric(Ui.medium(a, S.QUEUE_IDLE, 20.5f, Theme.INK));
+        headline.setLetterSpacing(-0.015f);
         headline.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         summary.addView(headline);
         detail = Ui.numeric(Ui.text(a, "", 13, Theme.MUTED));
-        detail.setPadding(0, Theme.dp(2), 0, Theme.dp(12));
-        detail.setLineSpacing(0, 1.15f);
+        detail.setPadding(0, Theme.dp(4), 0, 0);
+        detail.setLineSpacing(0, 1.2f);
         summary.addView(detail);
         LinearLayout buttons = Ui.row(a);
         limit = Ui.button(a, "", Ui.SECONDARY, this::showLimit);
         limit.setTextSize(13);
-        limit.setPadding(Theme.dp(14), 0, Theme.dp(14), 0);
+        limit.setPadding(Theme.dp(12), 0, Theme.dp(12), 0);
         Ui.id(limit, "transfers.limit");
         pauseAll = Ui.button(a, S.PAUSE_ALL, Ui.SECONDARY, this::toggleAll);
         pauseAll.setTextSize(13);
-        pauseAll.setPadding(Theme.dp(14), 0, Theme.dp(14), 0);
+        pauseAll.setPadding(Theme.dp(12), 0, Theme.dp(12), 0);
         Ui.id(pauseAll, "transfers.pauseall");
         clear = Ui.button(a, S.CLEAR_DONE, Ui.SECONDARY, this::confirmClear);
         clear.setTextSize(13);
-        clear.setPadding(Theme.dp(14), 0, Theme.dp(14), 0);
+        clear.setPadding(Theme.dp(12), 0, Theme.dp(12), 0);
         Ui.id(clear, "transfers.clear");
         // Widths follow the labels; spare space is shared evenly.
         for (Button b : new Button[] {limit, pauseAll, clear}) { b.setMinWidth(0); b.setMinimumWidth(0); }
@@ -77,28 +79,32 @@ final class TransfersPage {
         LinearLayout.LayoutParams p3 = new LinearLayout.LayoutParams(-2, Theme.dp(40), 1);
         p3.setMarginStart(Theme.dp(8));
         buttons.addView(clear, p3);
-        summary.addView(buttons, Ui.lp(-1, -2));
+        LinearLayout.LayoutParams bwrap = Ui.lp(-1, -2);
+        bwrap.topMargin = Theme.dp(14);
+        summary.addView(buttons, bwrap);
         view.addView(summary, Ui.lp(-1, -2));
 
         filters = Ui.row(a);
-        filters.setPadding(0, Theme.dp(14), 0, Theme.dp(6));
+        filters.setBackground(Ui.outline(Theme.INSET, Theme.LINE, 1f, 22));
+        filters.setPadding(Theme.dp(4), Theme.dp(4), Theme.dp(4), Theme.dp(4));
         String[] labels = {S.FILTER_ALL, S.FILTER_ACTIVE, S.FILTER_DONE};
         for (int i = 0; i < 3; i++) {
             final int n = i;
-            TextView t = Ui.medium(a, labels[i], 14, Theme.MUTED);
+            TextView t = Ui.medium(a, labels[i], 13.5f, Theme.MUTED);
             t.setGravity(Gravity.CENTER);
-            t.setPadding(Theme.dp(14), 0, Theme.dp(14), 0);
-            t.setMinHeight(Theme.dp(36));
+            t.setPadding(Theme.dp(12), 0, Theme.dp(12), 0);
+            t.setMinHeight(Theme.dp(34));
             t.setOnClickListener(v -> { filter = n; apply(); });
             t.setFocusable(true);
             Ui.role(t, RadioButton.class);
             Ui.id(t, "transfers.filter." + i);
-            LinearLayout.LayoutParams fp = Ui.lp(-2, Theme.dp(36));
-            fp.setMarginEnd(Theme.dp(6));
-            filters.addView(t, fp);
+            filters.addView(t, new LinearLayout.LayoutParams(0, Theme.dp(34), 1));
             filterTabs[i] = t;
         }
-        view.addView(filters, Ui.lp(-1, -2));
+        LinearLayout.LayoutParams fwrap = Ui.lp(-1, -2);
+        fwrap.topMargin = Theme.dp(14);
+        fwrap.bottomMargin = Theme.dp(10);
+        view.addView(filters, fwrap);
 
         FrameLayout area = new FrameLayout(a);
         list = new ListView(a);
@@ -106,7 +112,7 @@ final class TransfersPage {
         list.setDividerHeight(Theme.dp(10));
         list.setSelector(new android.graphics.drawable.ColorDrawable(0));
         list.setClipToPadding(false);
-        list.setPadding(0, Theme.dp(2), 0, Theme.dp(80));
+        list.setPadding(0, Theme.dp(2), 0, Theme.dp(84));
         list.setAdapter(adapter);
         Ui.id(list, "transfers.list");
         list.setOnItemClickListener((parent, row, index, id) -> showTask(shown.get(index)));
@@ -114,13 +120,16 @@ final class TransfersPage {
         emptyView = Ui.column(a);
         emptyView.setGravity(Gravity.CENTER);
         emptyView.setPadding(Theme.dp(32), 0, Theme.dp(32), Theme.dp(60));
-        emptyView.addView(Ui.glyphTile(a, Glyph.TRANSFER, Theme.MUTED, Theme.INSET, 64, 22), Ui.lp(Theme.dp(64), Theme.dp(64)));
+        ImageView emptyGlyph = Ui.glyphTile(a, Glyph.TRANSFER, Theme.MUTED, Theme.INSET, 68, 24);
+        emptyGlyph.setBackground(Ui.outline(Theme.INSET, Theme.RIM, 1f, 24));
+        emptyView.addView(emptyGlyph, Ui.lp(Theme.dp(68), Theme.dp(68)));
         TextView et = Ui.medium(a, S.NO_TASKS, 17, Theme.INK);
         et.setGravity(Gravity.CENTER);
-        et.setPadding(0, Theme.dp(16), 0, Theme.dp(4));
+        et.setPadding(0, Theme.dp(16), 0, Theme.dp(5));
         emptyView.addView(et);
-        TextView ed = Ui.text(a, S.NO_TASKS_DETAIL, 14, Theme.MUTED);
+        TextView ed = Ui.text(a, S.NO_TASKS_DETAIL, 13.5f, Theme.MUTED);
         ed.setGravity(Gravity.CENTER);
+        ed.setLineSpacing(0, 1.2f);
         emptyView.addView(ed);
         Button go = Ui.button(a, S.GO_FILES, Ui.PRIMARY, () -> shell.select(AppShell.FILES));
         LinearLayout.LayoutParams gp = Ui.lp(-2, Theme.dp(44));
@@ -130,6 +139,16 @@ final class TransfersPage {
         list.setEmptyView(emptyView);
         view.addView(area, new LinearLayout.LayoutParams(-1, 0, 1));
         apply();
+    }
+
+    /** Lightweight count used when the Transfers page is hidden (skips snapshot & adapter rebuild). */
+    static int activeCount(TransferQueue q) {
+        int active = 0;
+        synchronized (q) {
+            for (TransferQueue.Task t : q.tasks)
+                if (t.state.equals("进行中") || t.state.equals("等待") || t.state.equals("等待网络")) active++;
+        }
+        return active;
     }
 
     /** Builds snapshots under the queue lock; returns the number of tasks still moving or waiting. */
@@ -172,6 +191,7 @@ final class TransfersPage {
         else if (attention > 0) headline.setText(String.format(Locale.ROOT, S.QUEUE_ATTENTION, attention));
         else if (waiting > 0) headline.setText(String.format(Locale.ROOT, S.QUEUE_WAITING, waiting));
         else headline.setText(S.QUEUE_QUIET);
+        summary.setBackground(moving > 0 ? Ui.gradient(Theme.TILE_ON, Theme.SURFACE, Theme.LAMP_GLOW, 1.2f, 24) : Ui.card(24));
         TransferPacer pacer = TransferPacer.SHARED;
         StringBuilder d = new StringBuilder();
         // Measured speed per direction; a cap is mentioned only when the user chose one.
@@ -197,8 +217,9 @@ final class TransfersPage {
     void apply() {
         for (int i = 0; i < 3; i++) {
             boolean on = i == filter;
-            filterTabs[i].setTextColor(on ? Theme.ON_INK : Theme.MUTED);
-            filterTabs[i].setBackground(Ui.press(Ui.round(on ? Theme.INK : 0, 18), 18));
+            filterTabs[i].setTextColor(on ? Theme.INK : Theme.MUTED);
+            filterTabs[i].setBackground(on ? Ui.press(Ui.outline(Theme.dark ? Theme.SURFACE_RAISED : Theme.SURFACE, Theme.RIM, 1f, 18), 18) : Ui.press(Ui.round(0, 18), 18));
+            filterTabs[i].setElevation(on ? Theme.dp(1.5f) : 0f);
             filterTabs[i].setSelected(on);
         }
         List<TaskItem> next = new ArrayList<>();
@@ -366,23 +387,23 @@ final class TransfersPage {
         Card() {
             super(a);
             setOrientation(VERTICAL);
-            setPadding(Theme.dp(14), Theme.dp(12), Theme.dp(6), Theme.dp(12));
+            setPadding(Theme.dp(15), Theme.dp(14), Theme.dp(8), Theme.dp(14));
             LinearLayout top = Ui.row(a);
-            icon = Ui.glyphTile(a, Glyph.DOWNLOAD, Theme.INK, Theme.INSET, 40, 13);
-            top.addView(icon, Ui.lp(Theme.dp(40), Theme.dp(40)));
+            icon = Ui.glyphTile(a, Glyph.DOWNLOAD, Theme.INK, Theme.INSET, 42, 14);
+            top.addView(icon, Ui.lp(Theme.dp(42), Theme.dp(42)));
             LinearLayout lines = Ui.column(a);
             LinearLayout.LayoutParams lp = Ui.weight(1);
-            lp.setMarginStart(Theme.dp(12));
+            lp.setMarginStart(Theme.dp(13));
             top.addView(lines, lp);
-            name = Ui.text(a, "", 15, Theme.INK);
+            name = Ui.medium(a, "", 15, Theme.INK);
             name.setMaxLines(2);
             name.setEllipsize(TextUtils.TruncateAt.MIDDLE);
             lines.addView(name);
             LinearLayout stateRow = Ui.row(a);
-            stateRow.setPadding(0, Theme.dp(4), 0, 0);
+            stateRow.setPadding(0, Theme.dp(5), 0, 0);
             state = Ui.chip(a, "", Theme.MUTED, Theme.INSET);
             state.setTextSize(11);
-            state.setPadding(Theme.dp(8), Theme.dp(2), Theme.dp(8), Theme.dp(2));
+            state.setPadding(Theme.dp(9), Theme.dp(2.5f), Theme.dp(9), Theme.dp(2.5f));
             stateRow.addView(state);
             amount = Ui.numeric(Ui.text(a, "", 12, Theme.MUTED));
             Ui.oneLine(amount);
@@ -392,42 +413,51 @@ final class TransfersPage {
             action = Ui.iconButton(a, Glyph.PAUSE, S.PAUSE, null);
             action.setFocusable(false);
             action.setOnClickListener(v -> { if (item != null) quick(item); });
-            top.addView(action, Ui.lp(Theme.dp(44), Theme.dp(44)));
+            top.addView(action, Ui.lp(Theme.dp(42), Theme.dp(42)));
             addView(top, Ui.lp(-1, -2));
             meter = new Ui.Meter(a);
-            LinearLayout.LayoutParams mp = Ui.lp(-1, Theme.dp(4));
-            mp.setMargins(Theme.dp(52), Theme.dp(10), Theme.dp(10), 0);
+            LinearLayout.LayoutParams mp = Ui.lp(-1, Theme.dp(5));
+            mp.setMargins(Theme.dp(55), Theme.dp(11), Theme.dp(10), 0);
             addView(meter, mp);
             speed = Ui.numeric(Ui.text(a, "", 12, Theme.MUTED));
             Ui.oneLine(speed);
-            speed.setPadding(Theme.dp(52), Theme.dp(6), Theme.dp(10), 0);
+            speed.setPadding(Theme.dp(55), Theme.dp(6), Theme.dp(10), 0);
             addView(speed);
             error = Ui.text(a, "", 12, Theme.WARN);
             error.setMaxLines(3);
             error.setEllipsize(TextUtils.TruncateAt.END);
-            error.setPadding(Theme.dp(52), Theme.dp(4), Theme.dp(10), 0);
+            error.setPadding(Theme.dp(55), Theme.dp(4), Theme.dp(10), 0);
             addView(error);
             setLayoutParams(new AbsListView.LayoutParams(-1, -2));
         }
         void bind(TaskItem t) {
             item = t;
-            setBackground(Ui.press(Ui.outline(Theme.SURFACE, Theme.LINE, 18), 18));
-            setPadding(Theme.dp(14), Theme.dp(12), Theme.dp(6), Theme.dp(12));
+            boolean running = t.state.equals("进行中");
+            boolean conflict = t.state.equals("等待处理");
+            setBackground(Ui.press(
+                running ? Ui.gradient(Theme.TILE_ON, Theme.SURFACE, Theme.LAMP_GLOW, 1.15f, 20)
+                : conflict ? Ui.outline(Theme.SURFACE, Theme.alpha(Theme.DANGER, 0.42f), 1.15f, 20)
+                : Ui.card(20), 20));
+            setPadding(Theme.dp(15), Theme.dp(14), Theme.dp(8), Theme.dp(14));
             name.setText(t.name);
-            icon.setImageDrawable(new Glyph(t.kind == 0 ? Glyph.DOWNLOAD : Glyph.UPLOAD, Theme.INK));
+            int iconColor = running ? (Theme.dark ? Theme.LAMP : Theme.LAMP_TEXT)
+                            : t.state.equals("完成") ? Theme.POSITIVE
+                            : conflict ? Theme.DANGER : Theme.INK;
+            icon.setImageDrawable(new Glyph(t.kind == 0 ? Glyph.DOWNLOAD : Glyph.UPLOAD, iconColor, Theme.dp(20)));
+            icon.setBackground(Ui.round(toneSoft(t.state), 14));
             state.setText(label(t.state));
             state.setTextColor(tone(t.state));
-            state.setBackground(Ui.round(toneSoft(t.state), 10));
+            state.setBackground(Ui.round(toneSoft(t.state), 50));
             String progress = t.kind == 2 ? String.format(Locale.ROOT, S.ITEMS_PROGRESS, t.current, t.total)
                                           : Ui.size(t.current) + " / " + Ui.size(t.total);
             amount.setText(progress);
             float fraction = t.total == 0 ? (t.state.equals("完成") ? 1 : 0) : (float)(t.current / (double)t.total);
-            meter.set(fraction, t.state.equals("完成") ? Theme.POSITIVE : t.state.equals("进行中") ? Theme.LAMP : Theme.FAINT);
+            meter.set(fraction, t.state.equals("完成") ? Theme.POSITIVE : running ? Theme.LAMP : Theme.FAINT);
             meter.setVisibility(t.finished() && t.state.equals("已取消") ? View.GONE : View.VISIBLE);
             String sp = "";
-            if (t.state.equals("进行中") && t.rate > 1) {
+            if (running && t.rate > 1) {
                 sp = Ui.rate(t.rate);
-                if (t.kind != 2 && t.total > t.current) sp += "，" + String.format(Locale.ROOT, S.ETA, Ui.duration(Math.round((t.total - t.current) / t.rate)));
+                if (t.kind != 2 && t.total > t.current) sp += " · " + String.format(Locale.ROOT, S.ETA, Ui.duration(Math.round((t.total - t.current) / t.rate)));
             } else if (t.state.equals("等待网络")) {
                 sp = String.format(Locale.ROOT, S.RETRYING, t.retries, RetryPolicy.MAX_ATTEMPTS);
             } else if (t.otherDevice) {
@@ -436,7 +466,7 @@ final class TransfersPage {
             speed.setText(sp);
             speed.setVisibility(sp.isEmpty() ? View.GONE : View.VISIBLE);
             error.setText(t.error);
-            error.setTextColor(t.state.equals("等待处理") ? Theme.DANGER : Theme.WARN);
+            error.setTextColor(conflict ? Theme.DANGER : Theme.WARN);
             error.setVisibility(t.error.isEmpty() ? View.GONE : View.VISIBLE);
             int glyph; String desc;
             switch (t.state) {
@@ -447,7 +477,7 @@ final class TransfersPage {
             default: glyph = -1; desc = "";
             }
             action.setVisibility(glyph < 0 ? View.INVISIBLE : View.VISIBLE);
-            if (glyph >= 0) action.setImageDrawable(new Glyph(glyph, glyph == Glyph.WARNING ? Theme.DANGER : Theme.INK));
+            if (glyph >= 0) action.setImageDrawable(new Glyph(glyph, glyph == Glyph.WARNING ? Theme.DANGER : Theme.INK, Theme.dp(20)));
             action.setContentDescription(desc);
             setContentDescription(t.name + "，" + label(t.state) + "，" + progress);
         }

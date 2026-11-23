@@ -8,8 +8,10 @@ final class InputChannel implements AutoCloseable {
         final Phase phase; final long recoveringMillis;
         /** Not a network outage: revoked trust, ended session or an uncertain replay. Needs a deliberate restart. */
         final boolean terminal;
+        final String reason;
         State(Phase p,long n){this(p,n,false);}
-        State(Phase p,long n,boolean t){phase=p;recoveringMillis=n;terminal=t;}
+        State(Phase p,long n,boolean t){this(p,n,t,"");}
+        State(Phase p,long n,boolean t,String reason){phase=p;recoveringMillis=n;terminal=t;this.reason=reason;}
     }
     interface Events { void state(State s); default void result(long seq,int code,String reason){} default void result(long seq,int code,String reason,byte[] payload){result(seq,code,reason);}
         /** tag = the object given to submit (null for none). Coalesced moves never report. */
@@ -30,7 +32,7 @@ final class InputChannel implements AutoCloseable {
     final String id=UUID.randomUUID().toString().replace("-","")+UUID.randomUUID().toString().replace("-","");
     final Thread worker;
     volatile Remote active; volatile java.net.Socket opening;
-    volatile boolean closed; boolean terminal,sending; long acknowledged,recovery;
+    volatile boolean closed; String terminalReason=""; boolean terminal,sending; long acknowledged,recovery;
     InputChannel(Remote.Credentials c,Events e) {
         credentials=new Remote.Credentials(c.host,c.port,c.pin,c.token,c.endpoints);events=e;
         worker=new Thread(this::run,"Lantern reliable input");worker.start();
@@ -39,7 +41,7 @@ final class InputChannel implements AutoCloseable {
     synchronized boolean submit(int op,byte[] payload) throws IOException {return submit(op,payload,null);}
     synchronized boolean submit(int op,byte[] payload,Object tag) throws IOException {
         Command c=new Command(op,payload);c.tag=tag;
-        if(closed||terminal)return false;
+        if(closed||terminal)throw new IOException("控制通道已关闭，请重新连接");
         Command tail=queue.peekLast();
         if(c.move&&tail!=null&&tail.move&&tail.op==op&&(!sending||queue.size()>1))queue.removeLast();
         else if(queue.size()>=512)return false;
@@ -47,7 +49,7 @@ final class InputChannel implements AutoCloseable {
     }
     synchronized State state() {
         long elapsed=recovery==0?0:Math.max(1,(System.nanoTime()-recovery)/1_000_000);
-        return new State(closed||terminal||elapsed>=30000?Phase.DISCONNECTED:elapsed>0?Phase.RECOVERING:Phase.NORMAL,elapsed,closed||terminal);
+        return new State(closed||terminal||elapsed>=30000?Phase.DISCONNECTED:elapsed>0?Phase.RECOVERING:Phase.NORMAL,elapsed,closed||terminal,terminalReason);
     }
     synchronized int pending(){return queue.size();}
     synchronized long acknowledged(){return acknowledged;}
@@ -92,6 +94,10 @@ final class InputChannel implements AutoCloseable {
                         terminal=(sent&&!replay)||Remote.endedByHost(error)||error instanceof javax.net.ssl.SSLException||
                             error instanceof SecurityException||error instanceof Remote.RemoteError&&
                             (((Remote.RemoteError)error).code==2||((Remote.RemoteError)error).code==4);
+                        // An outer reliable-envelope rejection has no ACK to advance the queue.
+                        // Inner application refusals are acknowledged above and leave the channel usable.
+                        if(sent && replay && error instanceof Remote.RemoteError) terminal=true;
+                        if(terminal)terminalReason=error.getMessage();
                         if(recovery==0)recovery=System.nanoTime();
                     }
                     publish();

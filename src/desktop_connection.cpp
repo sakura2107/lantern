@@ -44,7 +44,7 @@ DesktopPacket DesktopConnection::next(){
     for(;;){
     Bytes bytes;
     if(using_udp_){
-        try{auto packet=udp_->receive();Reader header{packet};
+        try{auto packet=udp_->receive(config_.fps);Reader header{packet};
             if(header.u16()!=protocol_version||header.u16()!=uint16_t(Op::desktop_packet)||header.u32()!=0)throw Error(Code::invalid,"UDP desktop envelope");
             bytes=Bytes(packet.begin()+header.at,packet.end());
         }catch(const TransportError&){udp_->interrupt();using_udp_=false;

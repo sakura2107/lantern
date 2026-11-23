@@ -18,7 +18,7 @@ void AudioConnection::ready(){
 }
 AudioPacket AudioConnection::next(){
     Bytes bytes;
-    if(using_udp_)try{auto packet=udp_->receive();Reader r{packet};
+    if(using_udp_)try{auto packet=udp_->receive(100);Reader r{packet};
         if(r.u16()!=protocol_version||r.u16()!=uint16_t(Op::audio_packet)||r.u32()!=0)throw Error(Code::invalid,"UDP audio envelope");
         bytes=Bytes(packet.begin()+r.at,packet.end());
     }catch(const TransportError&){udp_->interrupt();using_udp_=false;auto event=stream_->receive(Op::media_path);Reader r{event};if(r.str()!="tcp")throw Error(Code::invalid,"Audio fallback");r.end();}
