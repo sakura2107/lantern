@@ -117,7 +117,7 @@ the frames starting inside it, so segments tile exactly (the v2 fMP4 output
 repeated ~21 ms of priming per segment, +0.18 s over 12 s).
 
 Physical phone (Android 16), 12-second generated 4K HEVC10 SDR + ASS/AAC fixture,
-v3 TS (report F:/LanternV03/claude-phone-hls.json, **43 assertions passed**):
+v3 TS (**43 assertions passed**):
 
 - **System MediaPlayer** prepared the loopback HLS URL, first frame **1.35 s**,
   1280x720, seek to 2.5 s in **65 ms**, played to completion without error,
